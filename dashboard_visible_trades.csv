@@ -1,0 +1,98 @@
+Time,Action,Symbol,Qty,Price,PnL,Source,EntryGrade,LiveGrade,ExitGrade,BotGrade,TradeScore,GradeReason,HoldTime,PeakPrice,HardStopPrice,TrailingStopPrice,MaxDrawdownFromPeakPercent,PnLPercent,ExitReason
+2026-06-30 10:58:42,BUY,SPY260630C00747000,1,0.36,,,,,,,,,,,,,,,
+2026-06-30 12:28:05,SELL,SPY260630C00747000,1,0.63,28.000000000000004,HUMAN,,,A,A,90,Good profit; Holding because market context has not confirmed exit; EMA aligned bullish; Price above VWAP; Green ticks 62%; Broke previous day high,1:29:23,,,,,,
+2026-06-30 13:04:56,BUY,SPY260630C00747000,1,0.86,,BOT,A+,,,A+,100,Market state BULLISH; Strong score separation; Market structure confirmation; EMA aligned bullish; MA aligned bullish; Price above VWAP; Broke previous day high; Broke previous week high; Broke opening range high,,,,,,,
+2026-06-30 13:13:41,SELL,SPY260630C00747000,1,0.8,-5.999999999999995,BOT,,,C,C,71,Small loss; Trailing stop respected; Exit followed bot signal; Trailing stop hit; Drawdown 17.53%,0:08:45,,,,,,
+2026-06-30 13:14:10,BUY,SPY260630C00747000,1,0.79,,BOT,A+,,,A+,100,Market state BULLISH; Market structure confirmation; EMA aligned bearish; MA aligned bearish; Price above VWAP; Broke previous day high; Broke previous week high; Broke opening range high,,,,,,,
+2026-06-30 13:27:45,SELL,SPY260630C00747000,1,0.86,5.999999999999995,BOT,,,A+,A+,96,Small profit; Trailing stop respected; Exit followed bot signal; Trailing stop hit; Drawdown 15.00%,0:13:35,,,,,,
+2026-06-30 13:28:57,BUY,SPY260630C00747000,1,0.81,,BOT,A+,,,A+,100,Market state BULLISH; Market structure confirmation; EMA aligned bearish; MA aligned bearish; Price above VWAP; Broke previous day high; Broke previous week high; Broke opening range high,,,,,,,
+2026-06-30 13:42:08,SELL,SPY260630C00747000,1,0.72,-7.000000000000006,BOT,,,C,C,71,Small loss; Trailing stop respected; Exit followed bot signal; Trailing stop hit; Drawdown 15.48%,0:13:11,,,,,,
+2026-06-30 14:58:23,BUY,SPY260630C00747000,1,0.73,,BOT,A+,,,A+,100,Market state BULLISH; Strong score separation; Opening direction confirmation; Market structure confirmation; EMA aligned bullish; MA aligned bullish; Price above VWAP; Green ticks 63%; Broke previous day high; Broke previous week high,,,,,,,
+2026-06-30 15:09:49,SELL,SPY260630C00747000,1,0.8,7.000000000000006,BOT,,,A+,A+,96,Small profit; Trailing stop respected; Exit followed bot signal; Trailing stop hit; Drawdown 19.59%,0:11:26,,,,,,
+2026-06-30 15:14:49,BUY,SPY260630C00747000,1,0.79,,BOT,A+,,,A+,100,Market state BULLISH; Market structure confirmation; EMA aligned bearish; MA aligned bearish; Price above VWAP; Broke previous day high; Broke previous week high; Broke opening range high,,,,,,,
+2026-06-30 15:29:36,BUY,SPY260630C00748000,1,0.56,,BOT,A+,,,A+,100,Market state BULLISH; Strong score separation; Market structure confirmation; EMA aligned bullish; MA aligned bullish; Price above VWAP; Broke previous day high; Broke previous week high; Broke opening range high,,,,,,,
+2026-06-30 15:34:31,SELL,SPY260630C00747000,1,1.1,31.000000000000007,BOT,,,A+,A+,100,Good profit; Trailing stop respected; Exit followed bot signal; Trailing stop hit; Drawdown 17.16%,0:19:42,,,,,,
+2026-06-30 15:37:13,SELL,SPY260630C00748000,1,0.47,-9.999999999999998,BOT,,,F,F,56,Large loss; Trailing stop respected; Exit followed bot signal; Trailing stop hit; Drawdown 21.31%,0:07:37,,,,,,
+2026-07-01 14:29:32,BUY,SPY260701P00747000,1,0.66,,BOT,A+,,,A+,100,Market state BEARISH; EMA aligned bearish; MA aligned bearish; Price below VWAP; Broke opening range low; Stagnant market penalty,,,,,,,
+2026-07-01 14:34:15,SELL,SPY260701P00747000,1,0.72,6.999999999999995,BOT,,,A+,A+,100,Good profit; Trailing stop respected; Exit followed bot signal; Trailing stop hit; Drawdown 17.24%,0:04:43,,,,,,
+2026-07-01 14:40:19,BUY,SPY260701C00747000,1,0.93,,BOT,A+,,,A+,100,Market state BULLISH; EMA aligned bullish; MA aligned bullish; Price above VWAP,,,,,,,
+2026-07-01 14:43:13,SELL,SPY260701C00747000,1,0.77,-16.000000000000004,BOT,,,F,F,56,Large loss; Trailing stop respected; Exit followed bot signal; Trailing stop hit; Drawdown 18.28%,0:02:54,,,,,,
+2026-07-01 14:52:02,BUY,SPY260701P00747000,1,0.5,,BOT,A+,,,A+,100,Market state BEARISH; Opening direction confirmation; EMA aligned bearish; Price below VWAP; Red ticks 100%,,,,,,,
+2026-07-01 14:55:04,SELL,SPY260701P00747000,1,0.49,-4.0000000000000036,BOT,,,C,C,71,Small loss; Trailing stop respected; Exit followed bot signal; Trailing stop hit; Drawdown 16.95%,0:03:02,,,,,,
+2026-07-01 15:00:37,BUY,SPY260701P00747000,1,0.56,,BOT,A+,,,A+,100,Market state BEARISH; EMA aligned bearish; MA aligned bearish; Price below VWAP,,,,,,,
+2026-07-01 15:05:04,SELL,SPY260701P00747000,1,0.65,10.999999999999998,BOT,,,A+,A+,100,Good profit; Trailing stop respected; Exit followed bot signal; Trailing stop hit; Drawdown 15.58%,0:04:27,,,,,,
+2026-07-01 15:10:17,BUY,SPY260701P00747000,1,0.77,,BOT,A+,,,A+,100,Market state BEARISH; EMA aligned bearish; MA aligned bearish; Price below VWAP; Not near major resistance,,,,,,,
+2026-07-01 15:12:45,SELL,SPY260701P00747000,1,0.86,-1.0000000000000009,BOT,,,D,D,63,Small loss; Exit followed bot signal; Full market context flipped bullish; EMA aligned bullish; Price above VWAP; Not near major resistance,0:02:28,,,,,,
+2026-07-01 15:17:58,BUY,SPY260701C00747000,1,0.69,,BOT,A+,,,A+,100,Market state BULLISH; Strong score separation; Opening direction confirmation; EMA aligned bullish; MA aligned bullish; Price above VWAP; Green ticks 70%,,,,,,,
+2026-07-01 15:28:31,SELL,SPY260701C00747000,1,0.72,2.0000000000000018,BOT,,,B,B,88,Small profit; Exit followed bot signal; Full market context flipped bearish; EMA aligned bearish; Price below VWAP; Red ticks 100%; Not near major support,0:10:33,,,,,,
+2026-07-01 15:33:52,BUY,SPY260701P00747000,1,0.3,,BOT,A+,,,A+,100,Market state BEARISH; EMA aligned bearish; MA aligned bullish; Price below VWAP; Not near major support,,,,,,,
+2026-07-01 15:36:14,SELL,SPY260701P00747000,1,0.28,-6.0,BOT,,,F,F,56,Large loss; Trailing stop respected; Exit followed bot signal; Trailing stop hit; Drawdown 17.65%,0:02:22,,,,,,
+2026-07-01 15:42:21,BUY,SPY260701P00747000,1,0.45,,BOT,A+,,,A+,100,Market state BEARISH; EMA aligned bearish; MA aligned bearish; Price below VWAP,,,,,,,
+2026-07-01 15:45:38,SELL,SPY260701P00747000,1,0.35,-12.0,BOT,,,F,F,53,Large loss; Stop loss respected; Exit followed bot signal; Hard stop hit; P/L -21.28%,0:03:17,,,,,,
+2026-07-02 14:27:06,BUY,SPY260702C00743000,1,0.98,,BOT,A+,,,A+,100,Market state BULLISH; Opening direction confirmation; EMA aligned bullish; Price above VWAP; Green ticks 100%; Broke opening range low,,,,,,,
+2026-07-02 14:29:31,SELL,SPY260702C00743000,1,0.74,0.0,BOT,,,C,C,78,Break even; Exit followed bot signal; Full market context flipped bearish; Price below VWAP; Broke opening range low,0:02:25,0.83,0.784,0.7054999999999999,10.843373493975902,0.0,"Trailing stop not hit.
+Drawdown 10.84% < 15.00%.
+Full market context flipped bearish
+Price below VWAP
+Broke opening range low"
+2026-07-02 14:30:32,BUY,SPY260702P00742000,1,0.87,,BOT,A+,,,A+,100,Market state BEARISH; Strong score separation; Opening direction confirmation; Market structure confirmation; EMA aligned bearish; MA aligned bearish; Price below VWAP; Red ticks 70%; Broke previous day low; Broke opening range low,,,,,,,
+2026-07-02 14:50:56,SELL,SPY260702P00742000,1,0.53,-36.0,BOT,,,F,F,53,Large loss; Stop loss respected; Exit followed bot signal; Hard stop hit; P/L -41.57%,0:20:24,1.27,0.6960000000000001,1.0795,58.26771653543307,-41.37931034482759,"Trailing stop hit.
+Drawdown 58.27% >= 15.00%.
+Hard stop hit
+P/L -41.57%"
+2026-07-02 14:52:05,BUY,SPY260702C00743000,1,0.98,,BOT,A+,,,A+,100,Market state BULLISH; EMA aligned bullish; MA aligned bullish; Price above VWAP; Broke opening range low,,,,,,,
+2026-07-02 15:00:24,SELL,SPY260702C00743000,1,0.72,-15.000000000000002,BOT,,,F,F,56,Large loss; Trailing stop respected; Exit followed bot signal; Trailing stop hit; Drawdown 25.74%,0:08:19,1.01,0.784,0.8584999999999999,28.712871287128717,-15.306122448979595,"Trailing stop hit.
+Drawdown 28.71% >= 15.00%.
+Trailing stop hit
+Drawdown 25.74%"
+2026-07-02 15:01:28,BUY,SPY260702P00743000,1,0.84,,BOT,A+,,,A+,100,Market state BEARISH; Strong score separation; EMA aligned bearish; MA aligned bearish; Price below VWAP; Broke opening range low,,,,,,,
+2026-07-02 15:04:00,SELL,SPY260702P00743000,1,0.82,-17.000000000000004,BOT,,,F,F,56,Large loss; Trailing stop respected; Exit followed bot signal; Trailing stop hit; Drawdown 17.65%,0:02:32,1.02,0.672,0.867,19.607843137254907,-20.23809523809524,"Trailing stop hit.
+Drawdown 19.61% >= 15.00%.
+Trailing stop hit
+Drawdown 17.65%"
+2026-07-02 15:11:42,BUY,SPY260702P00743000,1,0.88,,BOT,A+,,,A+,100,Market state BEARISH; Strong score separation; EMA aligned bearish; MA aligned bearish; MACD bearish; Price below VWAP; Broke opening range low; Not near major resistance,,,,,,,
+2026-07-02 15:12:48,SELL,SPY260702P00743000,1,0.83,-21.000000000000007,BOT,,,F,F,53,Large loss; Stop loss respected; Exit followed bot signal; Hard stop hit; P/L -20.19%,0:01:06,1.04,0.7040000000000001,0.884,20.192307692307697,-23.863636363636374,"Trailing stop hit.
+Drawdown 20.19% >= 15.00%.
+Hard stop hit
+P/L -20.19%"
+2026-07-02 15:16:30,BUY,SPY260702P00742000,1,0.43,,BOT,A+,,,A+,100,Market state BEARISH; Strong score separation; EMA aligned bearish; MA aligned bearish; MACD bearish; Price below VWAP; Broke opening range low; Not near major resistance,,,,,,,
+2026-07-02 15:21:37,SELL,SPY260702P00742000,1,0.92,32.00000000000001,BOT,,,A+,A+,100,Good profit; Trailing stop respected; Exit followed bot signal; Trailing stop hit; Drawdown 18.10%,0:05:07,1.16,0.34400000000000003,0.9859999999999999,20.689655172413783,74.41860465116281,"Trailing stop hit.
+Drawdown 20.69% >= 15.00%.
+Trailing stop hit
+Drawdown 18.10%"
+2026-07-02 15:37:42,BUY,SPY260702P00742000,1,0.95,,BOT,A+,,,A+,100,Market state BEARISH; Strong score separation; Opening direction confirmation; Market structure confirmation; EMA aligned bearish; MACD bearish; Price below VWAP; Red ticks 80%; Broke previous day low; Broke opening range low,,,,,,,
+2026-07-02 15:41:46,SELL,SPY260702P00742000,1,0.8,-8.999999999999996,BOT,,,C,C,76,Small loss; Trailing stop respected; Stop loss respected; Exit followed bot signal; Trailing stop hit; Drawdown 16.67% >= 15.00%; Fast exit poll; Entry 0.89; Current 0.80,0:04:04,0.96,0.76,0.816,16.66666666666666,-9.473684210526311,"Trailing stop hit.
+Drawdown 16.67% >= 15.00%.
+Trailing stop hit
+Drawdown 16.67% >= 15.00%
+Fast exit poll
+Entry 0.89
+Current 0.80
+Peak 0.96
+Hard stop price 0.71
+Trailing stop price 0.82
+Drawdown 16.67%"
+2026-07-02 15:44:12,BUY,SPY260702C00742000,1,0.56,,BOT,A+,,,A+,100,Market state BULLISH; Strong score separation; EMA aligned bullish; MA aligned bullish; MACD bullish; Price above VWAP; Broke opening range low; Not near major resistance,,,,,,,
+2026-07-02 15:44:52,SELL,SPY260702C00742000,1,0.82,-12.0,BOT,,,D,D,61,Large loss; Trailing stop respected; Stop loss respected; Exit followed bot signal; Trailing stop hit; Drawdown 17.17% >= 15.00%; Fast exit poll; Entry 0.94; Current 0.82,0:00:40,0.99,0.44800000000000006,0.8415,17.171717171717177,-21.428571428571423,"Trailing stop hit.
+Drawdown 17.17% >= 15.00%.
+Trailing stop hit
+Drawdown 17.17% >= 15.00%
+Fast exit poll
+Entry 0.94
+Current 0.82
+Peak 0.99
+Hard stop price 0.75
+Trailing stop price 0.84
+Drawdown 17.17%"
+2026-07-02 15:46:01,BUY,SPY260702C00742000,1,0.98,,BOT,A+,,,A+,100,Market state BULLISH; Strong score separation; EMA aligned bullish; MA aligned bullish; MACD bullish; Price above VWAP; Broke opening range low; Not near major resistance,,,,,,,
+2026-07-02 15:51:54,SELL,SPY260702C00742000,1,1.11,14.000000000000012,BOT,,,A+,A+,100,Good profit; Trailing stop respected; Stop loss respected; Exit followed bot signal; Trailing stop hit; Drawdown 15.27% >= 15.00%; Fast exit poll; Entry 0.97; Current 1.11,0:05:53,1.31,0.784,1.1135,15.26717557251908,14.285714285714299,"Trailing stop hit.
+Drawdown 15.27% >= 15.00%.
+Trailing stop hit
+Drawdown 15.27% >= 15.00%
+Fast exit poll
+Entry 0.97
+Current 1.11
+Peak 1.31
+Hard stop price 0.78
+Trailing stop price 1.11
+Drawdown 15.27%"

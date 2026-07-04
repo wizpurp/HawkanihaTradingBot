@@ -1,0 +1,40 @@
+{
+    "mode": "sandbox",
+    "symbol": "SPY",
+    "asset_type": "option",
+    "contracts": 1,
+    "bot_enabled": false,
+    "strategy_mode": "SURFER",
+
+    "strategy": {
+        "ema_fast": 1,
+        "ema_medium": 5,
+        "ema_slow": 10,
+
+        "ma_fast": 10,
+        "ma_medium": 10,
+        "ma_slow": 20,
+
+        "use_macd": false,
+        "use_vwap": true,
+        "use_volume": false,
+
+        "hard_stop_percent": 20.0,
+        "trailing_stop_percent": 15.0,
+
+        "tick_interval_seconds": 10,
+        "direction_threshold_percent": 60.0
+    },
+
+    "scanner": {
+        "interval_seconds": 60
+    },
+
+    "entry_rules": {
+        "ema_alignment": true,
+        "macd_confirmation": true,
+        "vwap_confirmation": true,
+        "volume_confirmation": true,
+        "minimum_signals": 3
+    }
+}
