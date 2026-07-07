@@ -96,3 +96,23 @@ Peak 1.31
 Hard stop price 0.78
 Trailing stop price 1.11
 Drawdown 15.27%"
+2026-07-06 05:41:11,BUY,SPY260706C00750000,1,0.32,,HUMAN,F,,,F,11,CHOPPY market penalty; Weak confidence; Conflicting signals; Market structure confirmation; Broke last hour low; Stagnant market penalty; Confidence 0 is too low,,,,,,,
+2026-07-06 09:53:33,SELL,SPY260706C00750000,1,0.57,-53.000000000000014,BOT,,,F,F,53,Large loss; Stop loss respected; Exit followed bot signal; Hard stop hit; P/L -50.00%,4:12:22,1.1,0.256,0.935,48.181818181818194,-165.62500000000006,"Trailing stop hit.
+Drawdown 48.18% >= 15.00%.
+Hard stop hit
+P/L -50.00%"
+2026-07-06 10:36:57,BUY,SPY260706C00750000,1,0.7,,BOT,A+,,,A+,100,Market state BULLISH; Strong score separation; EMA aligned bullish; MA aligned bullish; MACD bullish; Price above VWAP; Broke opening range high,,,,,,,
+2026-07-06 11:28:29,SELL,SPY260706C00750000,1,0.8,13.0,BOT,,,A+,A+,100,Good profit; Trailing stop respected; Exit followed bot signal; Trailing stop hit; Drawdown 19.80%,0:51:32,1.01,0.5599999999999999,0.8584999999999999,20.79207920792079,18.571428571428573,"Trailing stop hit.
+Drawdown 20.79% >= 15.00%.
+Trailing stop hit
+Drawdown 19.80%"
+2026-07-06 12:11:02,BUY,SPY260706C00751000,1,0.54,,BOT,A+,,,A+,100,Market state BULLISH; Strong score separation; EMA aligned bullish; MACD bullish; Price above VWAP; Broke opening range high,,,,,,,
+2026-07-06 12:15:25,SELL,SPY260706C00751000,1,0.49,-5.000000000000004,BOT,,,C,C,71,Small loss; Trailing stop respected; Exit followed bot signal; Trailing stop hit; Drawdown 18.33%,0:04:23,0.6,0.43200000000000005,0.51,18.333333333333332,-9.259259259259267,"Trailing stop hit.
+Drawdown 18.33% >= 15.00%.
+Trailing stop hit
+Drawdown 18.33%"
+2026-07-06 13:18:45,BUY,SPY260706C00751000,1,0.47,,BOT,A+,,,A+,100,Market state BULLISH; Strong score separation; EMA aligned bullish; MACD bullish; Price above VWAP; Broke opening range high,,,,,,,
+2026-07-06 13:32:54,SELL,SPY260706C00751000,1,0.7,21.999999999999996,BOT,,,A+,A+,100,Good profit; Trailing stop respected; Exit followed bot signal; Trailing stop hit; Drawdown 16.47%,0:14:09,0.85,0.376,0.7224999999999999,17.647058823529417,46.80851063829786,"Trailing stop hit.
+Drawdown 17.65% >= 15.00%.
+Trailing stop hit
+Drawdown 16.47%"

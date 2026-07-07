@@ -8,6 +8,7 @@ import threading
 import time
 import html as html_lib
 from datetime import datetime, timedelta, time as datetime_time
+from logs.trade_logger import *
 
 
 
@@ -17,16 +18,7 @@ TOKEN = "0kkGC4Wj40dAv9GjOO6c7hioOiXM"
 ACCOUNT = "VA52467186"
 BASE_URL = "https://sandbox.tradier.com/v1"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-TRADES_FILE = os.path.join(APP_DIR, "trades.csv")
-VISIBLE_TRADES_FILE = os.path.join(APP_DIR, "dashboard_visible_trades.csv")
 BOT_AUDIT_FILE = os.path.join(APP_DIR, "bot_audit_log.csv")
-TRADE_COLUMNS = [
-    "Time", "Action", "Symbol", "Qty", "Price", "PnL",
-    "Source", "EntryGrade", "LiveGrade", "ExitGrade", "BotGrade",
-    "TradeScore", "GradeReason", "HoldTime", "PeakPrice",
-    "HardStopPrice", "TrailingStopPrice", "MaxDrawdownFromPeakPercent",
-    "PnLPercent", "ExitReason"
-]
 BOT_AUDIT_COLUMNS = [
     "timestamp", "action", "decision", "symbol", "option_symbol",
     "market_state", "bullish_score", "bearish_score", "confidence",
@@ -131,34 +123,6 @@ def load_config():
 def save_config(config):
     with open("config.json", "w") as f:
         json.dump(config, f, indent=4)
-
-
-def ensure_trade_file(path):
-    if not os.path.exists(path) or os.path.getsize(path) == 0:
-        write_trade_header(path)
-        return
-
-    with open(path, "r", newline="") as f:
-        reader = csv.DictReader(f)
-        rows = list(reader)
-        fieldnames = reader.fieldnames or []
-
-    if fieldnames == TRADE_COLUMNS:
-        return
-
-    with open(path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=TRADE_COLUMNS)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow({column: row.get(column, "") for column in TRADE_COLUMNS})
-
-
-def append_trade_row(path, row):
-    ensure_trade_file(path)
-
-    with open(path, "a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=TRADE_COLUMNS)
-        writer.writerow({column: row.get(column, "") for column in TRADE_COLUMNS})
 
 
 def grade_from_score(score):
@@ -277,19 +241,6 @@ def grade_live_trade(pl, market_context, position_symbol=""):
     return grade_from_score(score), max(0, min(100, int(round(score)))), "; ".join(reasons[:10])
 
 
-def find_last_buy(symbol):
-    try:
-        with open(TRADES_FILE, "r", newline="") as f:
-            rows = list(csv.DictReader(f))
-    except:
-        return None
-
-    for row in reversed(rows):
-        if row.get("Symbol") == symbol and row.get("Action") == "BUY":
-            return row
-    return None
-
-
 def position_hold_time(symbol):
     last_buy = find_last_buy(symbol)
     if not last_buy:
@@ -390,103 +341,6 @@ def grade_exit_trade(symbol, qty, sell_price, pnl, market_context):
 
     reasons.extend(decision_reasons[:5])
     return grade_from_score(score), max(0, min(100, int(round(score)))), "; ".join(reasons[:10]), hold_time
-
-
-def log_trade(action, symbol, qty, price="", pnl="", source="HUMAN", market_context=None):
-    market_context = market_context or current_market_context_snapshot()
-    entry_grade = ""
-    exit_grade = ""
-    bot_grade = ""
-    trade_score = ""
-    grade_reason = ""
-    hold_time = ""
-    peak_price = ""
-    hard_stop_price = ""
-    trailing_stop_price = ""
-    max_drawdown_from_peak_percent = ""
-    pnl_percent = ""
-    exit_reason = ""
-
-    if action == "BUY":
-        entry_grade, trade_score, grade_reason = grade_entry_setup(market_context)
-        bot_grade = entry_grade
-    elif action == "SELL":
-        exit_grade, trade_score, grade_reason, hold_time = grade_exit_trade(symbol, qty, price, pnl, market_context)
-        bot_grade = exit_grade
-        last_buy = find_last_buy(symbol)
-        entry_price = safe_float(last_buy.get("Price"), 0) if last_buy else 0
-        sell_price = safe_float(price)
-        qty_value = safe_float(qty, 1)
-        entry_cost = entry_price * qty_value * 100
-        pnl_percent = (safe_float(pnl) / entry_cost) * 100 if entry_cost else ""
-        stop_values = stop_debug_values(symbol, entry_price, sell_price)
-        peak_price = stop_values["peak_price"]
-        hard_stop_price = stop_values["hard_stop_price"]
-        trailing_stop_price = stop_values["trailing_stop_price"]
-        max_drawdown_from_peak_percent = stop_values["drawdown_from_peak_percent"]
-        trailing_percent = stop_values["trailing_stop_percent"]
-        trailing_lines = (
-            ["Trailing stop hit.", f"Drawdown {max_drawdown_from_peak_percent:.2f}% >= {trailing_percent:.2f}%."]
-            if max_drawdown_from_peak_percent >= trailing_percent
-            else ["Trailing stop not hit.", f"Drawdown {max_drawdown_from_peak_percent:.2f}% < {trailing_percent:.2f}%."]
-        )
-        exit_reason = "\n".join(trailing_lines + [str(reason) for reason in (market_context.get("decision_reasons") or [])])
-
-    row = {
-        "Time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "Action": action,
-        "Symbol": symbol,
-        "Qty": qty,
-        "Price": price,
-        "PnL": pnl,
-        "Source": source,
-        "EntryGrade": entry_grade,
-        "LiveGrade": "",
-        "ExitGrade": exit_grade,
-        "BotGrade": bot_grade,
-        "TradeScore": trade_score,
-        "GradeReason": grade_reason,
-        "HoldTime": hold_time,
-        "PeakPrice": peak_price,
-        "HardStopPrice": hard_stop_price,
-        "TrailingStopPrice": trailing_stop_price,
-        "MaxDrawdownFromPeakPercent": max_drawdown_from_peak_percent,
-        "PnLPercent": pnl_percent,
-        "ExitReason": exit_reason
-    }
-
-    append_trade_row(TRADES_FILE, row)
-    append_trade_row(VISIBLE_TRADES_FILE, row)
-    try:
-        sync_trade_limits_from_file(load_config())
-    except:
-        pass
-    return row
-
-
-def write_trade_header(path):
-    with open(path, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(TRADE_COLUMNS)
-
-
-def clear_recent_trades():
-    write_trade_header(VISIBLE_TRADES_FILE)
-
-
-def restore_cleared_trades():
-    if not os.path.exists(TRADES_FILE):
-        write_trade_header(VISIBLE_TRADES_FILE)
-        return True
-
-    ensure_trade_file(TRADES_FILE)
-    with open(TRADES_FILE, "r", newline="") as src:
-        permanent_history = src.read()
-
-    with open(VISIBLE_TRADES_FILE, "w", newline="") as dst:
-        dst.write(permanent_history)
-
-    return True
 
 
 def parse_order_response(status, text, label="ORDER"):
@@ -906,6 +760,16 @@ def sync_trade_limits_from_file(config):
         BOT_STATE["cooldown_remaining_seconds"] = cooldown_remaining_seconds
 
     return trades_today, spent_today
+
+
+configure_trade_logger(
+    current_market_context_snapshot=current_market_context_snapshot,
+    grade_entry_setup=grade_entry_setup,
+    grade_exit_trade=grade_exit_trade,
+    stop_debug_values=stop_debug_values,
+    load_config=load_config,
+    sync_trade_limits_from_file=sync_trade_limits_from_file
+)
 
 
 def get_cooldown_state(config):
@@ -1330,32 +1194,9 @@ def build_market_context(config, positions=None):
                 reasons, "bearish", f"Broke {key.replace('_', ' ')}", bullish_score, bearish_score
             )
 
-    nearest_resistance = min(
-        [value - current_price for key, value in levels.items() if "high" in key and value is not None and value >= current_price],
-        default=None
-    )
-    nearest_support = min(
-        [current_price - value for key, value in levels.items() if "low" in key and value is not None and value <= current_price],
-        default=None
-    )
-
     current_range_size = levels["today_high"] - levels["today_low"]
     stagnant_range = current_price * 0.001 if current_price else 0
     stagnant_market = current_range_size <= stagnant_range
-
-    if stagnant_market:
-        bullish_score = max(0, bullish_score - 1)
-        bearish_score = max(0, bearish_score - 1)
-        reasons.append("Stagnant market penalty")
-
-    if nearest_resistance is not None and nearest_resistance > current_price * 0.001:
-        bullish_score, bearish_score = add_score(
-            reasons, "bullish", "Not near major resistance", bullish_score, bearish_score
-        )
-    if nearest_support is not None and nearest_support > current_price * 0.001:
-        bullish_score, bearish_score = add_score(
-            reasons, "bearish", "Not near major support", bullish_score, bearish_score
-        )
 
     current_pl = 0
     distance_to_trailing_stop = None
@@ -1384,23 +1225,26 @@ def build_market_context(config, positions=None):
                 reasons.append("Current P/L supports holding")
 
     minimum_signals = int(e.get("minimum_signals", 3))
+    minimum_confidence = int(config.get("minimum_confidence", 2))
     confidence = abs(bullish_score - bearish_score)
     market_state = "NEUTRAL"
 
-    if confidence <= 1:
-        market_state = "CHOPPY"
-        reasons.append(f"Confidence {confidence} is too low")
-    elif bullish_score >= minimum_signals and bullish_score > bearish_score:
+    if bullish_score >= minimum_signals and confidence >= minimum_confidence:
         market_state = "BULLISH"
-    elif bearish_score >= minimum_signals and bearish_score > bullish_score:
+        current_signal = "CALL"
+    elif bearish_score >= minimum_signals and confidence >= minimum_confidence:
         market_state = "BEARISH"
-    elif stagnant_market:
-        market_state = "STAGNANT"
-    elif bullish_percent < 55 and bearish_percent < 55:
-        market_state = "CHOPPY"
-        reasons.append("Ticks and scores are choppy")
-
-    current_signal = "CALL" if market_state == "BULLISH" else "PUT" if market_state == "BEARISH" else "NONE"
+        current_signal = "PUT"
+    else:
+        current_signal = "NONE"
+        if confidence <= 1:
+            market_state = "CHOPPY"
+            reasons.append(f"Confidence {confidence} is too low")
+        elif stagnant_market:
+            market_state = "STAGNANT"
+        elif bullish_percent < 55 and bearish_percent < 55:
+            market_state = "CHOPPY"
+            reasons.append("Ticks and scores are choppy")
 
     return {
         "price": current_price,
@@ -1441,11 +1285,11 @@ def build_market_context(config, positions=None):
 
 
 def decide_surfer_action(config, positions, market_context):
+    market_context = normalize_signal(market_context)
     minimum_signals = int(config["entry_rules"].get("minimum_signals", 3))
     minimum_confidence = int(config.get("minimum_confidence", 2))
     hard_stop_percent = float(config["strategy"].get("hard_stop_percent", 20))
     trailing_stop_percent = float(config["strategy"].get("trailing_stop_percent", 15))
-    market_state = market_context["market_state"]
     confidence = market_context.get("confidence", 0)
 
     if positions:
@@ -1463,46 +1307,70 @@ def decide_surfer_action(config, positions, market_context):
 
         pnl_percent = ((current_price - entry_price) / entry_price) * 100 if current_price and entry_price else 0
         trailing_drawdown = ((peak - current_price) / peak) * 100 if current_price and peak else 0
-        is_call = "C" in symbol[-9:]
 
         if pnl_percent <= -hard_stop_percent:
             return "SELL", ["Hard stop hit", f"P/L {pnl_percent:.2f}%"]
         if trailing_drawdown >= trailing_stop_percent:
             return "SELL", ["Trailing stop hit", f"Drawdown {trailing_drawdown:.2f}%"]
-        if is_call and market_state == "BEARISH" and market_context["bearish_score"] >= minimum_signals:
-            return "SELL", ["Full market context flipped bearish"] + market_context["reasons"]
-        if not is_call and market_state == "BULLISH" and market_context["bullish_score"] >= minimum_signals:
-            return "SELL", ["Full market context flipped bullish"] + market_context["reasons"]
 
-        return "HOLD", ["Holding because market context has not confirmed exit"] + market_context["reasons"]
+        return "HOLD", ["Hard stop not hit", "Trailing stop not hit"] + market_context.get("reasons", [])
 
-    if market_state == "BULLISH" and confidence >= minimum_confidence:
-        return "BUY CALL", market_context["reasons"]
-    if market_state == "BEARISH" and confidence >= minimum_confidence:
-        return "BUY PUT", market_context["reasons"]
-    if market_state in ["BULLISH", "BEARISH"]:
-        return "DO NOTHING", [f"Confidence {confidence} below required {minimum_confidence}"] + market_context["reasons"]
-    if market_state == "STAGNANT":
-        return "DO NOTHING", ["Market stagnant"] + market_context["reasons"]
-    if market_state == "CHOPPY":
-        return "DO NOTHING", ["Market choppy"] + market_context["reasons"]
+    if market_context.get("bullish_score", 0) >= minimum_signals and confidence >= minimum_confidence:
+        return "BUY CALL", market_context.get("reasons", [])
+    if market_context.get("bearish_score", 0) >= minimum_signals and confidence >= minimum_confidence:
+        return "BUY PUT", market_context.get("reasons", [])
 
-    return "DO NOTHING", ["Market neutral"] + market_context["reasons"]
+    return "DO NOTHING", market_context.get("reasons", [])
 
 
 def calculate_surfer_signal(config, positions=None):
-    market_context = build_market_context(config, positions)
+    market_context = normalize_signal(build_market_context(config, positions))
     decision, decision_reasons = decide_surfer_action(config, positions or [], market_context)
     market_context["decision"] = decision
     market_context["decision_reasons"] = decision_reasons
-    return market_context
+    return normalize_signal(market_context)
+
+
+def normalize_signal(signal):
+    signal = dict(signal or {})
+    tick_statistics = dict(signal.get("tick_statistics") or {})
+    green_percent = signal.get("green_percent", tick_statistics.get("green_percent", signal.get("bullish_percent", 0)))
+    red_percent = signal.get("red_percent", tick_statistics.get("red_percent", signal.get("bearish_percent", 0)))
+    reasons = signal.get("decision_reasons") or signal.get("reasons") or ["Need more market context"]
+
+    signal.setdefault("price", None)
+    signal.setdefault("bullish_score", 0)
+    signal.setdefault("bearish_score", 0)
+    signal.setdefault("confidence", 0)
+    signal.setdefault("current_signal", "NONE")
+    signal.setdefault("market_state", "UNKNOWN")
+    signal.setdefault("decision", "DO NOTHING")
+    signal.setdefault("decision_reasons", reasons)
+    signal.setdefault("reasons", reasons)
+    signal.setdefault("level_distances", {})
+    signal.setdefault("levels", {})
+    signal.setdefault("current_pl", 0)
+    signal.setdefault("distance_to_trailing_stop", None)
+    signal.setdefault("current_range_size", 0)
+    signal.setdefault("bullish_percent", green_percent)
+    signal.setdefault("bearish_percent", red_percent)
+    signal.setdefault("green_percent", green_percent)
+    signal.setdefault("red_percent", red_percent)
+    signal.setdefault("tick_statistics", {
+        "green_ticks": tick_statistics.get("green_ticks", 0),
+        "red_ticks": tick_statistics.get("red_ticks", 0),
+        "green_percent": green_percent,
+        "red_percent": red_percent
+    })
+    return signal
 
 
 def format_market_reason_log(market_context):
+    market_context = normalize_signal(market_context)
     lines = [
-        f"Market State: {market_context['market_state']}",
-        f"Bullish Score: {market_context['bullish_score']}",
-        f"Bearish Score: {market_context['bearish_score']}",
+        f"Market State: {market_context.get('market_state', 'UNKNOWN')}",
+        f"Bullish Score: {market_context.get('bullish_score', 0)}",
+        f"Bearish Score: {market_context.get('bearish_score', 0)}",
         f"Confidence: {market_context.get('confidence', 0)}",
         f"Decision: {market_context.get('decision', 'DO NOTHING')}"
     ]
@@ -1511,18 +1379,19 @@ def format_market_reason_log(market_context):
 
 
 def update_bot_signal_state(signal, call_cost=None, put_cost=None):
+    signal = normalize_signal(signal)
     with BOT_LOCK:
-        BOT_STATE["bullish_score"] = signal["bullish_score"]
-        BOT_STATE["bearish_score"] = signal["bearish_score"]
-        BOT_STATE["confidence"] = signal["confidence"]
-        BOT_STATE["bullish_percent"] = signal["bullish_percent"]
-        BOT_STATE["bearish_percent"] = signal["bearish_percent"]
-        BOT_STATE["current_signal"] = signal["current_signal"]
+        BOT_STATE["bullish_score"] = signal.get("bullish_score", 0)
+        BOT_STATE["bearish_score"] = signal.get("bearish_score", 0)
+        BOT_STATE["confidence"] = signal.get("confidence", 0)
+        BOT_STATE["bullish_percent"] = signal.get("bullish_percent", signal.get("green_percent", 0))
+        BOT_STATE["bearish_percent"] = signal.get("bearish_percent", signal.get("red_percent", 0))
+        BOT_STATE["current_signal"] = signal.get("current_signal", "NONE")
         BOT_STATE["next_call_cost"] = call_cost
         BOT_STATE["next_put_cost"] = put_cost
-        BOT_STATE["market_state"] = signal["market_state"]
+        BOT_STATE["market_state"] = signal.get("market_state", "UNKNOWN")
         BOT_STATE["market_context"] = signal
-        BOT_STATE["level_distances"] = signal["level_distances"]
+        BOT_STATE["level_distances"] = signal.get("level_distances", {})
         BOT_STATE["reason_log"] = format_market_reason_log(signal)
 
 
@@ -1946,19 +1815,20 @@ def surfer_bot_tick(allow_entry=True):
             put_cost = BOT_STATE["next_put_cost"]
     positions = get_position()
     signal = calculate_surfer_signal(config, positions)
+    signal = normalize_signal(signal)
     update_bot_signal_state(signal, call_cost, put_cost)
 
     print("DIRECTION")
-    print("green_percent:", signal["bullish_percent"])
-    print("red_percent:", signal["bearish_percent"])
+    print("green_percent:", signal.get("bullish_percent", signal.get("green_percent", 0)))
+    print("red_percent:", signal.get("bearish_percent", signal.get("red_percent", 0)))
     print("SIGNAL")
-    print("bullish_score:", signal["bullish_score"])
-    print("bearish_score:", signal["bearish_score"])
-    print("confidence:", signal["confidence"])
-    print("current_signal:", signal["current_signal"])
-    print("market_state:", signal["market_state"])
-    print("signal:", signal["current_signal"])
-    print("decision:", signal["decision"])
+    print("bullish_score:", signal.get("bullish_score", 0))
+    print("bearish_score:", signal.get("bearish_score", 0))
+    print("confidence:", signal.get("confidence", 0))
+    print("current_signal:", signal.get("current_signal", "NONE"))
+    print("market_state:", signal.get("market_state", "UNKNOWN"))
+    print("signal:", signal.get("current_signal", "NONE"))
+    print("decision:", signal.get("decision", "DO NOTHING"))
 
     if not config.get("bot_enabled"):
         add_bot_reason("BOT scan only: bot_enabled is false")
@@ -2331,35 +2201,6 @@ def save_settings():
 
     save_config(config)
     return redirect("/")
-
-def get_recent_trades(limit=10):
-    try:
-        if os.path.exists(TRADES_FILE):
-            ensure_trade_file(TRADES_FILE)
-        if os.path.exists(VISIBLE_TRADES_FILE):
-            ensure_trade_file(VISIBLE_TRADES_FILE)
-        visible_path = VISIBLE_TRADES_FILE if os.path.exists(VISIBLE_TRADES_FILE) else TRADES_FILE
-
-        with open(visible_path, "r", newline="") as f:
-            reader = csv.DictReader(f)
-            trades = list(reader)
-
-        if limit is None:
-            return trades
-
-        return trades[-limit:]
-    except:
-        return []
-
-
-def read_permanent_trades():
-    try:
-        ensure_trade_file(TRADES_FILE)
-        with open(TRADES_FILE, "r", newline="") as f:
-            return list(csv.DictReader(f))
-    except:
-        return []
-
 
 def average(values):
     values = [value for value in values if value is not None]

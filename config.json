@@ -5,7 +5,7 @@
     "contracts": 1,
     "bot_enabled": true,
     "strategy_mode": "SURFER",
-    "decision_time": "11:48",
+    "decision_time": "9:42",
     "bot_budget": 1000.0,
     "max_contract_price": 1.0,
     "strategy": {
