@@ -8,15 +8,17 @@ import threading
 import time
 import html as html_lib
 from datetime import datetime, timedelta, time as datetime_time
+from dotenv import load_dotenv
 from logs.trade_logger import *
 
+load_dotenv()
 
 
 app = Flask(__name__)
 
-TOKEN = "0kkGC4Wj40dAv9GjOO6c7hioOiXM"
-ACCOUNT = "VA52467186"
-BASE_URL = "https://sandbox.tradier.com/v1"
+TOKEN = os.getenv("TRADIER_TOKEN", "")
+ACCOUNT = os.getenv("TRADIER_ACCOUNT", "")
+BASE_URL = os.getenv("TRADIER_BASE_URL", "https://sandbox.tradier.com/v1")
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 BOT_AUDIT_FILE = os.path.join(APP_DIR, "bot_audit_log.csv")
 BOT_AUDIT_COLUMNS = [
