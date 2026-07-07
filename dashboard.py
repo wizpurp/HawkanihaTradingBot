@@ -31,7 +31,10 @@ BOT_AUDIT_COLUMNS = [
     "order_status", "order_id", "human_or_bot", "max_unrealized_profit",
     "max_drawdown", "hold_time", "spy_price_at_entry", "spy_price_at_exit",
     "market_state_at_entry", "market_state_at_exit", "ema_state",
-    "vwap_state", "green_tick_percent", "red_tick_percent"
+    "vwap_state", "green_tick_percent", "red_tick_percent",
+    "highest_option_price_since_entry", "trailing_stop_percent",
+    "calculated_stop_price", "stop_armed", "no_sell_reason",
+    "sell_trigger_reason", "trailing_drawdown_percent"
 ]
 BOT_LOCK = threading.Lock()
 BOT_STATE = {
@@ -458,7 +461,14 @@ def log_bot_audit(action, decision, symbol, market_context, config, **extra):
         "ema_state": extra.get("ema_state", market_context.get("ema_state", "")),
         "vwap_state": extra.get("vwap_state", market_context.get("vwap_state", "")),
         "green_tick_percent": extra.get("green_tick_percent", tick_statistics.get("green_percent", "")),
-        "red_tick_percent": extra.get("red_tick_percent", tick_statistics.get("red_percent", ""))
+        "red_tick_percent": extra.get("red_tick_percent", tick_statistics.get("red_percent", "")),
+        "highest_option_price_since_entry": extra.get("highest_option_price_since_entry", ""),
+        "trailing_stop_percent": extra.get("trailing_stop_percent", ""),
+        "calculated_stop_price": extra.get("calculated_stop_price", ""),
+        "stop_armed": extra.get("stop_armed", ""),
+        "no_sell_reason": extra.get("no_sell_reason", ""),
+        "sell_trigger_reason": extra.get("sell_trigger_reason", ""),
+        "trailing_drawdown_percent": extra.get("trailing_drawdown_percent", "")
     }
 
     with open(BOT_AUDIT_FILE, "a", newline="") as f:
@@ -1613,6 +1623,36 @@ def try_surfer_exit(config, positions, market_context):
     return False
 
 
+def fast_exit_audit_fields(
+    symbol,
+    qty,
+    cost_basis,
+    entry_price,
+    current_price,
+    peak,
+    trailing_stop_percent,
+    trailing_stop_price,
+    trailing_drawdown,
+    stop_armed,
+    no_sell_reason="",
+    sell_trigger_reason=""
+):
+    return {
+        "option_symbol": symbol,
+        "entry_price": entry_price,
+        "current_price": current_price,
+        "current_value": option_current_value(current_price, qty),
+        "cost_basis": cost_basis,
+        "highest_option_price_since_entry": peak,
+        "trailing_stop_percent": trailing_stop_percent,
+        "calculated_stop_price": trailing_stop_price,
+        "stop_armed": stop_armed,
+        "no_sell_reason": no_sell_reason,
+        "sell_trigger_reason": sell_trigger_reason,
+        "trailing_drawdown_percent": trailing_drawdown
+    }
+
+
 def fast_exit_poll(config, positions):
     if not positions:
         return False
@@ -1620,6 +1660,22 @@ def fast_exit_poll(config, positions):
     pos = positions[0]
     symbol = pos.get("symbol", "")
     if len(symbol) <= 6:
+        market_context = current_market_context_snapshot()
+        reason = "Fast exit skipped: open position is not an option contract"
+        print("FAST EXIT POLL")
+        print("symbol:", symbol)
+        print("no_sell_reason:", reason)
+        log_bot_audit(
+            "SKIP",
+            "HOLD",
+            config.get("symbol", ""),
+            market_context,
+            config,
+            option_symbol=symbol,
+            reason_log=[reason],
+            skip_reason=reason,
+            no_sell_reason=reason
+        )
         return False
 
     qty = int(float(pos.get("quantity", 1)))
@@ -1644,6 +1700,9 @@ def fast_exit_poll(config, positions):
     trailing_stop_price = peak * (1 - trailing_stop_percent / 100)
     trailing_drawdown = ((peak - current_price) / peak) * 100 if peak else 0
     distance_to_trailing_stop = current_price - trailing_stop_price
+    stop_armed = peak > entry_price
+    no_sell_reason = ""
+    sell_trigger_reason = ""
     decision = "HOLD"
     reasons = [
         "Fast exit poll",
@@ -1657,11 +1716,14 @@ def fast_exit_poll(config, positions):
 
     if pnl_percent <= -hard_stop_percent:
         decision = "SELL"
+        sell_trigger_reason = f"Hard stop hit: P/L {pnl_percent:.2f}% <= -{hard_stop_percent:.2f}%"
         reasons = ["Hard stop hit", f"P/L {pnl_percent:.2f}% <= -{hard_stop_percent:.2f}%"] + reasons
     elif trailing_drawdown >= trailing_stop_percent:
         decision = "SELL"
+        sell_trigger_reason = f"Trailing stop hit: drawdown {trailing_drawdown:.2f}% >= {trailing_stop_percent:.2f}%"
         reasons = ["Trailing stop hit", f"Drawdown {trailing_drawdown:.2f}% >= {trailing_stop_percent:.2f}%"] + reasons
     else:
+        no_sell_reason = f"Hard stop not hit; trailing stop not hit; stop_armed={stop_armed}; drawdown {trailing_drawdown:.2f}% < {trailing_stop_percent:.2f}%"
         reasons = [
             "Trailing stop not hit.",
             f"Drawdown {trailing_drawdown:.2f}% < {trailing_stop_percent:.2f}%."
@@ -1682,14 +1744,40 @@ def fast_exit_poll(config, positions):
     print("FAST EXIT POLL")
     print("symbol:", symbol)
     print("entry_price:", entry_price)
-    print("current_price:", current_price)
-    print("peak_price:", peak)
+    print("current_option_price:", current_price)
+    print("highest_option_price_since_entry:", peak)
     print("hard_stop_price:", hard_stop_price)
-    print("trailing_stop_price:", trailing_stop_price)
+    print("trailing_stop_percent:", trailing_stop_percent)
+    print("calculated_stop_price:", trailing_stop_price)
     print("drawdown_percent:", trailing_drawdown)
+    print("stop_armed:", stop_armed)
+    print("no_sell_reason:", no_sell_reason)
+    print("sell_trigger_reason:", sell_trigger_reason)
     print("decision:", decision)
 
     if decision != "SELL":
+        log_bot_audit(
+            "DO NOTHING",
+            decision,
+            config.get("symbol", ""),
+            market_context,
+            config,
+            reason_log=reasons,
+            skip_reason="fast exit hold",
+            **fast_exit_audit_fields(
+                symbol,
+                qty,
+                cost_basis,
+                entry_price,
+                current_price,
+                peak,
+                trailing_stop_percent,
+                trailing_stop_price,
+                trailing_drawdown,
+                stop_armed,
+                no_sell_reason=no_sell_reason
+            )
+        )
         return False
 
     reason = "; ".join(reasons)
@@ -1697,7 +1785,29 @@ def fast_exit_poll(config, positions):
 
     if not option_market_is_open():
         add_bot_reason("FAST EXIT skipped: options market is closed")
-        log_bot_audit("SKIP", decision, config.get("symbol", ""), market_context, config, option_symbol=symbol, skip_reason="options market closed", exit_reason=reason)
+        log_bot_audit(
+            "SKIP",
+            decision,
+            config.get("symbol", ""),
+            market_context,
+            config,
+            reason_log=reasons,
+            skip_reason="options market closed",
+            exit_reason=reason,
+            **fast_exit_audit_fields(
+                symbol,
+                qty,
+                cost_basis,
+                entry_price,
+                current_price,
+                peak,
+                trailing_stop_percent,
+                trailing_stop_price,
+                trailing_drawdown,
+                stop_armed,
+                sell_trigger_reason=sell_trigger_reason
+            )
+        )
         return True
 
     ok, order_status, status, text = submit_and_parse_option_order(
@@ -1720,14 +1830,9 @@ def fast_exit_poll(config, positions):
             config.get("symbol", ""),
             market_context,
             config,
-            option_symbol=symbol,
             exit_grade=trade_row.get("ExitGrade", ""),
             pnl=pnl,
             pnl_percent=pnl_percent,
-            current_price=current_price,
-            entry_price=entry_price,
-            current_value=option_current_value(current_price, qty),
-            cost_basis=cost_basis,
             exit_reason=reason,
             order_status=order_status,
             order_id=order_id,
@@ -1735,7 +1840,21 @@ def fast_exit_poll(config, positions):
             max_drawdown=max_drawdown,
             hold_time=trade_row.get("HoldTime", ""),
             spy_price_at_exit=market_context.get("price", ""),
-            market_state_at_exit=market_context.get("market_state", "")
+            market_state_at_exit=market_context.get("market_state", ""),
+            reason_log=reasons,
+            **fast_exit_audit_fields(
+                symbol,
+                qty,
+                cost_basis,
+                entry_price,
+                current_price,
+                peak,
+                trailing_stop_percent,
+                trailing_stop_price,
+                trailing_drawdown,
+                stop_armed,
+                sell_trigger_reason=sell_trigger_reason
+            )
         )
         update_last_trade_review({
             "entry_reason": entry_row.get("GradeReason", "") if entry_row else "",
@@ -1756,7 +1875,31 @@ def fast_exit_poll(config, positions):
         return True
 
     add_bot_reason(f"FAST EXIT rejected or not accepted: {order_status}")
-    log_bot_audit("SKIP", decision, config.get("symbol", ""), market_context, config, option_symbol=symbol, skip_reason="fast exit rejected or not accepted", exit_reason=reason, order_status=order_status, order_id=order_id)
+    log_bot_audit(
+        "SKIP",
+        decision,
+        config.get("symbol", ""),
+        market_context,
+        config,
+        reason_log=reasons,
+        skip_reason="fast exit rejected or not accepted",
+        exit_reason=reason,
+        order_status=order_status,
+        order_id=order_id,
+        **fast_exit_audit_fields(
+            symbol,
+            qty,
+            cost_basis,
+            entry_price,
+            current_price,
+            peak,
+            trailing_stop_percent,
+            trailing_stop_price,
+            trailing_drawdown,
+            stop_armed,
+            sell_trigger_reason=sell_trigger_reason
+        )
+    )
     return True
 
 
@@ -2498,6 +2641,46 @@ def get_position_pl_data(pos):
     return position_data
 
 
+def get_bot_health_data(positions, bot_snapshot):
+    broker_has_position = bool(positions)
+    with BOT_LOCK:
+        internal_symbols = list(BOT_STATE["position_peaks"].keys())
+    internal_has_position = bool(internal_symbols)
+    position_sync = "OK" if internal_has_position == broker_has_position else "MISMATCH"
+
+    health = {
+        "engine_running": bool(bot_snapshot.get("thread_alive")),
+        "last_tick": bot_snapshot.get("last_tick", ""),
+        "internal_has_position": internal_has_position,
+        "broker_has_position": broker_has_position,
+        "position_sync": position_sync,
+        "warning": position_sync == "MISMATCH",
+        "symbol": "",
+        "entry_price": None,
+        "current_price": None,
+        "peak_price": None,
+        "trailing_stop_price": None,
+        "trailing_stop_percent": None,
+        "stop_armed": False,
+        "hold_time": "N/A"
+    }
+
+    if positions:
+        pl = get_position_pl_data(positions[0])
+        health.update({
+            "symbol": pl.get("symbol", ""),
+            "entry_price": pl.get("entry_price"),
+            "current_price": pl.get("current_price"),
+            "peak_price": pl.get("peak_price"),
+            "trailing_stop_price": pl.get("trailing_stop_price"),
+            "trailing_stop_percent": pl.get("trailing_stop_percent"),
+            "stop_armed": bool(pl.get("peak_price") and pl.get("entry_price") and pl.get("peak_price") > pl.get("entry_price")),
+            "hold_time": pl.get("hold_time", "N/A")
+        })
+
+    return health
+
+
 @app.route("/")
 def dashboard():
     config = load_config()
@@ -2555,6 +2738,7 @@ def dashboard():
     reason_log_html = "<br>".join(bot_snapshot["reason_log"][-10:]) or "No bot actions yet."
     market_context = bot_snapshot["market_context"] or empty_market_context(get_quote_price(quote))
     trade_performance = get_trade_performance()
+    bot_health = get_bot_health_data(positions, bot_snapshot)
     levels = market_context.get("levels", {})
     distances = market_context.get("level_distances", {})
 
@@ -2635,6 +2819,16 @@ button {{
 .yellow {{ background: #ffd166; }}
 .good {{ color: #00ff88; }}
 .bad {{ color: #ff6666; }}
+.warning {{
+    background: #7a1111;
+    color: white;
+    padding: 12px;
+    border-radius: 8px;
+    font-size: 22px;
+    font-weight: bold;
+    margin-bottom: 12px;
+    text-align: center;
+}}
 .trade-card {{
     border-left: 5px solid #777;
     padding: 12px;
@@ -2847,6 +3041,32 @@ Allow Calls: {e.get("allow_calls")}<br>
 Allow Puts: {e.get("allow_puts")}<br>
 Cooldown Minutes: {e.get("cooldown_minutes")}<br>
 Max Trades Per Day: {e.get("max_trades_per_day")}
+</div>
+
+<div class="card">
+<h2>Bot Health</h2>
+{ '<div class="warning">POSITION STATE MISMATCH</div>' if bot_health["warning"] else '' }
+Engine Running: { "YES" if bot_health["engine_running"] else "NO" }<br>
+Last Tick Time: {bot_health["last_tick"] or "N/A"}<br>
+Bot Internal Position: { "YES" if bot_health["internal_has_position"] else "NO" }<br>
+Broker Position (live Tradier): { "YES" if bot_health["broker_has_position"] else "NO" }<br>
+Position Sync: <span class="{ "bad" if bot_health["position_sync"] == "MISMATCH" else "good" }">{bot_health["position_sync"]}</span><br>
+"""
+
+    if bot_health["broker_has_position"]:
+        html += f"""
+<br>
+Current Symbol: {bot_health["symbol"]}<br>
+Entry Price: {fmt_money(bot_health["entry_price"])}<br>
+Current Option Price: {fmt_money(bot_health["current_price"])}<br>
+Highest Price Since Entry: {fmt_money(bot_health["peak_price"])}<br>
+Trailing Stop Price: {fmt_money(bot_health["trailing_stop_price"])}<br>
+Trailing Stop %: {bot_health["trailing_stop_percent"]:.2f}%<br>
+Stop Armed: { "YES" if bot_health["stop_armed"] else "NO" }<br>
+Time In Trade: {bot_health["hold_time"]}<br>
+"""
+
+    html += """
 </div>
 
 <div class="card">
