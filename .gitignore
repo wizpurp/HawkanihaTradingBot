@@ -1,0 +1,45 @@
+# Python bytecode/cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Environment/secrets
+.env
+.env.*
+!.env.example
+
+# Test/coverage caches
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Type/lint/tool caches
+.mypy_cache/
+.pyre/
+.ruff_cache/
+
+# Build/package outputs
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Logs/runtime output
+*.log
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Local temp files
+*.tmp
+*.bak
