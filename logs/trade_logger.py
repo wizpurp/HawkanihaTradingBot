@@ -10,7 +10,7 @@ TRADE_COLUMNS = [
     "Source", "EntryGrade", "LiveGrade", "ExitGrade", "BotGrade",
     "TradeScore", "GradeReason", "HoldTime", "PeakPrice",
     "HardStopPrice", "TrailingStopPrice", "MaxDrawdownFromPeakPercent",
-    "PnLPercent", "ExitReason"
+    "PnLPercent", "ExitReason", "EntryPriceSource", "EstimatedEntryPrice"
 ]
 
 _CALLBACKS = {}
@@ -78,7 +78,17 @@ def find_last_buy(symbol):
     return None
 
 
-def log_trade(action, symbol, qty, price="", pnl="", source="HUMAN", market_context=None):
+def log_trade(
+    action,
+    symbol,
+    qty,
+    price="",
+    pnl="",
+    source="HUMAN",
+    market_context=None,
+    entry_price_source="",
+    estimated_entry_price=""
+):
     current_market_context_snapshot = _callback("current_market_context_snapshot")
     grade_entry_setup = _callback("grade_entry_setup")
     grade_exit_trade = _callback("grade_exit_trade")
@@ -148,7 +158,9 @@ def log_trade(action, symbol, qty, price="", pnl="", source="HUMAN", market_cont
         "TrailingStopPrice": trailing_stop_price,
         "MaxDrawdownFromPeakPercent": max_drawdown_from_peak_percent,
         "PnLPercent": pnl_percent,
-        "ExitReason": exit_reason
+        "ExitReason": exit_reason,
+        "EntryPriceSource": entry_price_source,
+        "EstimatedEntryPrice": estimated_entry_price
     }
 
     append_trade_row(TRADES_FILE, row)

@@ -34,7 +34,8 @@ BOT_AUDIT_COLUMNS = [
     "vwap_state", "green_tick_percent", "red_tick_percent",
     "highest_option_price_since_entry", "trailing_stop_percent",
     "calculated_stop_price", "stop_armed", "no_sell_reason",
-    "sell_trigger_reason", "trailing_drawdown_percent"
+    "sell_trigger_reason", "trailing_drawdown_percent",
+    "entry_price_source", "estimated_entry_price"
 ]
 BOT_LOCK = threading.Lock()
 BOT_STATE = {
@@ -68,7 +69,28 @@ BOT_STATE = {
     "position_peaks": {},
     "position_max_profit": {},
     "position_max_drawdown": {},
-    "last_trade_review": {}
+    "last_trade_review": {},
+    "last_quote_time": "",
+    "last_quote_epoch": None,
+    "last_quote_latency_ms": None,
+    "last_quote_status": "UNKNOWN",
+    "last_position_time": "",
+    "last_position_epoch": None,
+    "last_position_latency_ms": None,
+    "last_position_status": "UNKNOWN",
+    "last_tick_epoch": None,
+    "last_tick_duration_ms": None,
+    "last_error": "None",
+    "quote_request_count": 0,
+    "quote_latency_total_ms": 0,
+    "quote_latency_slowest_ms": 0,
+    "quote_failed_count": 0,
+    "quote_rate_limited_count": 0,
+    "last_order_submit_ms": None,
+    "last_broker_confirm_ms": None,
+    "last_market_scan_ms": None,
+    "last_indicators_ms": None,
+    "last_signal_ms": None
 }
 
 
@@ -468,7 +490,9 @@ def log_bot_audit(action, decision, symbol, market_context, config, **extra):
         "stop_armed": extra.get("stop_armed", ""),
         "no_sell_reason": extra.get("no_sell_reason", ""),
         "sell_trigger_reason": extra.get("sell_trigger_reason", ""),
-        "trailing_drawdown_percent": extra.get("trailing_drawdown_percent", "")
+        "trailing_drawdown_percent": extra.get("trailing_drawdown_percent", ""),
+        "entry_price_source": extra.get("entry_price_source", ""),
+        "estimated_entry_price": extra.get("estimated_entry_price", "")
     }
 
     with open(BOT_AUDIT_FILE, "a", newline="") as f:
@@ -534,7 +558,86 @@ def option_current_value(option_price, qty):
     return option_price * 100 * qty
 
 
+def record_api_diagnostic(kind, started_at, status):
+    latency_ms = int((time.perf_counter() - started_at) * 1000)
+    now = datetime.now()
+    timestamp = now.strftime("%H:%M:%S.%f")[:-3]
+    epoch = time.time()
+    with BOT_LOCK:
+        BOT_STATE[f"last_{kind}_time"] = timestamp
+        BOT_STATE[f"last_{kind}_epoch"] = epoch
+        BOT_STATE[f"last_{kind}_latency_ms"] = latency_ms
+        BOT_STATE[f"last_{kind}_status"] = status
+        if kind == "quote":
+            BOT_STATE["quote_request_count"] += 1
+            BOT_STATE["quote_latency_total_ms"] += latency_ms
+            BOT_STATE["quote_latency_slowest_ms"] = max(BOT_STATE["quote_latency_slowest_ms"], latency_ms)
+            if status == "HTTP 429":
+                BOT_STATE["quote_rate_limited_count"] += 1
+            if not str(status).startswith("OK"):
+                BOT_STATE["quote_failed_count"] += 1
+
+
+def record_tick_finished(started_at):
+    with BOT_LOCK:
+        BOT_STATE["last_tick"] = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        BOT_STATE["last_tick_epoch"] = time.time()
+        BOT_STATE["last_tick_duration_ms"] = int((time.perf_counter() - started_at) * 1000)
+
+
+def set_last_error(error):
+    with BOT_LOCK:
+        BOT_STATE["last_error"] = str(error) if error else "None"
+
+
+def age_ms(epoch):
+    if not epoch:
+        return None
+    return int((time.time() - epoch) * 1000)
+
+
+def find_broker_position(symbol):
+    positions = get_position()
+    if not positions:
+        return None
+
+    for pos in positions:
+        if pos.get("symbol") == symbol:
+            return pos
+
+    return None
+
+
+def resolve_actual_entry_price(option_symbol, expected_qty, estimated_entry_price, retries=6, delay_seconds=0.5):
+    for attempt in range(retries):
+        pos = find_broker_position(option_symbol)
+        if pos:
+            try:
+                qty = float(pos.get("quantity", expected_qty) or expected_qty)
+                cost_basis = float(pos.get("cost_basis", 0) or 0)
+                if qty and cost_basis:
+                    actual_entry_price = cost_basis / qty / 100
+                    print("BUY ENTRY RESOLVED FROM BROKER")
+                    print("symbol:", option_symbol)
+                    print("qty:", qty)
+                    print("cost_basis:", cost_basis)
+                    print("actual_entry_price:", actual_entry_price)
+                    return actual_entry_price, "BROKER_COST_BASIS", estimated_entry_price
+            except Exception as exc:
+                print("BUY ENTRY RESOLVE ERROR:", exc)
+
+        if attempt < retries - 1:
+            time.sleep(delay_seconds)
+
+    print("BUY ENTRY ESTIMATED")
+    print("symbol:", option_symbol)
+    print("estimated_entry_price:", estimated_entry_price)
+    print("reason:", "broker position unavailable after retry")
+    return estimated_entry_price, "ESTIMATED_ASK", estimated_entry_price
+
+
 def get_market_quote(symbol):
+    started_at = time.perf_counter()
     try:
         r = requests.get(
             f"{BASE_URL}/markets/quotes",
@@ -542,38 +645,47 @@ def get_market_quote(symbol):
             headers=headers()
         )
         if r.status_code != 200:
+            record_api_diagnostic("quote", started_at, f"HTTP {r.status_code}")
             return None
 
         data = r.json()["quotes"]
         if "quote" not in data:
+            record_api_diagnostic("quote", started_at, "NO_QUOTE")
             return None
 
         quote = data["quote"]
+        record_api_diagnostic("quote", started_at, "OK")
         if isinstance(quote, list):
             return quote[0]
         return quote
-    except:
+    except Exception as exc:
+        record_api_diagnostic("quote", started_at, f"ERROR {exc}")
         return None
 
 
 def get_position():
+    started_at = time.perf_counter()
     try:
         r = requests.get(
             f"{BASE_URL}/accounts/{ACCOUNT}/positions",
             headers=headers()
         )
         if r.status_code != 200:
+            record_api_diagnostic("position", started_at, f"HTTP {r.status_code}")
             return None
 
         data = r.json()
         print("POSITIONS DATA:", data)
 
         if data.get("positions") == "null":
+            record_api_diagnostic("position", started_at, "OK_NO_POSITION")
             return None
 
         pos = data["positions"]["position"]
+        record_api_diagnostic("position", started_at, "OK_POSITION")
         return pos if isinstance(pos, list) else [pos]
-    except:
+    except Exception as exc:
+        record_api_diagnostic("position", started_at, f"ERROR {exc}")
         return None
 
 
@@ -648,11 +760,16 @@ def submit_option_order(option_symbol, qty, action="buy_to_open"):
         "duration": "day"
     }
 
+    started_at = time.perf_counter()
     r = requests.post(
         f"{BASE_URL}/accounts/{ACCOUNT}/orders",
         headers=headers(),
         data=data
     )
+    elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+    with BOT_LOCK:
+        BOT_STATE["last_order_submit_ms"] = elapsed_ms
+        BOT_STATE["last_broker_confirm_ms"] = elapsed_ms
 
     return r.status_code, r.text
 
@@ -1506,7 +1623,21 @@ def try_surfer_entry(config, positions, market_context, call, put):
     order_id = extract_order_id(text)
 
     if ok:
-        trade_row = log_trade("BUY", contract["symbol"], contracts, ask, source="BOT", market_context=market_context)
+        entry_price, entry_price_source, estimated_entry_price = resolve_actual_entry_price(
+            contract["symbol"],
+            contracts,
+            ask
+        )
+        trade_row = log_trade(
+            "BUY",
+            contract["symbol"],
+            contracts,
+            entry_price,
+            source="BOT",
+            market_context=market_context,
+            entry_price_source=entry_price_source,
+            estimated_entry_price=estimated_entry_price
+        )
         log_bot_audit(
             decision,
             decision,
@@ -1515,13 +1646,16 @@ def try_surfer_entry(config, positions, market_context, call, put):
             config,
             option_symbol=contract["symbol"],
             entry_grade=trade_row.get("EntryGrade", ""),
+            entry_price=entry_price if entry_price_source == "BROKER_COST_BASIS" else "",
+            entry_price_source=entry_price_source,
+            estimated_entry_price=estimated_entry_price,
             order_status=order_status,
             order_id=order_id,
             spy_price_at_entry=market_context.get("price", ""),
             market_state_at_entry=market_context.get("market_state", ""),
             reason_log=market_context.get("decision_reasons", [])
         )
-        add_bot_reason(f"BUY logged {contract['symbol']} qty {contracts} price {ask}")
+        add_bot_reason(f"BUY logged {contract['symbol']} qty {contracts} price {entry_price} source {entry_price_source}")
         add_bot_reason(f"SIGNAL entered {side}: {'; '.join(market_context.get('decision_reasons', []))}")
     else:
         add_bot_reason(f"SIGNAL entry rejected or not accepted: {order_status}")
@@ -1654,7 +1788,10 @@ def fast_exit_audit_fields(
 
 
 def fast_exit_poll(config, positions):
+    tick_started_at = time.perf_counter()
+    set_last_error(None)
     if not positions:
+        record_tick_finished(tick_started_at)
         return False
 
     pos = positions[0]
@@ -1676,6 +1813,7 @@ def fast_exit_poll(config, positions):
             skip_reason=reason,
             no_sell_reason=reason
         )
+        record_tick_finished(tick_started_at)
         return False
 
     qty = int(float(pos.get("quantity", 1)))
@@ -1694,7 +1832,6 @@ def fast_exit_poll(config, positions):
         BOT_STATE["position_max_profit"][symbol] = max(BOT_STATE["position_max_profit"].get(symbol, pnl), pnl)
         BOT_STATE["position_max_drawdown"][symbol] = min(BOT_STATE["position_max_drawdown"].get(symbol, pnl), pnl)
         BOT_STATE["thread_alive"] = True
-        BOT_STATE["last_tick"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     hard_stop_price = entry_price * (1 - hard_stop_percent / 100)
     trailing_stop_price = peak * (1 - trailing_stop_percent / 100)
@@ -1778,6 +1915,7 @@ def fast_exit_poll(config, positions):
                 no_sell_reason=no_sell_reason
             )
         )
+        record_tick_finished(tick_started_at)
         return False
 
     reason = "; ".join(reasons)
@@ -1808,6 +1946,7 @@ def fast_exit_poll(config, positions):
                 sell_trigger_reason=sell_trigger_reason
             )
         )
+        record_tick_finished(tick_started_at)
         return True
 
     ok, order_status, status, text = submit_and_parse_option_order(
@@ -1872,6 +2011,7 @@ def fast_exit_poll(config, positions):
             BOT_STATE["position_peaks"].pop(symbol, None)
             BOT_STATE["position_max_profit"].pop(symbol, None)
             BOT_STATE["position_max_drawdown"].pop(symbol, None)
+        record_tick_finished(tick_started_at)
         return True
 
     add_bot_reason(f"FAST EXIT rejected or not accepted: {order_status}")
@@ -1900,16 +2040,20 @@ def fast_exit_poll(config, positions):
             sell_trigger_reason=sell_trigger_reason
         )
     )
+    record_tick_finished(tick_started_at)
     return True
 
 
 def surfer_bot_tick(allow_entry=True):
+    tick_started_at = time.perf_counter()
+    set_last_error(None)
     config = load_config()
     sync_trade_limits_from_file(config)
 
     if config.get("strategy_mode") != "SURFER":
         print("BOT TICK")
         print("SURFER disabled: strategy_mode is not SURFER")
+        record_tick_finished(tick_started_at)
         return
 
     symbol = config.get("symbol", "SPY")
@@ -1923,6 +2067,7 @@ def surfer_bot_tick(allow_entry=True):
 
     if price is None:
         add_bot_reason("BOT TICK skipped: quote unavailable")
+        record_tick_finished(tick_started_at)
         return
 
     volume = None
@@ -1939,7 +2084,6 @@ def surfer_bot_tick(allow_entry=True):
         })
         BOT_STATE["samples"] = BOT_STATE["samples"][-500:]
         BOT_STATE["thread_alive"] = True
-        BOT_STATE["last_tick"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         BOT_STATE["samples_length"] = len(BOT_STATE["samples"])
 
     print("samples length:", len(BOT_STATE["samples"]))
@@ -1959,9 +2103,17 @@ def surfer_bot_tick(allow_entry=True):
             call_cost = BOT_STATE["next_call_cost"]
             put_cost = BOT_STATE["next_put_cost"]
     positions = get_position()
+    market_scan_started_at = time.perf_counter()
     signal = calculate_surfer_signal(config, positions)
+    market_scan_ms = int((time.perf_counter() - market_scan_started_at) * 1000)
+    signal_started_at = time.perf_counter()
     signal = normalize_signal(signal)
     update_bot_signal_state(signal, call_cost, put_cost)
+    signal_ms = int((time.perf_counter() - signal_started_at) * 1000)
+    with BOT_LOCK:
+        BOT_STATE["last_market_scan_ms"] = market_scan_ms
+        BOT_STATE["last_indicators_ms"] = market_scan_ms
+        BOT_STATE["last_signal_ms"] = signal_ms
 
     print("DIRECTION")
     print("green_percent:", signal.get("bullish_percent", signal.get("green_percent", 0)))
@@ -1978,19 +2130,23 @@ def surfer_bot_tick(allow_entry=True):
     if not config.get("bot_enabled"):
         add_bot_reason("BOT scan only: bot_enabled is false")
         log_bot_audit("SKIP", signal.get("decision", "DO NOTHING"), symbol, signal, config, skip_reason="bot_enabled is false")
+        record_tick_finished(tick_started_at)
         return
 
     exited_this_tick = try_surfer_exit(config, positions, signal)
     if exited_this_tick:
         add_bot_reason("ENTRY skipped: exit happened this tick")
         log_bot_audit("SKIP", signal.get("decision", "DO NOTHING"), symbol, signal, config, skip_reason="exit happened this tick")
+        record_tick_finished(tick_started_at)
         return
 
     if not allow_entry:
+        record_tick_finished(tick_started_at)
         return
 
     positions = get_position()
     try_surfer_entry(config, positions, signal, call, put)
+    record_tick_finished(tick_started_at)
 
 
 def surfer_bot_loop():
@@ -2018,15 +2174,17 @@ def surfer_bot_loop():
                     else:
                         fast_exit_poll(config, positions)
                 else:
+                    idle_started_at = time.perf_counter()
                     with BOT_LOCK:
                         BOT_STATE["thread_alive"] = True
-                        BOT_STATE["last_tick"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    record_tick_finished(idle_started_at)
                 time.sleep(1)
             else:
                 last_full_position_scan = 0
                 surfer_bot_tick()
                 time.sleep(max(1, interval))
         except Exception as exc:
+            set_last_error(exc)
             add_bot_reason(f"BOT ERROR {exc}")
             time.sleep(10)
 
@@ -2141,8 +2299,67 @@ def api_bot_state():
             "last_trade_timestamp": BOT_STATE["last_trade_timestamp"],
             "cooldown_remaining_seconds": BOT_STATE["cooldown_remaining_seconds"],
             "last_trade_review": dict(BOT_STATE["last_trade_review"]),
-            "reason_log": list(BOT_STATE["reason_log"])
+            "reason_log": list(BOT_STATE["reason_log"]),
+            "last_quote_time": BOT_STATE["last_quote_time"],
+            "last_quote_epoch": BOT_STATE["last_quote_epoch"],
+            "last_quote_latency_ms": BOT_STATE["last_quote_latency_ms"],
+            "last_quote_status": BOT_STATE["last_quote_status"],
+            "last_position_time": BOT_STATE["last_position_time"],
+            "last_position_epoch": BOT_STATE["last_position_epoch"],
+            "last_position_latency_ms": BOT_STATE["last_position_latency_ms"],
+            "last_position_status": BOT_STATE["last_position_status"],
+            "last_tick_epoch": BOT_STATE["last_tick_epoch"],
+            "last_tick_duration_ms": BOT_STATE["last_tick_duration_ms"],
+            "last_error": BOT_STATE["last_error"],
+            "quote_request_count": BOT_STATE["quote_request_count"],
+            "quote_latency_total_ms": BOT_STATE["quote_latency_total_ms"],
+            "quote_latency_slowest_ms": BOT_STATE["quote_latency_slowest_ms"],
+            "quote_failed_count": BOT_STATE["quote_failed_count"],
+            "quote_rate_limited_count": BOT_STATE["quote_rate_limited_count"],
+            "last_order_submit_ms": BOT_STATE["last_order_submit_ms"],
+            "last_broker_confirm_ms": BOT_STATE["last_broker_confirm_ms"],
+            "last_market_scan_ms": BOT_STATE["last_market_scan_ms"],
+            "last_indicators_ms": BOT_STATE["last_indicators_ms"],
+            "last_signal_ms": BOT_STATE["last_signal_ms"]
         })
+
+
+@app.route("/api/developer-diagnostics")
+def api_developer_diagnostics():
+    config = load_config()
+    positions = get_position()
+    with BOT_LOCK:
+        bot_snapshot = {
+            "current_signal": BOT_STATE["current_signal"],
+            "last_action": BOT_STATE["last_action"],
+            "market_state": BOT_STATE["market_state"],
+            "market_context": dict(BOT_STATE["market_context"]),
+            "thread_alive": BOT_STATE["thread_alive"],
+            "last_tick": BOT_STATE["last_tick"],
+            "last_quote_time": BOT_STATE["last_quote_time"],
+            "last_quote_epoch": BOT_STATE["last_quote_epoch"],
+            "last_quote_latency_ms": BOT_STATE["last_quote_latency_ms"],
+            "last_quote_status": BOT_STATE["last_quote_status"],
+            "last_position_time": BOT_STATE["last_position_time"],
+            "last_position_epoch": BOT_STATE["last_position_epoch"],
+            "last_position_latency_ms": BOT_STATE["last_position_latency_ms"],
+            "last_position_status": BOT_STATE["last_position_status"],
+            "last_tick_epoch": BOT_STATE["last_tick_epoch"],
+            "last_tick_duration_ms": BOT_STATE["last_tick_duration_ms"],
+            "last_error": BOT_STATE["last_error"],
+            "quote_request_count": BOT_STATE["quote_request_count"],
+            "quote_latency_total_ms": BOT_STATE["quote_latency_total_ms"],
+            "quote_latency_slowest_ms": BOT_STATE["quote_latency_slowest_ms"],
+            "quote_failed_count": BOT_STATE["quote_failed_count"],
+            "quote_rate_limited_count": BOT_STATE["quote_rate_limited_count"],
+            "last_order_submit_ms": BOT_STATE["last_order_submit_ms"],
+            "last_broker_confirm_ms": BOT_STATE["last_broker_confirm_ms"],
+            "last_market_scan_ms": BOT_STATE["last_market_scan_ms"],
+            "last_indicators_ms": BOT_STATE["last_indicators_ms"],
+            "last_signal_ms": BOT_STATE["last_signal_ms"]
+        }
+    bot_health = get_bot_health_data(positions, bot_snapshot)
+    return jsonify(get_developer_diagnostics(config, positions, bot_snapshot, bot_health))
 
 
 @app.route("/api/current-position")
@@ -2237,8 +2454,20 @@ def manual_buy_selected():
         )
         if ok:
             quote = get_market_quote(option_symbol)
-            price = get_quote_price(quote) or ""
-            log_trade("BUY", option_symbol, qty, price)
+            estimated_price = get_quote_price(quote) or ""
+            entry_price, entry_price_source, estimated_entry_price = resolve_actual_entry_price(
+                option_symbol,
+                qty,
+                estimated_price
+            )
+            log_trade(
+                "BUY",
+                option_symbol,
+                qty,
+                entry_price,
+                entry_price_source=entry_price_source,
+                estimated_entry_price=estimated_entry_price
+            )
 
     return redirect("/")
 
@@ -2255,7 +2484,20 @@ def manual_buy_call():
             "ORDER"
         )
         if ok:
-            log_trade("BUY", contract["symbol"], config["contracts"], get_option_trade_price(contract) or "")
+            estimated_price = get_option_trade_price(contract) or ""
+            entry_price, entry_price_source, estimated_entry_price = resolve_actual_entry_price(
+                contract["symbol"],
+                config["contracts"],
+                estimated_price
+            )
+            log_trade(
+                "BUY",
+                contract["symbol"],
+                config["contracts"],
+                entry_price,
+                entry_price_source=entry_price_source,
+                estimated_entry_price=estimated_entry_price
+            )
     return redirect("/")
 
 
@@ -2271,7 +2513,20 @@ def manual_buy_put():
             "ORDER"
         )
         if ok:
-            log_trade("BUY", contract["symbol"], config["contracts"], get_option_trade_price(contract) or "")
+            estimated_price = get_option_trade_price(contract) or ""
+            entry_price, entry_price_source, estimated_entry_price = resolve_actual_entry_price(
+                contract["symbol"],
+                config["contracts"],
+                estimated_price
+            )
+            log_trade(
+                "BUY",
+                contract["symbol"],
+                config["contracts"],
+                entry_price,
+                entry_price_source=entry_price_source,
+                estimated_entry_price=estimated_entry_price
+            )
     return redirect("/")
 
 
@@ -2409,6 +2664,9 @@ def enrich_trade_rows(rows):
             matching_buys = open_buys.get(key, [])
             buy_row = matching_buys.pop(0) if matching_buys else None
             display["Entry"] = buy_row.get("Price", "") if buy_row else ""
+            if buy_row:
+                display["EntryPriceSource"] = buy_row.get("EntryPriceSource", "")
+                display["EstimatedEntryPrice"] = buy_row.get("EstimatedEntryPrice", "")
             display["Exit"] = price
             if not display["Entry"]:
                 exit_price = safe_float(price, None)
@@ -2449,6 +2707,7 @@ def summarize_ledger(rows, source, config):
             "return_percent": return_percent,
             "entry_amount": entry_amount,
             "entry_price": row.get("Entry", ""),
+            "entry_price_source": row.get("EntryPriceSource", ""),
             "exit_price": row.get("Exit", ""),
             "balance": running_balance,
             "hold_time": row.get("HoldTime") or "N/A",
@@ -2487,6 +2746,15 @@ def fmt_trade_price(value):
     return fmt_money(safe_float(value))
 
 
+def entry_source_label(trade):
+    source = trade.get("EntryPriceSource", "")
+    if source == "ESTIMATED_ASK":
+        return " (ESTIMATED)"
+    if source == "BROKER_COST_BASIS":
+        return " (BROKER)"
+    return ""
+
+
 def render_recent_trade_card(trade):
     trader = trade.get("Trader", "HUMAN")
     trader_class = trader.lower()
@@ -2505,7 +2773,7 @@ def render_recent_trade_card(trade):
 <span class="badge {trader_class}">Trader: {escape_html(trader)}</span><br>
 Symbol: {escape_html(trade.get("Symbol", ""))}<br>
 Qty: {escape_html(trade.get("Qty", ""))}<br>
-Entry: {fmt_trade_price(trade.get("Entry"))}<br>
+Entry: {fmt_trade_price(trade.get("Entry"))}{entry_source_label(trade)}<br>
 Exit: {fmt_trade_price(trade.get("Exit"))}<br>
 Peak Price: {fmt_trade_price(trade.get("PeakPrice"))}<br>
 Hard Stop Price: {fmt_trade_price(trade.get("HardStopPrice"))}<br>
@@ -2528,10 +2796,11 @@ def render_trade_list(summary):
     lines = []
     for trade in summary["trade_list"]:
         pnl_class = "good" if trade["pnl"] > 0 else "bad" if trade["pnl"] < 0 else ""
+        entry_label = entry_source_label({"EntryPriceSource": trade["entry_price_source"]})
         lines.append(
             f"""<div class="trade-line">#{trade["number"]} | """
             f"""<span class="{pnl_class}">{fmt_money(trade["pnl"])} ({trade["return_percent"]:+.1f}%)</span> """
-            f"""| Entry: {fmt_premium(trade["entry_price"])} """
+            f"""| Entry: {fmt_premium(trade["entry_price"])}{entry_label} """
             f"""| Exit: {fmt_premium(trade["exit_price"])} """
             f"""| Balance: {fmt_money(trade["balance"])} """
             f"""| Hold: {escape_html(trade["hold_time"])} """
@@ -2647,10 +2916,19 @@ def get_bot_health_data(positions, bot_snapshot):
         internal_symbols = list(BOT_STATE["position_peaks"].keys())
     internal_has_position = bool(internal_symbols)
     position_sync = "OK" if internal_has_position == broker_has_position else "MISMATCH"
+    last_quote_age_ms = age_ms(bot_snapshot.get("last_quote_epoch"))
+    api_connected = str(bot_snapshot.get("last_quote_status", "")).startswith("OK")
+    broker_connected = str(bot_snapshot.get("last_position_status", "")).startswith("OK")
 
     health = {
         "engine_running": bool(bot_snapshot.get("thread_alive")),
         "last_tick": bot_snapshot.get("last_tick", ""),
+        "last_tick_duration_ms": bot_snapshot.get("last_tick_duration_ms"),
+        "last_quote_age_ms": last_quote_age_ms,
+        "last_decision": (bot_snapshot.get("market_context") or {}).get("decision", "DO NOTHING"),
+        "last_error": bot_snapshot.get("last_error", "None"),
+        "api_status": "Connected" if api_connected else "Disconnected",
+        "broker_status": "Connected" if broker_connected else "Disconnected",
         "internal_has_position": internal_has_position,
         "broker_has_position": broker_has_position,
         "position_sync": position_sync,
@@ -2660,6 +2938,8 @@ def get_bot_health_data(positions, bot_snapshot):
         "current_price": None,
         "peak_price": None,
         "trailing_stop_price": None,
+        "distance_to_stop_percent": None,
+        "poll_interval_ms": 1000 if broker_has_position else None,
         "trailing_stop_percent": None,
         "stop_armed": False,
         "hold_time": "N/A"
@@ -2673,12 +2953,59 @@ def get_bot_health_data(positions, bot_snapshot):
             "current_price": pl.get("current_price"),
             "peak_price": pl.get("peak_price"),
             "trailing_stop_price": pl.get("trailing_stop_price"),
+            "distance_to_stop_percent": (
+                ((pl.get("current_price") - pl.get("trailing_stop_price")) / pl.get("current_price")) * 100
+                if pl.get("current_price") and pl.get("trailing_stop_price") else None
+            ),
             "trailing_stop_percent": pl.get("trailing_stop_percent"),
             "stop_armed": bool(pl.get("peak_price") and pl.get("entry_price") and pl.get("peak_price") > pl.get("entry_price")),
             "hold_time": pl.get("hold_time", "N/A")
         })
 
     return health
+
+
+def get_developer_diagnostics(config, positions, bot_snapshot, bot_health):
+    market_context = bot_snapshot.get("market_context") or {}
+    broker_sync_status = bot_snapshot.get("last_position_status", "UNKNOWN")
+    quote_count = int(bot_snapshot.get("quote_request_count") or 0)
+    quote_total = int(bot_snapshot.get("quote_latency_total_ms") or 0)
+    average_quote_ms = int(quote_total / quote_count) if quote_count else None
+
+    return {
+        "engine_running": bool(bot_snapshot.get("thread_alive")),
+        "polling_interval": int(config.get("strategy", {}).get("tick_interval_seconds", 10)),
+        "last_tick": bot_snapshot.get("last_tick", ""),
+        "last_tick_duration_ms": bot_snapshot.get("last_tick_duration_ms"),
+        "last_quote_time": bot_snapshot.get("last_quote_time", ""),
+        "last_quote_age_ms": age_ms(bot_snapshot.get("last_quote_epoch")),
+        "last_quote_latency_ms": bot_snapshot.get("last_quote_latency_ms"),
+        "last_quote_status": bot_snapshot.get("last_quote_status", "UNKNOWN"),
+        "last_position_time": bot_snapshot.get("last_position_time", ""),
+        "last_position_latency_ms": bot_snapshot.get("last_position_latency_ms"),
+        "last_position_status": broker_sync_status,
+        "broker_sync": "OK" if str(broker_sync_status).startswith("OK") else broker_sync_status,
+        "last_decision": market_context.get("decision", "DO NOTHING"),
+        "last_action": bot_snapshot.get("last_action", ""),
+        "internal_position": bot_health.get("internal_has_position", False),
+        "broker_position": bot_health.get("broker_has_position", False),
+        "position_sync": bot_health.get("position_sync", "UNKNOWN"),
+        "current_signal": bot_snapshot.get("current_signal", "NONE"),
+        "market_state": bot_snapshot.get("market_state", "UNKNOWN"),
+        "last_error": bot_snapshot.get("last_error", "None"),
+        "api_status": bot_health.get("api_status", "Disconnected"),
+        "broker_status": bot_health.get("broker_status", "Disconnected"),
+        "average_quote_latency_ms": average_quote_ms,
+        "slowest_quote_latency_ms": bot_snapshot.get("quote_latency_slowest_ms"),
+        "quote_failed_count": bot_snapshot.get("quote_failed_count"),
+        "quote_rate_limited_count": bot_snapshot.get("quote_rate_limited_count"),
+        "market_scan_ms": bot_snapshot.get("last_market_scan_ms"),
+        "indicators_ms": bot_snapshot.get("last_indicators_ms"),
+        "signal_ms": bot_snapshot.get("last_signal_ms"),
+        "order_submit_ms": bot_snapshot.get("last_order_submit_ms"),
+        "broker_confirm_ms": bot_snapshot.get("last_broker_confirm_ms"),
+        "position_monitor": bot_health
+    }
 
 
 @app.route("/")
@@ -2722,7 +3049,28 @@ def dashboard():
             "last_trade_timestamp": BOT_STATE["last_trade_timestamp"],
             "cooldown_remaining_seconds": BOT_STATE["cooldown_remaining_seconds"],
             "last_trade_review": dict(BOT_STATE["last_trade_review"]),
-            "reason_log": list(BOT_STATE["reason_log"])
+            "reason_log": list(BOT_STATE["reason_log"]),
+            "last_quote_time": BOT_STATE["last_quote_time"],
+            "last_quote_epoch": BOT_STATE["last_quote_epoch"],
+            "last_quote_latency_ms": BOT_STATE["last_quote_latency_ms"],
+            "last_quote_status": BOT_STATE["last_quote_status"],
+            "last_position_time": BOT_STATE["last_position_time"],
+            "last_position_epoch": BOT_STATE["last_position_epoch"],
+            "last_position_latency_ms": BOT_STATE["last_position_latency_ms"],
+            "last_position_status": BOT_STATE["last_position_status"],
+            "last_tick_epoch": BOT_STATE["last_tick_epoch"],
+            "last_tick_duration_ms": BOT_STATE["last_tick_duration_ms"],
+            "last_error": BOT_STATE["last_error"],
+            "quote_request_count": BOT_STATE["quote_request_count"],
+            "quote_latency_total_ms": BOT_STATE["quote_latency_total_ms"],
+            "quote_latency_slowest_ms": BOT_STATE["quote_latency_slowest_ms"],
+            "quote_failed_count": BOT_STATE["quote_failed_count"],
+            "quote_rate_limited_count": BOT_STATE["quote_rate_limited_count"],
+            "last_order_submit_ms": BOT_STATE["last_order_submit_ms"],
+            "last_broker_confirm_ms": BOT_STATE["last_broker_confirm_ms"],
+            "last_market_scan_ms": BOT_STATE["last_market_scan_ms"],
+            "last_indicators_ms": BOT_STATE["last_indicators_ms"],
+            "last_signal_ms": BOT_STATE["last_signal_ms"]
         }
 
     call_price = get_option_trade_price(call)
@@ -2739,6 +3087,7 @@ def dashboard():
     market_context = bot_snapshot["market_context"] or empty_market_context(get_quote_price(quote))
     trade_performance = get_trade_performance()
     bot_health = get_bot_health_data(positions, bot_snapshot)
+    developer_diagnostics = get_developer_diagnostics(config, positions, bot_snapshot, bot_health)
     levels = market_context.get("levels", {})
     distances = market_context.get("level_distances", {})
 
@@ -3045,28 +3394,63 @@ Max Trades Per Day: {e.get("max_trades_per_day")}
 
 <div class="card">
 <h2>Bot Health</h2>
-{ '<div class="warning">POSITION STATE MISMATCH</div>' if bot_health["warning"] else '' }
-Engine Running: { "YES" if bot_health["engine_running"] else "NO" }<br>
-Last Tick Time: {bot_health["last_tick"] or "N/A"}<br>
-Bot Internal Position: { "YES" if bot_health["internal_has_position"] else "NO" }<br>
-Broker Position (live Tradier): { "YES" if bot_health["broker_has_position"] else "NO" }<br>
-Position Sync: <span class="{ "bad" if bot_health["position_sync"] == "MISMATCH" else "good" }">{bot_health["position_sync"]}</span><br>
-"""
+<div class="grid">
+<div class="item"><div class="label">Status</div><div class="value good" id="health-engine-status">{ "🟢 Bot Running" if bot_health["engine_running"] else "🔴 Bot Stopped" }</div></div>
+<div class="item"><div class="label">Last Tick</div><div class="value" id="health-last-tick">{bot_health["last_tick"] or "N/A"}</div></div>
+<div class="item"><div class="label">Tick Duration</div><div class="value" id="health-tick-duration">{fmt_int(bot_health["last_tick_duration_ms"])} ms</div></div>
+<div class="item"><div class="label">Last Quote</div><div class="value" id="health-last-quote-age">{fmt_int(bot_health["last_quote_age_ms"])} ms ago</div></div>
+<div class="item"><div class="label">Last Decision</div><div class="value" id="health-last-decision">{bot_health["last_decision"]}</div></div>
+<div class="item"><div class="label">Last Error</div><div class="value" id="health-last-error">{bot_health["last_error"]}</div></div>
+<div class="item"><div class="label">API Status</div><div class="value" id="health-api-status">{bot_health["api_status"]}</div></div>
+<div class="item"><div class="label">Broker</div><div class="value" id="health-broker-status">{bot_health["broker_status"]}</div></div>
+<div class="item"><div class="label">Position Sync</div><div class="value" id="health-position-sync">{bot_health["position_sync"]}</div></div>
+</div>
+</div>
 
-    if bot_health["broker_has_position"]:
-        html += f"""
-<br>
-Current Symbol: {bot_health["symbol"]}<br>
-Entry Price: {fmt_money(bot_health["entry_price"])}<br>
-Current Option Price: {fmt_money(bot_health["current_price"])}<br>
-Highest Price Since Entry: {fmt_money(bot_health["peak_price"])}<br>
-Trailing Stop Price: {fmt_money(bot_health["trailing_stop_price"])}<br>
-Trailing Stop %: {bot_health["trailing_stop_percent"]:.2f}%<br>
-Stop Armed: { "YES" if bot_health["stop_armed"] else "NO" }<br>
-Time In Trade: {bot_health["hold_time"]}<br>
-"""
+<div class="card">
+<h2>Position Monitor</h2>
+<div id="position-monitor-warning">{ '<div class="warning">🚨 DESYNC</div>' if bot_health["warning"] else '' }</div>
+<div class="grid">
+<div class="item"><div class="label">Broker Position</div><div class="value" id="monitor-broker-position">{ "YES" if bot_health["broker_has_position"] else "NO" }</div></div>
+<div class="item"><div class="label">Local Position</div><div class="value" id="monitor-local-position">{ "YES" if bot_health["internal_has_position"] else "NO" }</div></div>
+<div class="item"><div class="label">Status</div><div class="value" id="monitor-position-status">{ "IN SYNC" if bot_health["position_sync"] == "OK" else "🚨 DESYNC" }</div></div>
+</div>
+</div>
 
-    html += """
+<div class="card">
+<h2>Exit Monitor</h2>
+<div class="grid">
+<div class="item"><div class="label">Entry</div><div class="value" id="exit-entry">{fmt_money(bot_health["entry_price"])}</div></div>
+<div class="item"><div class="label">Current</div><div class="value" id="exit-current">{fmt_money(bot_health["current_price"])}</div></div>
+<div class="item"><div class="label">Peak</div><div class="value" id="exit-peak">{fmt_money(bot_health["peak_price"])}</div></div>
+<div class="item"><div class="label">Trailing Stop</div><div class="value" id="exit-trailing-stop">{fmt_money(bot_health["trailing_stop_price"])}</div></div>
+<div class="item"><div class="label">Distance to Stop</div><div class="value" id="exit-distance-stop">{fmt_int(bot_health["distance_to_stop_percent"])}%</div></div>
+<div class="item"><div class="label">Poll Interval</div><div class="value" id="exit-poll-interval">{fmt_int(bot_health["poll_interval_ms"])} ms</div></div>
+<div class="item"><div class="label">Last Quote</div><div class="value" id="exit-last-quote-age">{fmt_int(bot_health["last_quote_age_ms"])} ms ago</div></div>
+<div class="item"><div class="label">Stop Armed</div><div class="value" id="exit-stop-armed">{ "YES" if bot_health["stop_armed"] else "NO" }</div></div>
+<div class="item"><div class="label">Time In Trade</div><div class="value" id="exit-time-in-trade">{bot_health["hold_time"]}</div></div>
+</div>
+</div>
+
+<div class="card">
+<h2>Performance</h2>
+<div class="grid">
+<div class="item"><div class="label">Average Quote Request</div><div class="value" id="perf-average-quote">{fmt_int(developer_diagnostics["average_quote_latency_ms"])} ms</div></div>
+<div class="item"><div class="label">Slowest</div><div class="value" id="perf-slowest-quote">{fmt_int(developer_diagnostics["slowest_quote_latency_ms"])} ms</div></div>
+<div class="item"><div class="label">Failed</div><div class="value" id="perf-quote-failed">{developer_diagnostics["quote_failed_count"]}</div></div>
+<div class="item"><div class="label">Rate Limited</div><div class="value" id="perf-rate-limited">{developer_diagnostics["quote_rate_limited_count"]}</div></div>
+</div>
+</div>
+
+<div class="card">
+<h2>Decision Timer</h2>
+<div class="grid">
+<div class="item"><div class="label">Market Scan</div><div class="value" id="timer-market-scan">{fmt_int(developer_diagnostics["market_scan_ms"])} ms</div></div>
+<div class="item"><div class="label">Indicators</div><div class="value" id="timer-indicators">{fmt_int(developer_diagnostics["indicators_ms"])} ms</div></div>
+<div class="item"><div class="label">Signal</div><div class="value" id="timer-signal">{fmt_int(developer_diagnostics["signal_ms"])} ms</div></div>
+<div class="item"><div class="label">Order Submit</div><div class="value" id="timer-order-submit">{fmt_int(developer_diagnostics["order_submit_ms"])} ms</div></div>
+<div class="item"><div class="label">Broker Confirm</div><div class="value" id="timer-broker-confirm">{fmt_int(developer_diagnostics["broker_confirm_ms"])} ms</div></div>
+</div>
 </div>
 
 <div class="card">
@@ -3318,6 +3702,14 @@ function fmtInt(value) {{
     return Math.round(num).toLocaleString();
 }}
 
+function fmtPercent(value) {{
+    if (value === null || value === undefined || value === "") return "N/A";
+    const num = Number(value);
+    if (Number.isNaN(num)) return "N/A";
+    const sign = num > 0 ? "+" : "";
+    return `${{sign}}${{num.toFixed(1)}}%`;
+}}
+
 async function getJson(url) {{
     const res = await fetch(url, {{ cache: "no-store" }});
     if (!res.ok) throw new Error(`${{url}} failed`);
@@ -3465,6 +3857,49 @@ async function updateSelectedOptionQuote() {{
     setText("open_interest", quote.open_interest ?? "N/A");
 }}
 
+async function updateDeveloperDiagnostics() {{
+    const data = await getJson("/api/developer-diagnostics");
+    const position = data.position_monitor || {{}};
+
+    setText("health-engine-status", data.engine_running ? "🟢 Bot Running" : "🔴 Bot Stopped");
+    setText("health-last-tick", data.last_tick || "N/A");
+    setText("health-tick-duration", `${{fmtInt(data.last_tick_duration_ms)}} ms`);
+    setText("health-last-quote-age", `${{fmtInt(data.last_quote_age_ms)}} ms ago`);
+    setText("health-last-decision", data.last_decision || "DO NOTHING");
+    setText("health-last-error", data.last_error || "None");
+    setText("health-api-status", data.api_status || "Disconnected");
+    setText("health-broker-status", data.broker_status || "Disconnected");
+    setText("health-position-sync", data.position_sync || "UNKNOWN");
+
+    const desynced = data.position_sync !== "OK";
+    const warningEl = document.getElementById("position-monitor-warning");
+    if (warningEl) warningEl.innerHTML = desynced ? '<div class="warning">🚨 DESYNC</div>' : "";
+    setText("monitor-broker-position", data.broker_position ? "YES" : "NO");
+    setText("monitor-local-position", data.internal_position ? "YES" : "NO");
+    setText("monitor-position-status", desynced ? "🚨 DESYNC" : "IN SYNC");
+
+    setText("exit-entry", fmtMoney(position.entry_price));
+    setText("exit-current", fmtMoney(position.current_price));
+    setText("exit-peak", fmtMoney(position.peak_price));
+    setText("exit-trailing-stop", fmtMoney(position.trailing_stop_price));
+    setText("exit-distance-stop", fmtPercent(position.distance_to_stop_percent));
+    setText("exit-poll-interval", `${{fmtInt(position.poll_interval_ms)}} ms`);
+    setText("exit-last-quote-age", `${{fmtInt(position.last_quote_age_ms)}} ms ago`);
+    setText("exit-stop-armed", position.stop_armed ? "YES" : "NO");
+    setText("exit-time-in-trade", position.hold_time || "N/A");
+
+    setText("perf-average-quote", `${{fmtInt(data.average_quote_latency_ms)}} ms`);
+    setText("perf-slowest-quote", `${{fmtInt(data.slowest_quote_latency_ms)}} ms`);
+    setText("perf-quote-failed", data.quote_failed_count ?? 0);
+    setText("perf-rate-limited", data.quote_rate_limited_count ?? 0);
+
+    setText("timer-market-scan", `${{fmtInt(data.market_scan_ms)}} ms`);
+    setText("timer-indicators", `${{fmtInt(data.indicators_ms)}} ms`);
+    setText("timer-signal", `${{fmtInt(data.signal_ms)}} ms`);
+    setText("timer-order-submit", `${{fmtInt(data.order_submit_ms)}} ms`);
+    setText("timer-broker-confirm", `${{fmtInt(data.broker_confirm_ms)}} ms`);
+}}
+
 async function refreshLiveDashboard() {{
     try {{
         await Promise.all([
@@ -3472,7 +3907,8 @@ async function refreshLiveDashboard() {{
             updateQuote(),
             updateCurrentPosition(),
             updateMarketStructure(),
-            updateSelectedOptionQuote()
+            updateSelectedOptionQuote(),
+            updateDeveloperDiagnostics()
         ]);
     }} catch (err) {{
         console.error("Live dashboard update failed", err);
