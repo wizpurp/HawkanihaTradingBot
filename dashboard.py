@@ -128,7 +128,7 @@ def load_config():
     config.setdefault("bot_starting_account_balance", 500)
     config.setdefault("human_starting_account_balance", 500)
     config.setdefault("max_contract_price", 1.00)
-    config["max_open_contracts"] = clamp_int(config.get("max_open_contracts", 1), 1, 100, 1)
+    config["max_open_contracts"] = clamp_int(config.get("max_open_contracts", 1), 1, 5, 1)
     config.setdefault("minimum_confidence", 2)
     config["minimum_confidence"] = clamp_int(config.get("minimum_confidence", 2), 1, 10, 2)
     config["strategy"].setdefault("ema_fast", 1)
@@ -520,11 +520,11 @@ def submit_and_parse_option_order(option_symbol, qty, action, label):
     if action == "buy_to_open":
         allowed, reason, current_total, max_open_contracts = validate_buy_position_cap(qty)
         if not allowed:
-            text = reason
+            text = f"{reason}; Current: {current_total}; Maximum: {max_open_contracts}"
             print(f"{label} ORDER BLOCKED:", reason)
             print("current_total_option_contracts:", current_total)
             print("max_open_contracts:", max_open_contracts)
-            add_bot_reason(f"{label} BUY skipped: {reason}")
+            add_bot_reason(f"{label} BUY skipped: {reason}; Current: {current_total}; Maximum: {max_open_contracts}")
             return False, reason, 0, text
 
     status, text = submit_option_order(option_symbol, qty, action)
@@ -595,25 +595,22 @@ def total_option_contracts(positions):
 
 def get_position_cap_status(positions, config):
     current_total = total_option_contracts(positions)
-    max_open_contracts = clamp_int(config.get("max_open_contracts", 1), 1, 100, 1)
+    max_open_contracts = clamp_int(config.get("max_open_contracts", 1), 1, 5, 1)
     return {
         "current_total_option_contracts": current_total,
         "max_open_contracts": max_open_contracts,
-        "position_cap_status": "BLOCKING NEW BUYS" if current_total >= max_open_contracts else "OK"
+        "position_cap_status": "ACTIVE" if current_total >= max_open_contracts else "OK"
     }
 
 
 def validate_buy_position_cap(qty):
     config = load_config()
-    max_open_contracts = clamp_int(config.get("max_open_contracts", 1), 1, 100, 1)
+    max_open_contracts = clamp_int(config.get("max_open_contracts", 1), 1, 5, 1)
     live_positions = get_position()
     current_total = total_option_contracts(live_positions)
 
-    if current_total > 0:
-        return False, "already holding option position", current_total, max_open_contracts
-
     if current_total + int(qty) > max_open_contracts:
-        return False, "max open contracts reached", current_total, max_open_contracts
+        return False, "Max Open Contracts reached", current_total, max_open_contracts
 
     return True, "OK", current_total, max_open_contracts
 
@@ -1719,7 +1716,7 @@ def try_surfer_entry(config, positions, market_context, call, put):
         add_bot_reason(f"SIGNAL entered {side}: {'; '.join(market_context.get('decision_reasons', []))}")
     else:
         add_bot_reason(f"SIGNAL entry rejected or not accepted: {order_status}")
-        skip_reason = order_status if order_status in ["already holding option position", "max open contracts reached"] else "entry rejected or not accepted"
+        skip_reason = order_status if order_status == "Max Open Contracts reached" else "entry rejected or not accepted"
         log_bot_audit("SKIP", decision, config.get("symbol", ""), market_context, config, option_symbol=contract.get("symbol", ""), skip_reason=skip_reason, order_status=order_status, order_id=order_id)
 
 
@@ -2612,6 +2609,30 @@ def restore_trades():
     return redirect("/")
 
 
+@app.route("/clear-bot-trades", methods=["POST"])
+def clear_bot_trades():
+    clear_visible_trades_by_source("BOT")
+    return redirect("/")
+
+
+@app.route("/restore-bot-trades", methods=["POST"])
+def restore_bot_trades():
+    restore_visible_trades_by_source("BOT")
+    return redirect("/")
+
+
+@app.route("/clear-human-trades", methods=["POST"])
+def clear_human_trades():
+    clear_visible_trades_by_source("HUMAN")
+    return redirect("/")
+
+
+@app.route("/restore-human-trades", methods=["POST"])
+def restore_human_trades():
+    restore_visible_trades_by_source("HUMAN")
+    return redirect("/")
+
+
 @app.route("/save-settings", methods=["POST"])
 def save_settings():
     config = load_config()
@@ -2631,7 +2652,7 @@ def save_settings():
     config["bot_starting_account_balance"] = float(request.form.get("bot_starting_account_balance", 500))
     config["human_starting_account_balance"] = float(request.form.get("human_starting_account_balance", 500))
     config["max_contract_price"] = float(request.form.get("max_contract_price", 1))
-    config["max_open_contracts"] = clamp_int(request.form.get("max_open_contracts", 1), 1, 100, 1)
+    config["max_open_contracts"] = clamp_int(request.form.get("max_open_contracts", 1), 1, 5, 1)
     config["minimum_confidence"] = clamp_int(request.form.get("minimum_confidence", 2), 1, 10, 2)
 
     s = config["strategy"]
@@ -2684,7 +2705,20 @@ def trade_source(row):
 
 
 def trade_grade(row):
-    return row.get("BotGrade") or row.get("ExitGrade") or row.get("LiveGrade") or row.get("EntryGrade") or "N/A"
+    return row.get("OverallGrade") or row.get("BotGrade") or row.get("ExitGrade") or row.get("LiveGrade") or row.get("EntryGrade") or "N/A"
+
+
+def trade_entry_grade(row):
+    return row.get("EntryGrade") or "N/A"
+
+
+def trade_exit_grade(row):
+    return row.get("ExitGrade") or "N/A"
+
+
+def overall_grade_for_trades(rows):
+    scores = [grade_value(trade_grade(row)) for row in rows if grade_value(trade_grade(row)) > 0]
+    return grade_from_score(average(scores)) if scores else "N/A"
 
 
 def trade_entry_amount(row):
@@ -2732,6 +2766,8 @@ def enrich_trade_rows(rows):
             if buy_row:
                 display["EntryPriceSource"] = buy_row.get("EntryPriceSource", "")
                 display["EstimatedEntryPrice"] = buy_row.get("EstimatedEntryPrice", "")
+                if not display.get("EntryGrade"):
+                    display["EntryGrade"] = buy_row.get("EntryGrade", "")
             display["Exit"] = price
             if not display["Entry"]:
                 exit_price = safe_float(price, None)
@@ -2755,10 +2791,11 @@ def summarize_ledger(rows, source, config):
     sell_rows = [row for row in enriched_rows if row.get("Action") == "SELL"]
     pnl_values = [safe_float(row.get("PnL")) for row in sell_rows]
     total_pnl = sum(pnl_values)
+    today = datetime.now().strftime("%Y-%m-%d")
+    today_pnl = sum(safe_float(row.get("PnL")) for row in sell_rows if str(row.get("Time", "")).startswith(today))
     wins = [pnl for pnl in pnl_values if pnl > 0]
     trade_list = []
     running_balance = starting_balance
-    today = datetime.now().strftime("%Y-%m-%d")
     _, spent_today = daily_buy_totals(rows, source, today)
 
     for index, row in enumerate(sell_rows, start=1):
@@ -2776,17 +2813,22 @@ def summarize_ledger(rows, source, config):
             "exit_price": row.get("Exit", ""),
             "balance": running_balance,
             "hold_time": row.get("HoldTime") or "N/A",
-            "grade": trade_grade(row)
+            "entry_grade": trade_entry_grade(row),
+            "exit_grade": trade_exit_grade(row),
+            "overall_grade": trade_grade(row)
         })
 
     return {
         "starting_balance": starting_balance,
         "current_balance": starting_balance + total_pnl,
         "net_profit": total_pnl,
+        "today_pnl": today_pnl,
+        "total_pnl": total_pnl,
         "today_budget": today_budget,
         "spent_today": spent_today,
         "budget_remaining": max(0, today_budget - spent_today),
         "win_rate": (len(wins) / len(sell_rows) * 100) if sell_rows else 0,
+        "overall_grade": overall_grade_for_trades(sell_rows),
         "number_of_trades": len(sell_rows),
         "trade_list": trade_list
     }
@@ -2846,7 +2888,9 @@ Trailing Stop Price: {fmt_trade_price(trade.get("TrailingStopPrice"))}<br>
 Max Drawdown From Peak: {fmt_percent(trade.get("MaxDrawdownFromPeakPercent"))}<br>
 PnL: <span class="{pnl_class}">{pnl_display} ({fmt_percent(pnl_percent)})</span><br>
 Hold Time: {escape_html(trade.get("HoldTime") or "N/A")}<br>
-Grade: {escape_html(trade.get("Grade") or "N/A")}<br>
+Entry Grade: {escape_html(trade_entry_grade(trade))}<br>
+Exit Grade: {escape_html(trade_exit_grade(trade))}<br>
+Overall Grade: {escape_html(trade_grade(trade))}<br>
 Exit Reason:<br>
 {escape_html(exit_reason).replace(chr(10), "<br>")}<br>
 Time: {escape_html(trade.get("Time", ""))}
@@ -2863,22 +2907,36 @@ def render_trade_list(summary):
         pnl_class = "good" if trade["pnl"] > 0 else "bad" if trade["pnl"] < 0 else ""
         entry_label = entry_source_label({"EntryPriceSource": trade["entry_price_source"]})
         lines.append(
-            f"""<div class="trade-line">#{trade["number"]} | """
-            f"""<span class="{pnl_class}">{fmt_money(trade["pnl"])} ({trade["return_percent"]:+.1f}%)</span> """
-            f"""| Entry: {fmt_premium(trade["entry_price"])}{entry_label} """
-            f"""| Exit: {fmt_premium(trade["exit_price"])} """
-            f"""| Balance: {fmt_money(trade["balance"])} """
-            f"""| Hold: {escape_html(trade["hold_time"])} """
-            f"""| Grade: {escape_html(trade["grade"])}</div>"""
+            f"""<div class="trade-line">"""
+            f"""#{trade["number"]} | <span class="{pnl_class}">{fmt_money(trade["pnl"])} ({trade["return_percent"]:+.1f}%)</span><br>"""
+            f"""Entry: {fmt_premium(trade["entry_price"])}{entry_label}<br>"""
+            f"""Exit: {fmt_premium(trade["exit_price"])}<br>"""
+            f"""Entry Grade: {escape_html(trade["entry_grade"])}<br>"""
+            f"""Exit Grade: {escape_html(trade["exit_grade"])}<br>"""
+            f"""Overall Grade: {escape_html(trade["overall_grade"])}<br>"""
+            f"""Balance: {fmt_money(trade["balance"])}<br>"""
+            f"""Hold: {escape_html(trade["hold_time"])}</div>"""
         )
     return "".join(lines)
 
 
 def render_performance_panel(label, summary):
     panel_class = label.lower()
-    return f"""
-<div class="performance-panel {panel_class}">
-<h3>{escape_html(label.title())}</h3>
+    if label == "BOT":
+        stats_html = f"""
+Starting Account Balance: {fmt_money(summary["starting_balance"])}<br>
+Current Account Balance: {fmt_money(summary["current_balance"])}<br>
+Today's Trading Budget: {fmt_money(summary["today_budget"])}<br>
+Today's Budget Remaining: {fmt_money(summary["budget_remaining"])}<br>
+Spent Today: {fmt_money(summary["spent_today"])}<br>
+Win Rate: {summary["win_rate"]:.2f}%<br>
+Today's PnL: {fmt_money(summary["today_pnl"])}<br>
+Total PnL: {fmt_money(summary["total_pnl"])}<br>
+Overall Grade: {escape_html(summary["overall_grade"])}<br>
+Number of Trades: {summary["number_of_trades"]}<br>
+"""
+    else:
+        stats_html = f"""
 Starting Account Balance: {fmt_money(summary["starting_balance"])}<br>
 Current Account Balance: {fmt_money(summary["current_balance"])}<br>
 Net Profit: {fmt_money(summary["net_profit"])}<br>
@@ -2886,8 +2944,13 @@ Today's Trading Budget: {fmt_money(summary["today_budget"])}<br>
 Today's Budget Remaining: {fmt_money(summary["budget_remaining"])}<br>
 Spent Today: {fmt_money(summary["spent_today"])}<br>
 Win Rate: {summary["win_rate"]:.2f}%<br>
-Total PnL: {fmt_money(summary["net_profit"])}<br>
+Total PnL: {fmt_money(summary["total_pnl"])}<br>
 Number of Trades: {summary["number_of_trades"]}<br>
+"""
+    return f"""
+<div class="performance-panel {panel_class}">
+<h3>{escape_html(label.title())}</h3>
+{stats_html}
 Trade List:<br>
 {render_trade_list(summary)}
 </div>
@@ -3489,9 +3552,9 @@ Max Trades Per Day: {e.get("max_trades_per_day")}
 <div class="item"><div class="label">Broker Position</div><div class="value" id="monitor-broker-position">{ "YES" if bot_health["broker_has_position"] else "NO" }</div></div>
 <div class="item"><div class="label">Local Position</div><div class="value" id="monitor-local-position">{ "YES" if bot_health["internal_has_position"] else "NO" }</div></div>
 <div class="item"><div class="label">Status</div><div class="value" id="monitor-position-status">{ "IN SYNC" if bot_health["position_sync"] == "OK" else "🚨 DESYNC" }</div></div>
-<div class="item"><div class="label">Current Total Option Contracts Held</div><div class="value" id="monitor-total-contracts">{position_cap["current_total_option_contracts"]}</div></div>
+<div class="item"><div class="label">Current Open Contracts</div><div class="value" id="monitor-total-contracts">{position_cap["current_total_option_contracts"]}</div></div>
 <div class="item"><div class="label">Max Open Contracts</div><div class="value" id="monitor-max-contracts">{position_cap["max_open_contracts"]}</div></div>
-<div class="item"><div class="label">Position Cap Status</div><div class="value" id="monitor-cap-status">{position_cap["position_cap_status"]}</div></div>
+<div class="item"><div class="label">Position Cap</div><div class="value" id="monitor-cap-status">{position_cap["position_cap_status"]}</div></div>
 </div>
 </div>
 
@@ -3576,25 +3639,47 @@ Status: OPEN
 """
 
     visible_trades = get_recent_trades(limit=None)
-    recent = enrich_trade_rows(visible_trades)[-10:]
+    enriched_visible_trades = enrich_trade_rows(visible_trades)
+    recent_bot = [trade for trade in enriched_visible_trades if trade_source(trade) == "BOT"][-10:]
+    recent_human = [trade for trade in enriched_visible_trades if trade_source(trade) == "HUMAN"][-10:]
 
     html += """
 <div class="card">
-<h2>Recent Trades</h2>
-<form method="POST" action="/clear-trades" style="display:inline;">
-<button type="submit" class="red">Clear Recent Trades</button>
+<h2>Bot Trades</h2>
+<form method="POST" action="/clear-bot-trades" style="display:inline;">
+<button type="submit" class="red">Clear Bot Trades</button>
 </form>
-<form method="POST" action="/restore-cleared-trades" style="display:inline;">
-<button type="submit" class="yellow">Undo Clear</button>
+<form method="POST" action="/restore-bot-trades" style="display:inline;">
+<button type="submit" class="yellow">Undo Clear Bot Trades</button>
 </form>
 <br><br>
 """
 
-    if recent:
-        for trade in reversed(recent):
+    if recent_bot:
+        for trade in reversed(recent_bot):
             html += render_recent_trade_card(trade)
     else:
-        html += "No trades yet."
+        html += "No bot trades visible."
+
+    html += """
+</div>
+
+<div class="card">
+<h2>Human Trades</h2>
+<form method="POST" action="/clear-human-trades" style="display:inline;">
+<button type="submit" class="red">Clear Human Trades</button>
+</form>
+<form method="POST" action="/restore-human-trades" style="display:inline;">
+<button type="submit" class="yellow">Undo Clear Human Trades</button>
+</form>
+<br><br>
+"""
+
+    if recent_human:
+        for trade in reversed(recent_human):
+            html += render_recent_trade_card(trade)
+    else:
+        html += "No human trades visible."
 
     html += """
 </div>
@@ -3640,7 +3725,7 @@ Max Contract Price:
 <input type="number" step="0.01" name="max_contract_price" value="{config.get("max_contract_price", 1)}"><br>
 
 Max Open Contracts:
-<input type="number" name="max_open_contracts" value="{config.get("max_open_contracts", 1)}" min="1" max="100"><br>
+<input type="number" name="max_open_contracts" value="{config.get("max_open_contracts", 1)}" min="1" max="5"><br>
 
 Minimum Confidence:
 <input type="number" name="minimum_confidence" min="1" max="10" value="{config.get("minimum_confidence", 2)}"><br>

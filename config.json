@@ -8,6 +8,7 @@
     "decision_time": "9:42",
     "bot_budget": 1000.0,
     "max_contract_price": 1.0,
+    "max_open_contracts": 1,
     "strategy": {
         "ema_fast": 1,
         "ema_medium": 5,
@@ -20,7 +21,7 @@
         "use_volume": false,
         "hard_stop_percent": 20.0,
         "trailing_stop_percent": 15.0,
-        "tick_interval_seconds": 10,
+        "exit_poll_interval_ms": 1000,
         "direction_threshold_percent": 60.0
     },
     "scanner": {

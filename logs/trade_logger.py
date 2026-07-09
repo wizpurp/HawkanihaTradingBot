@@ -5,9 +5,11 @@ from datetime import datetime
 APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TRADES_FILE = os.path.join(APP_DIR, "trades.csv")
 VISIBLE_TRADES_FILE = os.path.join(APP_DIR, "dashboard_visible_trades.csv")
+BOT_VISIBLE_TRADES_BACKUP_FILE = os.path.join(APP_DIR, "dashboard_bot_trades_last_cleared.csv")
+HUMAN_VISIBLE_TRADES_BACKUP_FILE = os.path.join(APP_DIR, "dashboard_human_trades_last_cleared.csv")
 TRADE_COLUMNS = [
     "Time", "Action", "Symbol", "Qty", "Price", "PnL",
-    "Source", "EntryGrade", "LiveGrade", "ExitGrade", "BotGrade",
+    "Source", "EntryGrade", "LiveGrade", "ExitGrade", "BotGrade", "OverallGrade",
     "TradeScore", "GradeReason", "HoldTime", "PeakPrice",
     "HardStopPrice", "TrailingStopPrice", "MaxDrawdownFromPeakPercent",
     "PnLPercent", "ExitReason", "EntryPriceSource", "EstimatedEntryPrice"
@@ -29,6 +31,25 @@ def safe_float(value, default=0.0):
         return float(value)
     except:
         return default
+
+
+def grade_score(grade):
+    return {"A+": 97, "A": 92, "B": 85, "C": 75, "D": 65, "F": 45}.get(grade, 0)
+
+
+def grade_from_score(score):
+    score = max(0, min(100, int(round(score))))
+    if score >= 95:
+        return "A+"
+    if score >= 90:
+        return "A"
+    if score >= 80:
+        return "B"
+    if score >= 70:
+        return "C"
+    if score >= 60:
+        return "D"
+    return "F"
 
 
 def ensure_trade_file(path):
@@ -117,8 +138,12 @@ def log_trade(
         bot_grade = entry_grade
     elif action == "SELL" and grade_exit_trade:
         exit_grade, trade_score, grade_reason, hold_time = grade_exit_trade(symbol, qty, price, pnl, market_context)
-        bot_grade = exit_grade
         last_buy = find_last_buy(symbol)
+        entry_grade = last_buy.get("EntryGrade", "") if last_buy else ""
+        if entry_grade and exit_grade:
+            bot_grade = grade_from_score((grade_score(entry_grade) + grade_score(exit_grade)) / 2)
+        else:
+            bot_grade = exit_grade or entry_grade
         entry_price = safe_float(last_buy.get("Price"), 0) if last_buy else 0
         sell_price = safe_float(price)
         qty_value = safe_float(qty, 1)
@@ -150,6 +175,7 @@ def log_trade(
         "LiveGrade": "",
         "ExitGrade": exit_grade,
         "BotGrade": bot_grade,
+        "OverallGrade": bot_grade,
         "TradeScore": trade_score,
         "GradeReason": grade_reason,
         "HoldTime": hold_time,
@@ -192,17 +218,65 @@ def restore_cleared_trades():
     return True
 
 
+def source_backup_file(source):
+    return BOT_VISIBLE_TRADES_BACKUP_FILE if source.upper() == "BOT" else HUMAN_VISIBLE_TRADES_BACKUP_FILE
+
+
+def load_visible_trade_rows():
+    if os.path.exists(TRADES_FILE):
+        ensure_trade_file(TRADES_FILE)
+    if os.path.exists(VISIBLE_TRADES_FILE):
+        ensure_trade_file(VISIBLE_TRADES_FILE)
+    visible_path = VISIBLE_TRADES_FILE if os.path.exists(VISIBLE_TRADES_FILE) else TRADES_FILE
+
+    with open(visible_path, "r", newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def write_visible_trade_rows(rows):
+    ensure_trade_file(VISIBLE_TRADES_FILE)
+    with open(VISIBLE_TRADES_FILE, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=TRADE_COLUMNS)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({column: row.get(column, "") for column in TRADE_COLUMNS})
+
+
+def clear_visible_trades_by_source(source):
+    source = source.upper()
+    rows = load_visible_trade_rows()
+    cleared_rows = [row for row in rows if (row.get("Source") or "HUMAN").upper() == source]
+    remaining_rows = [row for row in rows if (row.get("Source") or "HUMAN").upper() != source]
+
+    with open(source_backup_file(source), "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=TRADE_COLUMNS)
+        writer.writeheader()
+        for row in cleared_rows:
+            writer.writerow({column: row.get(column, "") for column in TRADE_COLUMNS})
+
+    write_visible_trade_rows(remaining_rows)
+
+
+def restore_visible_trades_by_source(source):
+    source = source.upper()
+    backup_file = source_backup_file(source)
+    if not os.path.exists(backup_file):
+        return False
+
+    ensure_trade_file(backup_file)
+    current_rows = load_visible_trade_rows()
+    current_without_source = [row for row in current_rows if (row.get("Source") or "HUMAN").upper() != source]
+
+    with open(backup_file, "r", newline="") as f:
+        backup_rows = list(csv.DictReader(f))
+
+    write_visible_trade_rows(current_without_source + backup_rows)
+    return True
+
+
 def get_recent_trades(limit=10):
     try:
-        if os.path.exists(TRADES_FILE):
-            ensure_trade_file(TRADES_FILE)
-        if os.path.exists(VISIBLE_TRADES_FILE):
-            ensure_trade_file(VISIBLE_TRADES_FILE)
-        visible_path = VISIBLE_TRADES_FILE if os.path.exists(VISIBLE_TRADES_FILE) else TRADES_FILE
-
-        with open(visible_path, "r", newline="") as f:
-            reader = csv.DictReader(f)
-            trades = list(reader)
+        trades = load_visible_trade_rows()
 
         if limit is None:
             return trades
