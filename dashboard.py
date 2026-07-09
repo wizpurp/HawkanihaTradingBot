@@ -2836,7 +2836,7 @@ def summarize_ledger(rows, source, config):
 
 def get_trade_performance():
     config = load_config()
-    rows = read_permanent_trades()
+    rows = get_recent_trades(limit=None)
     return {
         "BOT": summarize_ledger(rows, "BOT", config),
         "HUMAN": summarize_ledger(rows, "HUMAN", config)
@@ -2907,21 +2907,25 @@ def render_trade_list(summary):
         pnl_class = "good" if trade["pnl"] > 0 else "bad" if trade["pnl"] < 0 else ""
         entry_label = entry_source_label({"EntryPriceSource": trade["entry_price_source"]})
         lines.append(
-            f"""<div class="trade-line">"""
-            f"""#{trade["number"]} | <span class="{pnl_class}">{fmt_money(trade["pnl"])} ({trade["return_percent"]:+.1f}%)</span><br>"""
-            f"""Entry: {fmt_premium(trade["entry_price"])}{entry_label}<br>"""
-            f"""Exit: {fmt_premium(trade["exit_price"])}<br>"""
-            f"""Entry Grade: {escape_html(trade["entry_grade"])}<br>"""
-            f"""Exit Grade: {escape_html(trade["exit_grade"])}<br>"""
-            f"""Overall Grade: {escape_html(trade["overall_grade"])}<br>"""
-            f"""Balance: {fmt_money(trade["balance"])}<br>"""
-            f"""Hold: {escape_html(trade["hold_time"])}</div>"""
+            f"""<div class="trade-line">#{trade["number"]} | """
+            f"""<span class="{pnl_class}">{fmt_money(trade["pnl"])} ({trade["return_percent"]:+.1f}%)</span> """
+            f"""| Entry: {fmt_premium(trade["entry_price"])}{entry_label} """
+            f"""| Exit: {fmt_premium(trade["exit_price"])} """
+            f"""| Balance: {fmt_money(trade["balance"])} """
+            f"""| Hold: {escape_html(trade["hold_time"])} """
+            f"""| Entry Grade: {escape_html(trade["entry_grade"])} """
+            f"""| Exit Grade: {escape_html(trade["exit_grade"])} """
+            f"""| Overall Grade: {escape_html(trade["overall_grade"])}</div>"""
         )
     return "".join(lines)
 
 
 def render_performance_panel(label, summary):
     panel_class = label.lower()
+    clear_action = "/clear-bot-trades" if label == "BOT" else "/clear-human-trades"
+    restore_action = "/restore-bot-trades" if label == "BOT" else "/restore-human-trades"
+    clear_text = "Clear Bot Trades" if label == "BOT" else "Clear Human Trades"
+    restore_text = "Undo Clear Bot Trades" if label == "BOT" else "Undo Clear Human Trades"
     if label == "BOT":
         stats_html = f"""
 Starting Account Balance: {fmt_money(summary["starting_balance"])}<br>
@@ -2950,6 +2954,13 @@ Number of Trades: {summary["number_of_trades"]}<br>
     return f"""
 <div class="performance-panel {panel_class}">
 <h3>{escape_html(label.title())}</h3>
+<form method="POST" action="{clear_action}" style="display:inline;">
+<button type="submit" class="red">{clear_text}</button>
+</form>
+<form method="POST" action="{restore_action}" style="display:inline;">
+<button type="submit" class="yellow">{restore_text}</button>
+</form>
+<br><br>
 {stats_html}
 Trade List:<br>
 {render_trade_list(summary)}
@@ -3635,53 +3646,6 @@ Status: OPEN
 
     html += """
 </div>
-</div>
-"""
-
-    visible_trades = get_recent_trades(limit=None)
-    enriched_visible_trades = enrich_trade_rows(visible_trades)
-    recent_bot = [trade for trade in enriched_visible_trades if trade_source(trade) == "BOT"][-10:]
-    recent_human = [trade for trade in enriched_visible_trades if trade_source(trade) == "HUMAN"][-10:]
-
-    html += """
-<div class="card">
-<h2>Bot Trades</h2>
-<form method="POST" action="/clear-bot-trades" style="display:inline;">
-<button type="submit" class="red">Clear Bot Trades</button>
-</form>
-<form method="POST" action="/restore-bot-trades" style="display:inline;">
-<button type="submit" class="yellow">Undo Clear Bot Trades</button>
-</form>
-<br><br>
-"""
-
-    if recent_bot:
-        for trade in reversed(recent_bot):
-            html += render_recent_trade_card(trade)
-    else:
-        html += "No bot trades visible."
-
-    html += """
-</div>
-
-<div class="card">
-<h2>Human Trades</h2>
-<form method="POST" action="/clear-human-trades" style="display:inline;">
-<button type="submit" class="red">Clear Human Trades</button>
-</form>
-<form method="POST" action="/restore-human-trades" style="display:inline;">
-<button type="submit" class="yellow">Undo Clear Human Trades</button>
-</form>
-<br><br>
-"""
-
-    if recent_human:
-        for trade in reversed(recent_human):
-            html += render_recent_trade_card(trade)
-    else:
-        html += "No human trades visible."
-
-    html += """
 </div>
 """
 

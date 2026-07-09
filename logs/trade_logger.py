@@ -265,12 +265,20 @@ def restore_visible_trades_by_source(source):
 
     ensure_trade_file(backup_file)
     current_rows = load_visible_trade_rows()
-    current_without_source = [row for row in current_rows if (row.get("Source") or "HUMAN").upper() != source]
 
     with open(backup_file, "r", newline="") as f:
         backup_rows = list(csv.DictReader(f))
 
-    write_visible_trade_rows(current_without_source + backup_rows)
+    existing_keys = {tuple(row.get(column, "") for column in TRADE_COLUMNS) for row in current_rows}
+    restored_rows = list(current_rows)
+    for row in backup_rows:
+        key = tuple(row.get(column, "") for column in TRADE_COLUMNS)
+        if key not in existing_keys:
+            restored_rows.append(row)
+            existing_keys.add(key)
+
+    restored_rows.sort(key=lambda row: row.get("Time", ""))
+    write_visible_trade_rows(restored_rows)
     return True
 
 
