@@ -129,6 +129,7 @@ def load_config():
     config.setdefault("human_starting_account_balance", 500)
     config.setdefault("max_contract_price", 1.00)
     config["max_open_contracts"] = clamp_int(config.get("max_open_contracts", 1), 1, 5, 1)
+    config.setdefault("contract_selection_mode", "strict_atm")
     config.setdefault("minimum_confidence", 2)
     config["minimum_confidence"] = clamp_int(config.get("minimum_confidence", 2), 1, 10, 2)
     config["strategy"].setdefault("ema_fast", 1)
@@ -803,6 +804,49 @@ def select_atm_contract(symbol, side):
     return selected
 
 
+def select_closest_contract_within_budget(symbol, side, max_contract_price):
+    quote = get_market_quote(symbol)
+    if not quote or quote.get("last") is None:
+        return None
+
+    price = float(quote["last"])
+    expirations = get_expirations(symbol)
+    if not expirations:
+        return None
+
+    expiration = expirations[0]
+    chain = get_option_chain(symbol, expiration)
+    option_type = "call" if side == "CALL" else "put"
+    matching = [o for o in chain if o.get("option_type") == option_type]
+    matching.sort(key=lambda o: abs(float(o["strike"]) - price))
+
+    for contract in matching:
+        ask = get_option_trade_price(contract)
+        if ask is not None and ask <= max_contract_price:
+            contract["expiration"] = expiration
+            contract["underlying_price"] = price
+            return contract
+
+    return None
+
+
+def select_entry_contract(config, decision, strict_call, strict_put):
+    side = "CALL" if decision == "BUY CALL" else "PUT" if decision == "BUY PUT" else "NONE"
+    if side == "NONE":
+        return None
+
+    strict_contract = strict_call if side == "CALL" else strict_put
+    if config.get("contract_selection_mode", "strict_atm") != "closest_within_budget":
+        return strict_contract
+
+    max_contract_price = float(config.get("max_contract_price", 1))
+    strict_ask = get_option_trade_price(strict_contract)
+    if strict_contract and strict_ask is not None and strict_ask <= max_contract_price:
+        return strict_contract
+
+    return select_closest_contract_within_budget(config.get("symbol", "SPY"), side, max_contract_price)
+
+
 def submit_option_order(option_symbol, qty, action="buy_to_open"):
     config = load_config()
     underlying = config["symbol"]
@@ -838,7 +882,7 @@ def add_bot_reason(message):
     with BOT_LOCK:
         BOT_STATE["last_action"] = message
         BOT_STATE["reason_log"].append(line)
-        BOT_STATE["reason_log"] = BOT_STATE["reason_log"][-20:]
+        BOT_STATE["reason_log"] = BOT_STATE["reason_log"][-80:]
 
     print(message)
 
@@ -1553,15 +1597,61 @@ def normalize_signal(signal):
 
 def format_market_reason_log(market_context):
     market_context = normalize_signal(market_context)
+    reasons = market_context.get("decision_reasons") or market_context.get("reasons", [])
+    breakdown_lines, bullish_breakdown_score, bearish_breakdown_score = format_indicator_breakdown(reasons)
     lines = [
         f"Market State: {market_context.get('market_state', 'UNKNOWN')}",
-        f"Bullish Score: {market_context.get('bullish_score', 0)}",
-        f"Bearish Score: {market_context.get('bearish_score', 0)}",
+        f"Bullish Score: {market_context.get('bullish_score', 0)} / 10",
+        f"Bearish Score: {market_context.get('bearish_score', 0)} / 10",
         f"Confidence: {market_context.get('confidence', 0)}",
-        f"Decision: {market_context.get('decision', 'DO NOTHING')}"
+        f"Decision: {market_context.get('decision', 'DO NOTHING')}",
+        "",
+        "Indicator Breakdown"
     ]
-    lines.extend(market_context.get("decision_reasons") or market_context.get("reasons", []))
-    return lines[-20:]
+    lines.extend(breakdown_lines)
+    lines.extend([
+        "----------------------------",
+        f"Bullish Score: {bullish_breakdown_score} / 10",
+        f"Bearish Score: {bearish_breakdown_score} / 10",
+        "",
+        "Reason Log"
+    ])
+    lines.extend(reasons)
+    return lines[-40:]
+
+
+def format_indicator_breakdown(reasons):
+    reason_text = "\n".join(str(reason) for reason in reasons)
+    rules = [
+        ("EMA Alignment", "EMA aligned bullish", "EMA aligned bearish"),
+        ("MA Alignment", "MA aligned bullish", "MA aligned bearish"),
+        ("MACD", "MACD bullish", "MACD bearish"),
+        ("VWAP", "Price above VWAP", "Price below VWAP"),
+        ("Volume Confirmation", "Volume confirmation bullish", "Volume confirmation bearish"),
+        ("Green/Red Tick Threshold", "Green ticks", "Red ticks"),
+        ("Previous Day High/Low", "Broke previous day high", "Broke previous day low"),
+        ("Previous Week High/Low", "Broke previous week high", "Broke previous week low"),
+        ("Last Hour High/Low", "Broke last hour high", "Broke last hour low"),
+        ("Opening Range High/Low", "Broke opening range high", "Broke opening range low")
+    ]
+
+    lines = []
+    bullish_score = 0
+    bearish_score = 0
+    for label, bullish_phrase, bearish_phrase in rules:
+        bullish_hit = bullish_phrase in reason_text
+        bearish_hit = bearish_phrase in reason_text
+        bullish_points = 1 if bullish_hit else 0
+        bearish_points = 1 if bearish_hit else 0
+        bullish_score += bullish_points
+        bearish_score += bearish_points
+        status = "✅" if bullish_hit or bearish_hit else "❌"
+        direction = "bullish" if bullish_hit else "bearish" if bearish_hit else ""
+        direction_label = f" {direction}" if direction else ""
+        points = bullish_points or bearish_points
+        lines.append(f"{label:<28} {status} +{points}{direction_label}")
+
+    return lines, bullish_score, bearish_score
 
 
 def update_bot_signal_state(signal, call_cost=None, put_cost=None):
@@ -1634,11 +1724,11 @@ def try_surfer_entry(config, positions, market_context, call, put):
         return
 
     side = "CALL" if decision == "BUY CALL" else "PUT" if decision == "BUY PUT" else "NONE"
-    contract = call if decision == "BUY CALL" else put if decision == "BUY PUT" else None
+    contract = select_entry_contract(config, decision, call, put)
 
     if not contract:
         add_bot_reason(f"SIGNAL no entry: {decision}")
-        log_bot_audit("DO NOTHING", decision, config.get("symbol", ""), market_context, config, skip_reason=decision)
+        log_bot_audit("DO NOTHING", decision, config.get("symbol", ""), market_context, config, skip_reason="no eligible contract")
         return
 
     ask = get_option_trade_price(contract)
@@ -2653,6 +2743,7 @@ def save_settings():
     config["human_starting_account_balance"] = float(request.form.get("human_starting_account_balance", 500))
     config["max_contract_price"] = float(request.form.get("max_contract_price", 1))
     config["max_open_contracts"] = clamp_int(request.form.get("max_open_contracts", 1), 1, 5, 1)
+    config["contract_selection_mode"] = request.form.get("contract_selection_mode", "strict_atm")
     config["minimum_confidence"] = clamp_int(request.form.get("minimum_confidence", 2), 1, 10, 2)
 
     s = config["strategy"]
@@ -3232,7 +3323,7 @@ def dashboard():
     if put_cost is None and put_price is not None:
         put_cost = put_price * 100 * contracts
 
-    reason_log_html = "<br>".join(bot_snapshot["reason_log"][-10:]) or "No bot actions yet."
+    reason_log_html = "<br>".join(bot_snapshot["reason_log"]) or "No bot actions yet."
     market_context = bot_snapshot["market_context"] or empty_market_context(get_quote_price(quote))
     trade_performance = get_trade_performance()
     bot_health = get_bot_health_data(positions, bot_snapshot)
@@ -3688,6 +3779,12 @@ Today's Human Trading Budget $:
 Max Contract Price:
 <input type="number" step="0.01" name="max_contract_price" value="{config.get("max_contract_price", 1)}"><br>
 
+Contract Selection Mode:
+<select name="contract_selection_mode">
+<option value="strict_atm" {selected("strict_atm", config.get("contract_selection_mode", "strict_atm"))}>Strict ATM (Skip if too expensive)</option>
+<option value="closest_within_budget" {selected("closest_within_budget", config.get("contract_selection_mode", "strict_atm"))}>Closest Within Budget</option>
+</select><br>
+
 Max Open Contracts:
 <input type="number" name="max_open_contracts" value="{config.get("max_open_contracts", 1)}" min="1" max="5"><br>
 
@@ -3849,7 +3946,7 @@ async function getJson(url) {{
 function renderReasonLog(lines) {{
     const el = document.getElementById("bot-reason-log");
     if (!el) return;
-    el.innerHTML = (lines && lines.length) ? lines.slice(-10).join("<br>") : "No bot actions yet.";
+    el.innerHTML = (lines && lines.length) ? lines.join("<br>") : "No bot actions yet.";
 }}
 
 function renderMarketStructure(data) {{

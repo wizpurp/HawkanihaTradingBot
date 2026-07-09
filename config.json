@@ -8,6 +8,7 @@
     "decision_time": "9:42",
     "bot_budget": 1000.0,
     "max_contract_price": 1.0,
+    "contract_selection_mode": "strict_atm",
     "max_open_contracts": 1,
     "strategy": {
         "ema_fast": 1,
