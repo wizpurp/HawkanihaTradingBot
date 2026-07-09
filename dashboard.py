@@ -128,6 +128,7 @@ def load_config():
     config.setdefault("bot_starting_account_balance", 500)
     config.setdefault("human_starting_account_balance", 500)
     config.setdefault("max_contract_price", 1.00)
+    config["max_open_contracts"] = clamp_int(config.get("max_open_contracts", 1), 1, 100, 1)
     config.setdefault("minimum_confidence", 2)
     config["minimum_confidence"] = clamp_int(config.get("minimum_confidence", 2), 1, 10, 2)
     config["strategy"].setdefault("ema_fast", 1)
@@ -141,7 +142,12 @@ def load_config():
     config["strategy"].setdefault("use_volume", False)
     config["strategy"].setdefault("hard_stop_percent", 20)
     config["strategy"].setdefault("trailing_stop_percent", 15)
-    config["strategy"].setdefault("tick_interval_seconds", 10)
+    config["strategy"]["exit_poll_interval_ms"] = clamp_int(
+        config["strategy"].get("exit_poll_interval_ms", 1000),
+        100,
+        5000,
+        1000
+    )
     config["strategy"].setdefault("direction_threshold_percent", 60)
 
     return config
@@ -511,6 +517,16 @@ def option_market_is_open():
 
 
 def submit_and_parse_option_order(option_symbol, qty, action, label):
+    if action == "buy_to_open":
+        allowed, reason, current_total, max_open_contracts = validate_buy_position_cap(qty)
+        if not allowed:
+            text = reason
+            print(f"{label} ORDER BLOCKED:", reason)
+            print("current_total_option_contracts:", current_total)
+            print("max_open_contracts:", max_open_contracts)
+            add_bot_reason(f"{label} BUY skipped: {reason}")
+            return False, reason, 0, text
+
     status, text = submit_option_order(option_symbol, qty, action)
     print(f"{label} ORDER STATUS:", status)
     print(f"{label} ORDER RESPONSE:", text)
@@ -556,6 +572,50 @@ def option_pnl(sell_price, cost_basis, qty):
 
 def option_current_value(option_price, qty):
     return option_price * 100 * qty
+
+
+def is_option_position(pos):
+    return len(str(pos.get("symbol", ""))) > 6
+
+
+def total_option_contracts(positions):
+    if not positions:
+        return 0
+
+    total = 0
+    for pos in positions:
+        if not is_option_position(pos):
+            continue
+        try:
+            total += abs(int(float(pos.get("quantity", 0) or 0)))
+        except:
+            pass
+    return total
+
+
+def get_position_cap_status(positions, config):
+    current_total = total_option_contracts(positions)
+    max_open_contracts = clamp_int(config.get("max_open_contracts", 1), 1, 100, 1)
+    return {
+        "current_total_option_contracts": current_total,
+        "max_open_contracts": max_open_contracts,
+        "position_cap_status": "BLOCKING NEW BUYS" if current_total >= max_open_contracts else "OK"
+    }
+
+
+def validate_buy_position_cap(qty):
+    config = load_config()
+    max_open_contracts = clamp_int(config.get("max_open_contracts", 1), 1, 100, 1)
+    live_positions = get_position()
+    current_total = total_option_contracts(live_positions)
+
+    if current_total > 0:
+        return False, "already holding option position", current_total, max_open_contracts
+
+    if current_total + int(qty) > max_open_contracts:
+        return False, "max open contracts reached", current_total, max_open_contracts
+
+    return True, "OK", current_total, max_open_contracts
 
 
 def record_api_diagnostic(kind, started_at, status):
@@ -1659,7 +1719,8 @@ def try_surfer_entry(config, positions, market_context, call, put):
         add_bot_reason(f"SIGNAL entered {side}: {'; '.join(market_context.get('decision_reasons', []))}")
     else:
         add_bot_reason(f"SIGNAL entry rejected or not accepted: {order_status}")
-        log_bot_audit("SKIP", decision, config.get("symbol", ""), market_context, config, option_symbol=contract.get("symbol", ""), skip_reason="entry rejected or not accepted", order_status=order_status, order_id=order_id)
+        skip_reason = order_status if order_status in ["already holding option position", "max open contracts reached"] else "entry rejected or not accepted"
+        log_bot_audit("SKIP", decision, config.get("symbol", ""), market_context, config, option_symbol=contract.get("symbol", ""), skip_reason=skip_reason, order_status=order_status, order_id=order_id)
 
 
 def try_surfer_exit(config, positions, market_context):
@@ -2162,7 +2223,8 @@ def surfer_bot_loop():
     while True:
         try:
             config = load_config()
-            interval = int(config["strategy"].get("tick_interval_seconds", 10))
+            interval = int(config.get("scanner", {}).get("interval_seconds", 60))
+            exit_poll_interval_ms = clamp_int(config["strategy"].get("exit_poll_interval_ms", 1000), 100, 5000, 1000)
             positions = get_position()
             if positions:
                 sync_trade_limits_from_file(config)
@@ -2178,7 +2240,7 @@ def surfer_bot_loop():
                     with BOT_LOCK:
                         BOT_STATE["thread_alive"] = True
                     record_tick_finished(idle_started_at)
-                time.sleep(1)
+                time.sleep(exit_poll_interval_ms / 1000)
             else:
                 last_full_position_scan = 0
                 surfer_bot_tick()
@@ -2320,7 +2382,8 @@ def api_bot_state():
             "last_broker_confirm_ms": BOT_STATE["last_broker_confirm_ms"],
             "last_market_scan_ms": BOT_STATE["last_market_scan_ms"],
             "last_indicators_ms": BOT_STATE["last_indicators_ms"],
-            "last_signal_ms": BOT_STATE["last_signal_ms"]
+            "last_signal_ms": BOT_STATE["last_signal_ms"],
+            "config_strategy": dict(config.get("strategy", {}))
         })
 
 
@@ -2356,7 +2419,8 @@ def api_developer_diagnostics():
             "last_broker_confirm_ms": BOT_STATE["last_broker_confirm_ms"],
             "last_market_scan_ms": BOT_STATE["last_market_scan_ms"],
             "last_indicators_ms": BOT_STATE["last_indicators_ms"],
-            "last_signal_ms": BOT_STATE["last_signal_ms"]
+            "last_signal_ms": BOT_STATE["last_signal_ms"],
+            "config_strategy": dict(config.get("strategy", {}))
         }
     bot_health = get_bot_health_data(positions, bot_snapshot)
     return jsonify(get_developer_diagnostics(config, positions, bot_snapshot, bot_health))
@@ -2567,6 +2631,7 @@ def save_settings():
     config["bot_starting_account_balance"] = float(request.form.get("bot_starting_account_balance", 500))
     config["human_starting_account_balance"] = float(request.form.get("human_starting_account_balance", 500))
     config["max_contract_price"] = float(request.form.get("max_contract_price", 1))
+    config["max_open_contracts"] = clamp_int(request.form.get("max_open_contracts", 1), 1, 100, 1)
     config["minimum_confidence"] = clamp_int(request.form.get("minimum_confidence", 2), 1, 10, 2)
 
     s = config["strategy"]
@@ -2581,7 +2646,7 @@ def save_settings():
     s["use_volume"] = request.form.get("use_volume") == "on"
     s["hard_stop_percent"] = float(request.form.get("hard_stop_percent", 20))
     s["trailing_stop_percent"] = float(request.form.get("trailing_stop_percent", 15))
-    s["tick_interval_seconds"] = int(request.form.get("tick_interval_seconds", 10))
+    s["exit_poll_interval_ms"] = clamp_int(request.form.get("exit_poll_interval_ms", 1000), 100, 5000, 1000)
     s["direction_threshold_percent"] = float(request.form.get("direction_threshold_percent", 60))
 
     e = config["entry_rules"]
@@ -2939,7 +3004,12 @@ def get_bot_health_data(positions, bot_snapshot):
         "peak_price": None,
         "trailing_stop_price": None,
         "distance_to_stop_percent": None,
-        "poll_interval_ms": 1000 if broker_has_position else None,
+        "poll_interval_ms": clamp_int(
+            (bot_snapshot.get("config_strategy") or {}).get("exit_poll_interval_ms", 1000),
+            100,
+            5000,
+            1000
+        ) if broker_has_position else None,
         "trailing_stop_percent": None,
         "stop_armed": False,
         "hold_time": "N/A"
@@ -2971,10 +3041,11 @@ def get_developer_diagnostics(config, positions, bot_snapshot, bot_health):
     quote_count = int(bot_snapshot.get("quote_request_count") or 0)
     quote_total = int(bot_snapshot.get("quote_latency_total_ms") or 0)
     average_quote_ms = int(quote_total / quote_count) if quote_count else None
+    position_cap = get_position_cap_status(positions, config)
 
     return {
         "engine_running": bool(bot_snapshot.get("thread_alive")),
-        "polling_interval": int(config.get("strategy", {}).get("tick_interval_seconds", 10)),
+        "polling_interval": int(config.get("scanner", {}).get("interval_seconds", 60)),
         "last_tick": bot_snapshot.get("last_tick", ""),
         "last_tick_duration_ms": bot_snapshot.get("last_tick_duration_ms"),
         "last_quote_time": bot_snapshot.get("last_quote_time", ""),
@@ -3004,7 +3075,10 @@ def get_developer_diagnostics(config, positions, bot_snapshot, bot_health):
         "signal_ms": bot_snapshot.get("last_signal_ms"),
         "order_submit_ms": bot_snapshot.get("last_order_submit_ms"),
         "broker_confirm_ms": bot_snapshot.get("last_broker_confirm_ms"),
-        "position_monitor": bot_health
+        "position_monitor": bot_health,
+        "current_total_option_contracts": position_cap["current_total_option_contracts"],
+        "max_open_contracts": position_cap["max_open_contracts"],
+        "position_cap_status": position_cap["position_cap_status"]
     }
 
 
@@ -3070,7 +3144,8 @@ def dashboard():
             "last_broker_confirm_ms": BOT_STATE["last_broker_confirm_ms"],
             "last_market_scan_ms": BOT_STATE["last_market_scan_ms"],
             "last_indicators_ms": BOT_STATE["last_indicators_ms"],
-            "last_signal_ms": BOT_STATE["last_signal_ms"]
+            "last_signal_ms": BOT_STATE["last_signal_ms"],
+            "config_strategy": dict(config.get("strategy", {}))
         }
 
     call_price = get_option_trade_price(call)
@@ -3088,6 +3163,7 @@ def dashboard():
     trade_performance = get_trade_performance()
     bot_health = get_bot_health_data(positions, bot_snapshot)
     developer_diagnostics = get_developer_diagnostics(config, positions, bot_snapshot, bot_health)
+    position_cap = get_position_cap_status(positions, config)
     levels = market_context.get("levels", {})
     distances = market_context.get("level_distances", {})
 
@@ -3375,7 +3451,6 @@ VWAP: {s.get("use_vwap")}<br>
 Volume: {s.get("use_volume")}<br>
 Hard Stop: {s.get("hard_stop_percent")}%<br>
 Trailing Stop: {s.get("trailing_stop_percent")}%<br>
-Direction Tick: {s.get("tick_interval_seconds")} sec<br>
 Direction Threshold: {s.get("direction_threshold_percent")}%<br>
 </div>
 
@@ -3414,6 +3489,9 @@ Max Trades Per Day: {e.get("max_trades_per_day")}
 <div class="item"><div class="label">Broker Position</div><div class="value" id="monitor-broker-position">{ "YES" if bot_health["broker_has_position"] else "NO" }</div></div>
 <div class="item"><div class="label">Local Position</div><div class="value" id="monitor-local-position">{ "YES" if bot_health["internal_has_position"] else "NO" }</div></div>
 <div class="item"><div class="label">Status</div><div class="value" id="monitor-position-status">{ "IN SYNC" if bot_health["position_sync"] == "OK" else "🚨 DESYNC" }</div></div>
+<div class="item"><div class="label">Current Total Option Contracts Held</div><div class="value" id="monitor-total-contracts">{position_cap["current_total_option_contracts"]}</div></div>
+<div class="item"><div class="label">Max Open Contracts</div><div class="value" id="monitor-max-contracts">{position_cap["max_open_contracts"]}</div></div>
+<div class="item"><div class="label">Position Cap Status</div><div class="value" id="monitor-cap-status">{position_cap["position_cap_status"]}</div></div>
 </div>
 </div>
 
@@ -3561,6 +3639,9 @@ Today's Human Trading Budget $:
 Max Contract Price:
 <input type="number" step="0.01" name="max_contract_price" value="{config.get("max_contract_price", 1)}"><br>
 
+Max Open Contracts:
+<input type="number" name="max_open_contracts" value="{config.get("max_open_contracts", 1)}" min="1" max="100"><br>
+
 Minimum Confidence:
 <input type="number" name="minimum_confidence" min="1" max="10" value="{config.get("minimum_confidence", 2)}"><br>
 
@@ -3666,8 +3747,8 @@ Trailing Stop %:
 
 <h3>Opening Direction</h3>
 
-Tick Interval Seconds:
-<input type="number" name="tick_interval_seconds" value="{s.get("tick_interval_seconds")}"><br>
+Exit Poll Interval (ms):
+<input type="number" min="100" max="5000" step="50" name="exit_poll_interval_ms" value="{s.get("exit_poll_interval_ms", 1000)}"><br>
 
 Direction Threshold %:
 <input type="number" step="0.1" name="direction_threshold_percent" value="{s.get("direction_threshold_percent")}"><br>
@@ -3877,6 +3958,9 @@ async function updateDeveloperDiagnostics() {{
     setText("monitor-broker-position", data.broker_position ? "YES" : "NO");
     setText("monitor-local-position", data.internal_position ? "YES" : "NO");
     setText("monitor-position-status", desynced ? "🚨 DESYNC" : "IN SYNC");
+    setText("monitor-total-contracts", data.current_total_option_contracts ?? 0);
+    setText("monitor-max-contracts", data.max_open_contracts ?? 1);
+    setText("monitor-cap-status", data.position_cap_status || "UNKNOWN");
 
     setText("exit-entry", fmtMoney(position.entry_price));
     setText("exit-current", fmtMoney(position.current_price));
