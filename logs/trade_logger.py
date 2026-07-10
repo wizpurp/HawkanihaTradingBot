@@ -209,11 +209,14 @@ def log_trade(
             trailing_stop_price = stop_values["trailing_stop_price"]
             max_drawdown_from_peak_percent = stop_values["drawdown_from_peak_percent"]
             trailing_percent = stop_values["trailing_stop_percent"]
-            trailing_lines = (
-                ["Trailing stop hit.", f"Drawdown {max_drawdown_from_peak_percent:.2f}% >= {trailing_percent:.2f}%."]
-                if max_drawdown_from_peak_percent >= trailing_percent
-                else ["Trailing stop not hit.", f"Drawdown {max_drawdown_from_peak_percent:.2f}% < {trailing_percent:.2f}%."]
-            )
+            if not stop_values.get("stop_armed", False):
+                trailing_lines = ["Trailing stop inactive.", "Trailing stop price has not reached entry."]
+            else:
+                trailing_lines = (
+                    ["Trailing stop hit.", f"Drawdown {max_drawdown_from_peak_percent:.2f}% >= {trailing_percent:.2f}%."]
+                    if max_drawdown_from_peak_percent >= trailing_percent
+                    else ["Trailing stop not hit.", f"Drawdown {max_drawdown_from_peak_percent:.2f}% < {trailing_percent:.2f}%."]
+                )
             exit_reason = "\n".join(trailing_lines + [str(reason) for reason in (market_context.get("decision_reasons") or [])])
 
     row = {

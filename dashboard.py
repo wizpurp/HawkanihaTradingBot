@@ -302,6 +302,7 @@ def stop_debug_values(symbol, entry_price, current_price, config=None):
 
     hard_stop_price = entry_price * (1 - hard_stop_percent / 100) if entry_price is not None else None
     trailing_stop_price = peak_price * (1 - trailing_stop_percent / 100) if peak_price is not None else None
+    stop_armed = trailing_stop_price >= entry_price if trailing_stop_price is not None and entry_price is not None else False
     drawdown_from_peak_percent = ((peak_price - current_price) / peak_price) * 100 if peak_price and current_price is not None else 0
 
     return {
@@ -310,6 +311,7 @@ def stop_debug_values(symbol, entry_price, current_price, config=None):
         "peak_price": peak_price,
         "trailing_stop_percent": trailing_stop_percent,
         "trailing_stop_price": trailing_stop_price,
+        "stop_armed": stop_armed,
         "drawdown_from_peak_percent": drawdown_from_peak_percent
     }
 
@@ -320,12 +322,16 @@ def current_exit_display(symbol, stop_values):
     reasons = context.get("decision_reasons") or []
     drawdown = stop_values.get("drawdown_from_peak_percent", 0)
     trailing_percent = stop_values.get("trailing_stop_percent", 0)
+    stop_armed = stop_values.get("stop_armed", False)
 
-    trailing_reasons = (
-        ["Trailing stop hit.", f"Drawdown {drawdown:.2f}% >= {trailing_percent:.2f}%."]
-        if drawdown >= trailing_percent
-        else ["Trailing stop not hit.", f"Drawdown {drawdown:.2f}% < {trailing_percent:.2f}%."]
-    )
+    if not stop_armed:
+        trailing_reasons = ["Trailing stop inactive.", "Trailing stop price has not reached entry."]
+    else:
+        trailing_reasons = (
+            ["Trailing stop hit.", f"Drawdown {drawdown:.2f}% >= {trailing_percent:.2f}%."]
+            if drawdown >= trailing_percent
+            else ["Trailing stop not hit.", f"Drawdown {drawdown:.2f}% < {trailing_percent:.2f}%."]
+        )
     reasons = trailing_reasons + [str(reason) for reason in reasons]
 
     return decision, "\n".join(str(reason) for reason in reasons)
@@ -1553,14 +1559,17 @@ def decide_surfer_action(config, positions, market_context):
             BOT_STATE["position_peaks"][symbol] = peak
 
         pnl_percent = ((current_price - entry_price) / entry_price) * 100 if current_price and entry_price else 0
+        trailing_stop_price = peak * (1 - trailing_stop_percent / 100) if peak else 0
         trailing_drawdown = ((peak - current_price) / peak) * 100 if current_price and peak else 0
+        trailing_stop_active = trailing_stop_price >= entry_price
 
         if pnl_percent <= -hard_stop_percent:
             return "SELL", ["Hard stop hit", f"P/L {pnl_percent:.2f}%"]
-        if trailing_drawdown >= trailing_stop_percent:
+        if trailing_stop_active and trailing_drawdown >= trailing_stop_percent:
             return "SELL", ["Trailing stop hit", f"Drawdown {trailing_drawdown:.2f}%"]
 
-        return "HOLD", ["Hard stop not hit", "Trailing stop not hit"] + market_context.get("reasons", [])
+        trailing_reason = "Trailing stop not hit" if trailing_stop_active else "Trailing stop inactive"
+        return "HOLD", ["Hard stop not hit", trailing_reason] + market_context.get("reasons", [])
 
     if (
         market_context.get("bullish_score", 0) >= minimum_signals
@@ -2013,7 +2022,7 @@ def fast_exit_poll(config, positions):
     trailing_stop_price = peak * (1 - trailing_stop_percent / 100)
     trailing_drawdown = ((peak - current_price) / peak) * 100 if peak else 0
     distance_to_trailing_stop = current_price - trailing_stop_price
-    stop_armed = peak > entry_price
+    stop_armed = trailing_stop_price >= entry_price
     no_sell_reason = ""
     sell_trigger_reason = ""
     decision = "HOLD"
@@ -2031,16 +2040,23 @@ def fast_exit_poll(config, positions):
         decision = "SELL"
         sell_trigger_reason = f"Hard stop hit: P/L {pnl_percent:.2f}% <= -{hard_stop_percent:.2f}%"
         reasons = ["Hard stop hit", f"P/L {pnl_percent:.2f}% <= -{hard_stop_percent:.2f}%"] + reasons
-    elif trailing_drawdown >= trailing_stop_percent:
+    elif stop_armed and trailing_drawdown >= trailing_stop_percent:
         decision = "SELL"
         sell_trigger_reason = f"Trailing stop hit: drawdown {trailing_drawdown:.2f}% >= {trailing_stop_percent:.2f}%"
         reasons = ["Trailing stop hit", f"Drawdown {trailing_drawdown:.2f}% >= {trailing_stop_percent:.2f}%"] + reasons
     else:
-        no_sell_reason = f"Hard stop not hit; trailing stop not hit; stop_armed={stop_armed}; drawdown {trailing_drawdown:.2f}% < {trailing_stop_percent:.2f}%"
-        reasons = [
-            "Trailing stop not hit.",
-            f"Drawdown {trailing_drawdown:.2f}% < {trailing_stop_percent:.2f}%."
-        ] + reasons
+        if stop_armed:
+            no_sell_reason = f"Hard stop not hit; trailing stop not hit; stop_armed={stop_armed}; drawdown {trailing_drawdown:.2f}% < {trailing_stop_percent:.2f}%"
+            reasons = [
+                "Trailing stop not hit.",
+                f"Drawdown {trailing_drawdown:.2f}% < {trailing_stop_percent:.2f}%."
+            ] + reasons
+        else:
+            no_sell_reason = f"Hard stop not hit; trailing stop inactive; stop_armed={stop_armed}; trailing_stop_price {trailing_stop_price:.2f} <= entry {entry_price:.2f}"
+            reasons = [
+                "Trailing stop inactive.",
+                f"Trailing stop price {trailing_stop_price:.2f} <= entry {entry_price:.2f}."
+            ] + reasons
 
     market_context = current_market_context_snapshot()
     market_context.update({
@@ -3382,7 +3398,7 @@ def get_bot_health_data(positions, bot_snapshot):
                 if pl.get("current_price") and pl.get("trailing_stop_price") else None
             ),
             "trailing_stop_percent": pl.get("trailing_stop_percent"),
-            "stop_armed": bool(pl.get("peak_price") and pl.get("entry_price") and pl.get("peak_price") > pl.get("entry_price")),
+            "stop_armed": bool(pl.get("trailing_stop_price") and pl.get("entry_price") and pl.get("trailing_stop_price") >= pl.get("entry_price")),
             "hold_time": pl.get("hold_time", "N/A")
         })
 
