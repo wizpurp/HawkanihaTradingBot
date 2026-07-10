@@ -964,17 +964,17 @@ def sync_trade_limits_from_file(config):
     last_sell_time = None
 
     try:
-        ensure_trade_file(TRADES_FILE)
-        with open(TRADES_FILE, "r", newline="") as f:
-            rows = list(csv.DictReader(f))
-            for row in rows:
-                if row.get("Action") == "SELL":
-                    try:
-                        sell_time = datetime.strptime(row.get("Time", ""), "%Y-%m-%d %H:%M:%S")
-                        if last_sell_time is None or sell_time > last_sell_time:
-                            last_sell_time = sell_time
-                    except:
-                        pass
+        rows = load_visible_trade_rows()
+        for row in rows:
+            if trade_source(row) != "BOT":
+                continue
+            if row.get("Action") == "SELL":
+                try:
+                    sell_time = datetime.strptime(row.get("Time", ""), "%Y-%m-%d %H:%M:%S")
+                    if last_sell_time is None or sell_time > last_sell_time:
+                        last_sell_time = sell_time
+                except:
+                    pass
     except:
         pass
 
@@ -2749,12 +2749,14 @@ def restore_trades():
 @app.route("/clear-bot-trades", methods=["POST"])
 def clear_bot_trades():
     clear_visible_trades_by_source("BOT")
+    sync_trade_limits_from_file(load_config())
     return redirect("/")
 
 
 @app.route("/restore-bot-trades", methods=["POST"])
 def restore_bot_trades():
     restore_visible_trades_by_source("BOT")
+    sync_trade_limits_from_file(load_config())
     return redirect("/")
 
 
