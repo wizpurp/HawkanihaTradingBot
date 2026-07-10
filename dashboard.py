@@ -43,6 +43,7 @@ BOT_STATE = {
     "bullish_score": 0,
     "bearish_score": 0,
     "confidence": 0,
+    "dominance_percent": 0,
     "bullish_percent": 0,
     "bearish_percent": 0,
     "current_signal": "NONE",
@@ -132,6 +133,7 @@ def load_config():
     config.setdefault("contract_selection_mode", "strict_atm")
     config.setdefault("minimum_confidence", 2)
     config["minimum_confidence"] = clamp_int(config.get("minimum_confidence", 2), 1, 10, 2)
+    config["minimum_dominance_percent"] = clamp_int(config.get("minimum_dominance_percent", 60), 50, 100, 60)
     config["strategy"].setdefault("ema_fast", 1)
     config["strategy"].setdefault("ema_medium", 5)
     config["strategy"].setdefault("ema_slow", 10)
@@ -1279,6 +1281,7 @@ def empty_market_context(price=None):
         "bullish_score": 0,
         "bearish_score": 0,
         "confidence": 0,
+        "dominance_percent": 0,
         "market_state": "NEUTRAL",
         "current_signal": "NONE",
         "decision": "DO NOTHING",
@@ -1298,6 +1301,13 @@ def add_score(reasons, side, text, bullish_score, bearish_score, amount=1):
     elif side == "bearish":
         bearish_score += amount
     return bullish_score, bearish_score
+
+
+def calculate_dominance_percent(bullish_score, bearish_score):
+    total_score = bullish_score + bearish_score
+    if total_score <= 0:
+        return 0
+    return (max(bullish_score, bearish_score) / total_score) * 100
 
 
 def build_market_context(config, positions=None):
@@ -1456,13 +1466,15 @@ def build_market_context(config, positions=None):
 
     minimum_signals = int(e.get("minimum_signals", 3))
     minimum_confidence = int(config.get("minimum_confidence", 2))
+    minimum_dominance_percent = int(config.get("minimum_dominance_percent", 60))
     confidence = abs(bullish_score - bearish_score)
+    dominance_percent = calculate_dominance_percent(bullish_score, bearish_score)
     market_state = "NEUTRAL"
 
-    if bullish_score >= minimum_signals and confidence >= minimum_confidence:
+    if bullish_score >= minimum_signals and confidence >= minimum_confidence and dominance_percent >= minimum_dominance_percent:
         market_state = "BULLISH"
         current_signal = "CALL"
-    elif bearish_score >= minimum_signals and confidence >= minimum_confidence:
+    elif bearish_score >= minimum_signals and confidence >= minimum_confidence and dominance_percent >= minimum_dominance_percent:
         market_state = "BEARISH"
         current_signal = "PUT"
     else:
@@ -1470,6 +1482,8 @@ def build_market_context(config, positions=None):
         if confidence <= 1:
             market_state = "CHOPPY"
             reasons.append(f"Confidence {confidence} is too low")
+        elif dominance_percent < minimum_dominance_percent:
+            reasons.append(f"Dominance {dominance_percent:.1f}% is below minimum {minimum_dominance_percent}%")
         elif stagnant_market:
             market_state = "STAGNANT"
         elif bullish_percent < 55 and bearish_percent < 55:
@@ -1501,6 +1515,7 @@ def build_market_context(config, positions=None):
         "bullish_score": bullish_score,
         "bearish_score": bearish_score,
         "confidence": confidence,
+        "dominance_percent": dominance_percent,
         "bullish_percent": bullish_percent,
         "bearish_percent": bearish_percent,
         "market_state": market_state,
@@ -1518,9 +1533,11 @@ def decide_surfer_action(config, positions, market_context):
     market_context = normalize_signal(market_context)
     minimum_signals = int(config["entry_rules"].get("minimum_signals", 3))
     minimum_confidence = int(config.get("minimum_confidence", 2))
+    minimum_dominance_percent = int(config.get("minimum_dominance_percent", 60))
     hard_stop_percent = float(config["strategy"].get("hard_stop_percent", 20))
     trailing_stop_percent = float(config["strategy"].get("trailing_stop_percent", 15))
     confidence = market_context.get("confidence", 0)
+    dominance_percent = float(market_context.get("dominance_percent") or 0)
 
     if positions:
         pos = positions[0]
@@ -1545,9 +1562,17 @@ def decide_surfer_action(config, positions, market_context):
 
         return "HOLD", ["Hard stop not hit", "Trailing stop not hit"] + market_context.get("reasons", [])
 
-    if market_context.get("bullish_score", 0) >= minimum_signals and confidence >= minimum_confidence:
+    if (
+        market_context.get("bullish_score", 0) >= minimum_signals
+        and confidence >= minimum_confidence
+        and dominance_percent >= minimum_dominance_percent
+    ):
         return "BUY CALL", market_context.get("reasons", [])
-    if market_context.get("bearish_score", 0) >= minimum_signals and confidence >= minimum_confidence:
+    if (
+        market_context.get("bearish_score", 0) >= minimum_signals
+        and confidence >= minimum_confidence
+        and dominance_percent >= minimum_dominance_percent
+    ):
         return "BUY PUT", market_context.get("reasons", [])
 
     return "DO NOTHING", market_context.get("reasons", [])
@@ -1572,6 +1597,7 @@ def normalize_signal(signal):
     signal.setdefault("bullish_score", 0)
     signal.setdefault("bearish_score", 0)
     signal.setdefault("confidence", 0)
+    signal.setdefault("dominance_percent", calculate_dominance_percent(signal.get("bullish_score", 0), signal.get("bearish_score", 0)))
     signal.setdefault("current_signal", "NONE")
     signal.setdefault("market_state", "UNKNOWN")
     signal.setdefault("decision", "DO NOTHING")
@@ -1604,6 +1630,7 @@ def format_market_reason_log(market_context):
         f"Bullish Score: {market_context.get('bullish_score', 0)} / 10",
         f"Bearish Score: {market_context.get('bearish_score', 0)} / 10",
         f"Confidence: {market_context.get('confidence', 0)}",
+        f"Dominance: {float(market_context.get('dominance_percent') or 0):.1f}%",
         f"Decision: {market_context.get('decision', 'DO NOTHING')}",
         "",
         "Indicator Breakdown"
@@ -1660,6 +1687,7 @@ def update_bot_signal_state(signal, call_cost=None, put_cost=None):
         BOT_STATE["bullish_score"] = signal.get("bullish_score", 0)
         BOT_STATE["bearish_score"] = signal.get("bearish_score", 0)
         BOT_STATE["confidence"] = signal.get("confidence", 0)
+        BOT_STATE["dominance_percent"] = signal.get("dominance_percent", 0)
         BOT_STATE["bullish_percent"] = signal.get("bullish_percent", signal.get("green_percent", 0))
         BOT_STATE["bearish_percent"] = signal.get("bearish_percent", signal.get("red_percent", 0))
         BOT_STATE["current_signal"] = signal.get("current_signal", "NONE")
@@ -2427,13 +2455,15 @@ def api_orders():
 
 @app.route("/api/bot-state")
 def api_bot_state():
-    sync_trade_limits_from_file(load_config())
+    config = load_config()
+    sync_trade_limits_from_file(config)
 
     with BOT_LOCK:
         return jsonify({
             "bullish_score": BOT_STATE["bullish_score"],
             "bearish_score": BOT_STATE["bearish_score"],
             "confidence": BOT_STATE["confidence"],
+            "dominance_percent": BOT_STATE["dominance_percent"],
             "current_signal": BOT_STATE["current_signal"],
             "last_action": BOT_STATE["last_action"],
             "trades_today": BOT_STATE["trades_today"],
@@ -2555,6 +2585,7 @@ def api_market_structure():
         "bullish_score": market_context.get("bullish_score"),
         "bearish_score": market_context.get("bearish_score"),
         "confidence": market_context.get("confidence"),
+        "dominance_percent": market_context.get("dominance_percent"),
         "current_signal": market_context.get("current_signal"),
         "reasons": market_context.get("decision_reasons") or market_context.get("reasons", [])
     })
@@ -2723,6 +2754,18 @@ def restore_human_trades():
     return redirect("/")
 
 
+@app.route("/clear-trade-history-view", methods=["POST"])
+def clear_trade_history_view_route():
+    clear_trade_history_view()
+    return redirect("/")
+
+
+@app.route("/restore-trade-history-view", methods=["POST"])
+def restore_trade_history_view_route():
+    restore_trade_history_view()
+    return redirect("/")
+
+
 @app.route("/save-settings", methods=["POST"])
 def save_settings():
     config = load_config()
@@ -2745,6 +2788,7 @@ def save_settings():
     config["max_open_contracts"] = clamp_int(request.form.get("max_open_contracts", 1), 1, 5, 1)
     config["contract_selection_mode"] = request.form.get("contract_selection_mode", "strict_atm")
     config["minimum_confidence"] = clamp_int(request.form.get("minimum_confidence", 2), 1, 10, 2)
+    config["minimum_dominance_percent"] = clamp_int(request.form.get("minimum_dominance_percent", 60), 50, 100, 60)
 
     s = config["strategy"]
     s["ema_fast"] = int(request.form.get("ema_fast", 1))
@@ -3023,6 +3067,7 @@ def render_buy_trade_card(trade):
     entry_bullish_score = trade.get("EntryBullishScore") or bullish_score
     entry_bearish_score = trade.get("EntryBearishScore") or bearish_score
     entry_confidence = trade.get("EntryConfidence") or abs(int(safe_float(entry_bullish_score)) - int(safe_float(entry_bearish_score)))
+    entry_dominance = trade.get("EntryDominancePercent") or calculate_dominance_percent(int(safe_float(entry_bullish_score)), int(safe_float(entry_bearish_score)))
     entry_decision = trade.get("EntryDecision") or "N/A"
     market_state = trade.get("EntryMarketState") or "N/A"
 
@@ -3041,6 +3086,7 @@ Market State: {escape_html(market_state)}<br>
 Bullish Score: {escape_html(entry_bullish_score)} / 10<br>
 Bearish Score: {escape_html(entry_bearish_score)} / 10<br>
 Confidence: {escape_html(entry_confidence)} / 10<br>
+Dominance: {float(safe_float(entry_dominance)):.1f}%<br>
 Decision: {escape_html(entry_decision)}<br>
 <br>
 Indicator Breakdown<br>
@@ -3415,6 +3461,7 @@ def dashboard():
             "bullish_score": BOT_STATE["bullish_score"],
             "bearish_score": BOT_STATE["bearish_score"],
             "confidence": BOT_STATE["confidence"],
+            "dominance_percent": BOT_STATE["dominance_percent"],
             "current_signal": BOT_STATE["current_signal"],
             "last_action": BOT_STATE["last_action"],
             "trades_today": BOT_STATE["trades_today"],
@@ -3625,6 +3672,8 @@ Bullish Score: <span id="bot-bullish-score">{bot_snapshot["bullish_score"]}</spa
 Bearish Score: <span id="bot-bearish-score">{bot_snapshot["bearish_score"]}</span><br>
 Current Confidence: <span id="bot-confidence">{bot_snapshot["confidence"]}</span> / 10<br>
 Minimum Confidence Required: <span id="bot-minimum-confidence">{config.get("minimum_confidence", 2)}</span> / 10<br>
+Dominance: <span id="bot-dominance">{float(bot_snapshot.get("dominance_percent") or 0):.1f}</span>%<br>
+Minimum Dominance Required: <span id="bot-minimum-dominance">{config.get("minimum_dominance_percent", 60)}</span>%<br>
 Current Signal: <span id="bot-current-signal">{bot_snapshot["current_signal"]}</span><br>
 Last Bot Action: <span id="bot-last-action">{bot_snapshot["last_action"]}</span><br>
 Trades Today: <span id="bot-trades-today">{bot_snapshot["trades_today"]}</span><br>
@@ -3893,10 +3942,17 @@ Status: OPEN
 </div>
 """
 
-    visible_trades = enrich_trade_rows(get_recent_trades(limit=None))
+    visible_trades = enrich_trade_rows(get_trade_history_trades(limit=None))
     html += """
 <div class="card">
 <h2>Trade History</h2>
+<form method="POST" action="/clear-trade-history-view" style="display:inline;">
+<button type="submit" class="red">Clear Trade History</button>
+</form>
+<form method="POST" action="/restore-trade-history-view" style="display:inline;">
+<button type="submit" class="yellow">Undo Clear Trade History</button>
+</form>
+<br><br>
 """
 
     if visible_trades:
@@ -3949,6 +4005,9 @@ Max Open Contracts:
 
 Minimum Confidence:
 <input type="number" name="minimum_confidence" min="1" max="10" value="{config.get("minimum_confidence", 2)}"><br>
+
+Minimum Dominance %:
+<input type="number" name="minimum_dominance_percent" min="50" max="100" value="{config.get("minimum_dominance_percent", 60)}"><br>
 
 Mode:
 <select name="mode">
@@ -4189,6 +4248,7 @@ async function updateBotState() {{
     setText("bot-bullish-score", data.bullish_score);
     setText("bot-bearish-score", data.bearish_score);
     setText("bot-confidence", data.confidence);
+    setText("bot-dominance", Number(data.dominance_percent || 0).toFixed(1));
     setText("bot-current-signal", data.current_signal);
     setText("bot-last-action", data.last_action);
     setText("bot-trades-today", data.trades_today);
@@ -4221,6 +4281,7 @@ async function updateMarketStructure() {{
     setText("bot-bullish-score", data.bullish_score);
     setText("bot-bearish-score", data.bearish_score);
     setText("bot-confidence", data.confidence);
+    setText("bot-dominance", Number(data.dominance_percent || 0).toFixed(1));
     setText("bot-current-signal", data.current_signal);
     setText("market-structure-source", data.market_structure_source);
     setText("market-date", data.market_date);

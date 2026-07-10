@@ -6,6 +6,8 @@ from datetime import datetime
 APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TRADES_FILE = os.path.join(APP_DIR, "trades.csv")
 VISIBLE_TRADES_FILE = os.path.join(APP_DIR, "dashboard_visible_trades.csv")
+TRADE_HISTORY_VISIBLE_FILE = os.path.join(APP_DIR, "dashboard_trade_history_visible.csv")
+TRADE_HISTORY_BACKUP_FILE = os.path.join(APP_DIR, "dashboard_trade_history_last_cleared.csv")
 BOT_VISIBLE_TRADES_BACKUP_FILE = os.path.join(APP_DIR, "dashboard_bot_trades_last_cleared.csv")
 HUMAN_VISIBLE_TRADES_BACKUP_FILE = os.path.join(APP_DIR, "dashboard_human_trades_last_cleared.csv")
 TRADE_COLUMNS = [
@@ -15,7 +17,7 @@ TRADE_COLUMNS = [
     "HardStopPrice", "TrailingStopPrice", "MaxDrawdownFromPeakPercent",
     "PnLPercent", "ExitReason", "EntryPriceSource", "EstimatedEntryPrice",
     "EntryMarketState", "EntryBullishScore", "EntryBearishScore",
-    "EntryConfidence", "EntryDecision", "EntryReasonLog",
+    "EntryConfidence", "EntryDominancePercent", "EntryDecision", "EntryReasonLog",
     "EntryIndicatorBreakdown"
 ]
 
@@ -168,6 +170,7 @@ def log_trade(
     entry_bullish_score = ""
     entry_bearish_score = ""
     entry_confidence = ""
+    entry_dominance_percent = ""
     entry_decision = ""
     entry_reason_log = ""
     entry_indicator_breakdown_json = ""
@@ -182,6 +185,7 @@ def log_trade(
         entry_bullish_score = market_context.get("bullish_score", "")
         entry_bearish_score = market_context.get("bearish_score", "")
         entry_confidence = market_context.get("confidence", "")
+        entry_dominance_percent = market_context.get("dominance_percent", "")
         entry_decision = market_context.get("decision", "")
         entry_reason_log = "\n".join(entry_reasons)
         entry_indicator_breakdown_json = json.dumps(entry_indicator_breakdown(entry_reasons))
@@ -240,6 +244,7 @@ def log_trade(
         "EntryBullishScore": entry_bullish_score,
         "EntryBearishScore": entry_bearish_score,
         "EntryConfidence": entry_confidence,
+        "EntryDominancePercent": entry_dominance_percent,
         "EntryDecision": entry_decision,
         "EntryReasonLog": entry_reason_log,
         "EntryIndicatorBreakdown": entry_indicator_breakdown_json
@@ -247,6 +252,7 @@ def log_trade(
 
     append_trade_row(TRADES_FILE, row)
     append_trade_row(VISIBLE_TRADES_FILE, row)
+    append_trade_row(TRADE_HISTORY_VISIBLE_FILE, row)
     try:
         if load_config and sync_trade_limits_from_file:
             sync_trade_limits_from_file(load_config())
@@ -348,6 +354,49 @@ def get_recent_trades(limit=10):
         return trades[-limit:]
     except:
         return []
+
+
+def get_trade_history_trades(limit=None):
+    try:
+        if os.path.exists(TRADES_FILE):
+            ensure_trade_file(TRADES_FILE)
+        if os.path.exists(TRADE_HISTORY_VISIBLE_FILE):
+            ensure_trade_file(TRADE_HISTORY_VISIBLE_FILE)
+        visible_path = TRADE_HISTORY_VISIBLE_FILE if os.path.exists(TRADE_HISTORY_VISIBLE_FILE) else TRADES_FILE
+
+        with open(visible_path, "r", newline="") as f:
+            trades = list(csv.DictReader(f))
+
+        if limit is None:
+            return trades
+        return trades[-limit:]
+    except:
+        return []
+
+
+def clear_trade_history_view():
+    current_rows = get_trade_history_trades(limit=None)
+    with open(TRADE_HISTORY_BACKUP_FILE, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=TRADE_COLUMNS)
+        writer.writeheader()
+        for row in current_rows:
+            writer.writerow({column: row.get(column, "") for column in TRADE_COLUMNS})
+    write_trade_header(TRADE_HISTORY_VISIBLE_FILE)
+
+
+def restore_trade_history_view():
+    if not os.path.exists(TRADE_HISTORY_BACKUP_FILE):
+        return False
+    ensure_trade_file(TRADE_HISTORY_BACKUP_FILE)
+    with open(TRADE_HISTORY_BACKUP_FILE, "r", newline="") as src:
+        backup_rows = list(csv.DictReader(src))
+
+    with open(TRADE_HISTORY_VISIBLE_FILE, "w", newline="") as dst:
+        writer = csv.DictWriter(dst, fieldnames=TRADE_COLUMNS)
+        writer.writeheader()
+        for row in backup_rows:
+            writer.writerow({column: row.get(column, "") for column in TRADE_COLUMNS})
+    return True
 
 
 def read_permanent_trades():

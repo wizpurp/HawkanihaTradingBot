@@ -42,5 +42,6 @@
     "minimum_confidence": 4,
     "human_daily_trading_budget": 300.0,
     "bot_starting_account_balance": 1000.0,
-    "human_starting_account_balance": 2000.0
+    "human_starting_account_balance": 2000.0,
+    "minimum_dominance_percent": 60
 }
