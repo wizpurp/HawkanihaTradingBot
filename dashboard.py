@@ -2953,7 +2953,150 @@ def entry_source_label(trade):
     return ""
 
 
+def parse_entry_reason_log(trade):
+    reason_log = trade.get("EntryReasonLog") or ""
+    if reason_log:
+        return [line for line in reason_log.splitlines() if line]
+
+    fallback = trade.get("GradeReason") or ""
+    if fallback:
+        return [part.strip() for part in fallback.split(";") if part.strip()]
+
+    return []
+
+
+def parse_entry_indicator_breakdown(trade):
+    raw_breakdown = trade.get("EntryIndicatorBreakdown") or ""
+    if raw_breakdown:
+        try:
+            parsed = json.loads(raw_breakdown)
+            if isinstance(parsed, list):
+                return parsed
+        except:
+            pass
+
+    reasons = parse_entry_reason_log(trade)
+    lines, _, _ = format_indicator_breakdown(reasons)
+    rows = []
+    for line in lines:
+        status = "✅" in line
+        points = 1 if "+1" in line else 0
+        direction = "bullish" if "bullish" in line else "bearish" if "bearish" in line else "neutral"
+        label = line.split("✅")[0].split("❌")[0].strip()
+        rows.append({
+            "label": label,
+            "passed": status,
+            "points": points,
+            "direction": direction,
+        })
+    return rows
+
+
+def render_entry_indicator_breakdown(trade):
+    rows = parse_entry_indicator_breakdown(trade)
+    bullish_score = 0
+    bearish_score = 0
+    lines = []
+
+    for row in rows:
+        label = row.get("label", "")
+        points = int(row.get("points") or 0)
+        direction = row.get("direction") or "neutral"
+        passed = bool(row.get("passed"))
+        if passed and direction == "bullish":
+            bullish_score += points
+        elif passed and direction == "bearish":
+            bearish_score += points
+
+        icon = "✅" if passed else "❌"
+        direction_text = f" {direction}" if passed and direction in ["bullish", "bearish"] else ""
+        lines.append(f"{escape_html(label)} {icon} +{points}{direction_text}")
+
+    return "<br>".join(lines), bullish_score, bearish_score
+
+
+def render_buy_trade_card(trade):
+    trader = trade.get("Trader", "HUMAN")
+    trader_class = trader.lower()
+    reasons = parse_entry_reason_log(trade)
+    breakdown_html, bullish_score, bearish_score = render_entry_indicator_breakdown(trade)
+    entry_bullish_score = trade.get("EntryBullishScore") or bullish_score
+    entry_bearish_score = trade.get("EntryBearishScore") or bearish_score
+    entry_confidence = trade.get("EntryConfidence") or abs(int(safe_float(entry_bullish_score)) - int(safe_float(entry_bearish_score)))
+    entry_decision = trade.get("EntryDecision") or "N/A"
+    market_state = trade.get("EntryMarketState") or "N/A"
+
+    return f"""
+<div class="trade-card {trader_class}">
+<b>BUY</b>
+<span class="badge {trader_class}">Trader: {escape_html(trader)}</span><br>
+Symbol: {escape_html(trade.get("Symbol", ""))}<br>
+Qty: {escape_html(trade.get("Qty", ""))}<br>
+Entry: {fmt_trade_price(trade.get("Entry"))}{entry_source_label(trade)}<br>
+Entry Grade: {escape_html(trade_entry_grade(trade))}<br>
+Overall Grade: {escape_html(trade_grade(trade))}<br>
+Timestamp: {escape_html(trade.get("Time", ""))}<br>
+<br>
+Market State: {escape_html(market_state)}<br>
+Bullish Score: {escape_html(entry_bullish_score)} / 10<br>
+Bearish Score: {escape_html(entry_bearish_score)} / 10<br>
+Confidence: {escape_html(entry_confidence)} / 10<br>
+Decision: {escape_html(entry_decision)}<br>
+<br>
+Indicator Breakdown<br>
+{breakdown_html}<br>
+----------------------------<br>
+Bullish Score: {escape_html(entry_bullish_score)} / 10<br>
+Bearish Score: {escape_html(entry_bearish_score)} / 10<br>
+<br>
+Reason Log<br>
+{escape_html(chr(10).join(reasons)).replace(chr(10), "<br>")}
+</div>
+"""
+
+
+def render_sell_trade_card(trade):
+    trader = trade.get("Trader", "HUMAN")
+    trader_class = trader.lower()
+    pnl = safe_float(trade.get("PnL"))
+    pnl_display = fmt_money(pnl) if trade.get("PnL") not in (None, "") else "N/A"
+    pnl_percent = trade.get("PnLPercent")
+    if not pnl_percent and trade.get("Entry") not in (None, ""):
+        entry_amount = trade_entry_amount(trade)
+        pnl_percent = (pnl / entry_amount) * 100 if entry_amount else ""
+    pnl_class = "good" if pnl > 0 else "bad" if pnl < 0 else ""
+    exit_reason = trade.get("ExitReason") or trade.get("GradeReason") or "N/A"
+
+    return f"""
+<div class="trade-card {trader_class}">
+<b>SELL</b>
+<span class="badge {trader_class}">Trader: {escape_html(trader)}</span><br>
+Symbol: {escape_html(trade.get("Symbol", ""))}<br>
+Qty: {escape_html(trade.get("Qty", ""))}<br>
+Entry: {fmt_trade_price(trade.get("Entry"))}{entry_source_label(trade)}<br>
+Exit: {fmt_trade_price(trade.get("Exit"))}<br>
+Peak Price: {fmt_trade_price(trade.get("PeakPrice"))}<br>
+Hard Stop Price: {fmt_trade_price(trade.get("HardStopPrice"))}<br>
+Trailing Stop Price: {fmt_trade_price(trade.get("TrailingStopPrice"))}<br>
+Max Drawdown From Peak: {fmt_percent(trade.get("MaxDrawdownFromPeakPercent"))}<br>
+PnL: <span class="{pnl_class}">{pnl_display} ({fmt_percent(pnl_percent)})</span><br>
+Hold Time: {escape_html(trade.get("HoldTime") or "N/A")}<br>
+Entry Grade: {escape_html(trade_entry_grade(trade))}<br>
+Exit Grade: {escape_html(trade_exit_grade(trade))}<br>
+Overall Grade: {escape_html(trade_grade(trade))}<br>
+Exit Reason:<br>
+{escape_html(exit_reason).replace(chr(10), "<br>")}<br>
+Timestamp: {escape_html(trade.get("Time", ""))}
+</div>
+"""
+
+
 def render_recent_trade_card(trade):
+    if trade.get("Action") == "BUY":
+        return render_buy_trade_card(trade)
+    if trade.get("Action") == "SELL":
+        return render_sell_trade_card(trade)
+
     trader = trade.get("Trader", "HUMAN")
     trader_class = trader.lower()
     pnl = safe_float(trade.get("PnL"))
@@ -3747,6 +3890,22 @@ Status: OPEN
 {render_performance_panel("HUMAN", trade_performance["HUMAN"])}
 {render_performance_panel("BOT", trade_performance["BOT"])}
 </div>
+</div>
+"""
+
+    visible_trades = enrich_trade_rows(get_recent_trades(limit=None))
+    html += """
+<div class="card">
+<h2>Trade History</h2>
+"""
+
+    if visible_trades:
+        for trade in reversed(visible_trades):
+            html += render_recent_trade_card(trade)
+    else:
+        html += "No trades visible."
+
+    html += """
 </div>
 """
 

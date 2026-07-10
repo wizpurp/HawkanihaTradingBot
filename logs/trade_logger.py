@@ -1,4 +1,5 @@
 import csv
+import json
 import os
 from datetime import datetime
 
@@ -12,7 +13,10 @@ TRADE_COLUMNS = [
     "Source", "EntryGrade", "LiveGrade", "ExitGrade", "BotGrade", "OverallGrade",
     "TradeScore", "GradeReason", "HoldTime", "PeakPrice",
     "HardStopPrice", "TrailingStopPrice", "MaxDrawdownFromPeakPercent",
-    "PnLPercent", "ExitReason", "EntryPriceSource", "EstimatedEntryPrice"
+    "PnLPercent", "ExitReason", "EntryPriceSource", "EstimatedEntryPrice",
+    "EntryMarketState", "EntryBullishScore", "EntryBearishScore",
+    "EntryConfidence", "EntryDecision", "EntryReasonLog",
+    "EntryIndicatorBreakdown"
 ]
 
 _CALLBACKS = {}
@@ -50,6 +54,34 @@ def grade_from_score(score):
     if score >= 60:
         return "D"
     return "F"
+
+
+def entry_indicator_breakdown(reasons):
+    reason_text = "\n".join(str(reason) for reason in reasons)
+    rules = [
+        ("EMA Alignment", "EMA aligned bullish", "EMA aligned bearish"),
+        ("MA Alignment", "MA aligned bullish", "MA aligned bearish"),
+        ("MACD", "MACD bullish", "MACD bearish"),
+        ("VWAP", "Price above VWAP", "Price below VWAP"),
+        ("Volume Confirmation", "Volume confirmation bullish", "Volume confirmation bearish"),
+        ("Green/Red Tick Threshold", "Green ticks", "Red ticks"),
+        ("Previous Day High/Low", "Broke previous day high", "Broke previous day low"),
+        ("Previous Week High/Low", "Broke previous week high", "Broke previous week low"),
+        ("Last Hour High/Low", "Broke last hour high", "Broke last hour low"),
+        ("Opening Range High/Low", "Broke opening range high", "Broke opening range low"),
+    ]
+
+    rows = []
+    for label, bullish_phrase, bearish_phrase in rules:
+        bullish_hit = bullish_phrase in reason_text
+        bearish_hit = bearish_phrase in reason_text
+        rows.append({
+            "label": label,
+            "passed": bullish_hit or bearish_hit,
+            "points": 1 if bullish_hit or bearish_hit else 0,
+            "direction": "bullish" if bullish_hit else "bearish" if bearish_hit else "neutral",
+        })
+    return rows
 
 
 def ensure_trade_file(path):
@@ -132,10 +164,27 @@ def log_trade(
     max_drawdown_from_peak_percent = ""
     pnl_percent = ""
     exit_reason = ""
+    entry_market_state = ""
+    entry_bullish_score = ""
+    entry_bearish_score = ""
+    entry_confidence = ""
+    entry_decision = ""
+    entry_reason_log = ""
+    entry_indicator_breakdown_json = ""
 
     if action == "BUY" and grade_entry_setup:
         entry_grade, trade_score, grade_reason = grade_entry_setup(market_context)
         bot_grade = entry_grade
+        entry_reasons = [str(reason) for reason in (market_context.get("decision_reasons") or market_context.get("reasons") or [])]
+        if market_context.get("decision") in ["BUY CALL", "BUY PUT"]:
+            entry_reasons.append(f"SIGNAL entered {market_context.get('decision').replace('BUY ', '')}")
+        entry_market_state = market_context.get("market_state", "")
+        entry_bullish_score = market_context.get("bullish_score", "")
+        entry_bearish_score = market_context.get("bearish_score", "")
+        entry_confidence = market_context.get("confidence", "")
+        entry_decision = market_context.get("decision", "")
+        entry_reason_log = "\n".join(entry_reasons)
+        entry_indicator_breakdown_json = json.dumps(entry_indicator_breakdown(entry_reasons))
     elif action == "SELL" and grade_exit_trade:
         exit_grade, trade_score, grade_reason, hold_time = grade_exit_trade(symbol, qty, price, pnl, market_context)
         last_buy = find_last_buy(symbol)
@@ -186,7 +235,14 @@ def log_trade(
         "PnLPercent": pnl_percent,
         "ExitReason": exit_reason,
         "EntryPriceSource": entry_price_source,
-        "EstimatedEntryPrice": estimated_entry_price
+        "EstimatedEntryPrice": estimated_entry_price,
+        "EntryMarketState": entry_market_state,
+        "EntryBullishScore": entry_bullish_score,
+        "EntryBearishScore": entry_bearish_score,
+        "EntryConfidence": entry_confidence,
+        "EntryDecision": entry_decision,
+        "EntryReasonLog": entry_reason_log,
+        "EntryIndicatorBreakdown": entry_indicator_breakdown_json
     }
 
     append_trade_row(TRADES_FILE, row)
