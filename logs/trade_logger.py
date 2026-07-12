@@ -2,6 +2,13 @@ import csv
 import json
 import os
 from datetime import datetime
+from zoneinfo import ZoneInfo
+
+MARKET_TZ = ZoneInfo("America/New_York")
+
+
+def market_now():
+    return datetime.now(MARKET_TZ)
 
 APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TRADES_FILE = os.path.join(APP_DIR, "trades.csv")
@@ -220,7 +227,7 @@ def log_trade(
             exit_reason = "\n".join(trailing_lines + [str(reason) for reason in (market_context.get("decision_reasons") or [])])
 
     row = {
-        "Time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "Time": market_now().strftime("%Y-%m-%d %H:%M:%S"),
         "Action": action,
         "Symbol": symbol,
         "Qty": qty,

@@ -8,6 +8,7 @@ import threading
 import time
 import html as html_lib
 from datetime import datetime, timedelta, time as datetime_time
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from logs.trade_logger import *
 
@@ -15,6 +16,25 @@ load_dotenv()
 
 
 app = Flask(__name__)
+MARKET_TZ = ZoneInfo("America/New_York")
+
+
+def market_now():
+    return datetime.now(MARKET_TZ)
+
+
+def parse_market_datetime(value):
+    if not value:
+        return None
+
+    text = str(value).strip()
+    for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"]:
+        try:
+            return datetime.strptime(text[:19], fmt).replace(tzinfo=MARKET_TZ)
+        except:
+            pass
+
+    return None
 
 TOKEN = os.getenv("TRADIER_TOKEN", "")
 ACCOUNT = os.getenv("TRADIER_ACCOUNT", "")
@@ -283,8 +303,8 @@ def position_hold_time(symbol):
         return "N/A"
 
     try:
-        entry_time = datetime.strptime(last_buy.get("Time", ""), "%Y-%m-%d %H:%M:%S")
-        return str(datetime.now() - entry_time).split(".")[0]
+        entry_time = parse_market_datetime(last_buy.get("Time", ""))
+        return str(market_now() - entry_time).split(".")[0] if entry_time else "N/A"
     except:
         return "N/A"
 
@@ -345,8 +365,8 @@ def grade_exit_trade(symbol, qty, sell_price, pnl, market_context):
     if last_buy:
         try:
             entry_price = float(last_buy.get("Price") or 0)
-            entry_time = datetime.strptime(last_buy.get("Time", ""), "%Y-%m-%d %H:%M:%S")
-            hold_time = str(datetime.now() - entry_time).split(".")[0]
+            entry_time = parse_market_datetime(last_buy.get("Time", ""))
+            hold_time = str(market_now() - entry_time).split(".")[0] if entry_time else ""
             entry_cost = entry_price * 100 * float(qty)
             pnl_percent = (float(pnl or 0) / entry_cost) * 100 if entry_cost else 0
         except:
@@ -459,7 +479,7 @@ def log_bot_audit(action, decision, symbol, market_context, config, **extra):
     reason_log = extra.get("reason_log") or market_context.get("decision_reasons") or market_context.get("reasons") or []
     tick_statistics = market_context.get("tick_statistics", {})
     row = {
-        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "timestamp": market_now().strftime("%Y-%m-%d %H:%M:%S"),
         "action": action,
         "decision": decision,
         "symbol": symbol,
@@ -521,7 +541,7 @@ def update_last_trade_review(review):
 
 
 def option_market_is_open():
-    now = datetime.now().time()
+    now = market_now().time()
     return datetime_time(9, 30) <= now <= datetime_time(16, 0)
 
 
@@ -626,7 +646,7 @@ def validate_buy_position_cap(qty):
 
 def record_api_diagnostic(kind, started_at, status):
     latency_ms = int((time.perf_counter() - started_at) * 1000)
-    now = datetime.now()
+    now = market_now()
     timestamp = now.strftime("%H:%M:%S.%f")[:-3]
     epoch = time.time()
     with BOT_LOCK:
@@ -646,7 +666,7 @@ def record_api_diagnostic(kind, started_at, status):
 
 def record_tick_finished(started_at):
     with BOT_LOCK:
-        BOT_STATE["last_tick"] = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        BOT_STATE["last_tick"] = market_now().strftime("%H:%M:%S.%f")[:-3]
         BOT_STATE["last_tick_epoch"] = time.time()
         BOT_STATE["last_tick_duration_ms"] = int((time.perf_counter() - started_at) * 1000)
 
@@ -884,7 +904,7 @@ def submit_option_order(option_symbol, qty, action="buy_to_open"):
 
 
 def add_bot_reason(message):
-    timestamp = datetime.now().strftime("%H:%M:%S")
+    timestamp = market_now().strftime("%H:%M:%S")
     line = f"{timestamp} {message}"
 
     with BOT_LOCK:
@@ -933,7 +953,7 @@ def parse_clock(value, default_hour=9, default_minute=35):
 
 def is_after_decision_time(config):
     decision = parse_clock(config.get("decision_time", "09:35"))
-    return datetime.now().time() >= decision
+    return market_now().time() >= decision
 
 
 def buy_cost(row):
@@ -941,7 +961,7 @@ def buy_cost(row):
 
 
 def daily_buy_totals(rows, source=None, day=None):
-    day = day or datetime.now().strftime("%Y-%m-%d")
+    day = day or market_now().strftime("%Y-%m-%d")
     trades_today = 0
     spent_today = 0.0
 
@@ -959,7 +979,7 @@ def daily_buy_totals(rows, source=None, day=None):
 
 
 def sync_trade_limits_from_file(config):
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = market_now().strftime("%Y-%m-%d")
     rows = []
     last_sell_time = None
 
@@ -970,7 +990,9 @@ def sync_trade_limits_from_file(config):
                 continue
             if row.get("Action") == "SELL":
                 try:
-                    sell_time = datetime.strptime(row.get("Time", ""), "%Y-%m-%d %H:%M:%S")
+                    sell_time = parse_market_datetime(row.get("Time", ""))
+                    if sell_time is None:
+                        continue
                     if last_sell_time is None or sell_time > last_sell_time:
                         last_sell_time = sell_time
                 except:
@@ -983,7 +1005,7 @@ def sync_trade_limits_from_file(config):
     cooldown_minutes = int(config.get("entry_rules", {}).get("cooldown_minutes", 5) or 0)
     cooldown_remaining_seconds = 0
     if last_sell_time and cooldown_minutes > 0:
-        elapsed = (datetime.now() - last_sell_time).total_seconds()
+        elapsed = (market_now() - last_sell_time).total_seconds()
         cooldown_remaining_seconds = max(0, int((cooldown_minutes * 60) - elapsed))
 
     with BOT_LOCK:
@@ -1040,7 +1062,7 @@ def exponential_average(values, period):
 
 
 def get_historical_levels(symbol):
-    today = datetime.now().date().isoformat()
+    today = market_now().date().isoformat()
 
     with BOT_LOCK:
         if (
@@ -1051,7 +1073,7 @@ def get_historical_levels(symbol):
             return dict(BOT_STATE["historical_levels"])
 
     try:
-        end = datetime.now().date()
+        end = market_now().date()
         start = end - timedelta(days=14)
         r = requests.get(
             f"{BASE_URL}/markets/history",
@@ -1104,7 +1126,7 @@ def parse_tradier_time(value):
 
     for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"]:
         try:
-            return datetime.strptime(value[:19], fmt)
+            return datetime.strptime(value[:19], fmt).replace(tzinfo=MARKET_TZ)
         except:
             pass
 
@@ -1112,7 +1134,7 @@ def parse_tradier_time(value):
 
 
 def get_intraday_bars(symbol):
-    today = datetime.now().date()
+    today = market_now().date()
 
     try:
         r = requests.get(
@@ -1121,7 +1143,7 @@ def get_intraday_bars(symbol):
                 "symbol": symbol,
                 "interval": "1min",
                 "start": f"{today.isoformat()} 04:00",
-                "end": datetime.now().strftime("%Y-%m-%d %H:%M")
+                "end": market_now().strftime("%Y-%m-%d %H:%M")
             },
             headers=headers()
         )
@@ -1166,7 +1188,7 @@ def high_low_from_bars(bars):
 
 
 def build_real_market_structure(symbol, quote, current_price, config=None):
-    now = datetime.now()
+    now = market_now()
     today = now.date()
     opening_range_start = datetime_time(9, 30)
     opening_range_end = parse_clock((config or {}).get("decision_time", "09:35"))
@@ -1278,7 +1300,7 @@ def empty_market_context(price=None):
         "tick_statistics": {"green_ticks": 0, "red_ticks": 0, "green_percent": 0, "red_percent": 0},
         "levels": levels,
         "market_structure_source": "Tradier daily/intraday bars",
-        "market_date": datetime.now().date().isoformat(),
+        "market_date": market_now().date().isoformat(),
         "market_structure_last_updated": "",
         "level_distances": {key: None for key in levels},
         "current_pl": 0,
@@ -2270,7 +2292,7 @@ def surfer_bot_tick(allow_entry=True):
 
     with BOT_LOCK:
         BOT_STATE["samples"].append({
-            "time": datetime.now(),
+            "time": market_now(),
             "price": price,
             "volume": volume
         })
@@ -2944,7 +2966,7 @@ def summarize_ledger(rows, source, config):
     sell_rows = [row for row in enriched_rows if row.get("Action") == "SELL"]
     pnl_values = [safe_float(row.get("PnL")) for row in sell_rows]
     total_pnl = sum(pnl_values)
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = market_now().strftime("%Y-%m-%d")
     today_pnl = sum(safe_float(row.get("PnL")) for row in sell_rows if str(row.get("Time", "")).startswith(today))
     wins = [pnl for pnl in pnl_values if pnl > 0]
     trade_list = []
