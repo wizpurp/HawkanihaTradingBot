@@ -4362,6 +4362,19 @@ Use Volume:
 
 <h3>Entry Rules</h3>
 
+<div style="border:1px solid #666; padding:10px; margin:10px 0;">
+<h3>Option Momentum Confirmation</h3>
+
+Enable Option Momentum Confirmation:
+<input type="checkbox" name="option_momentum_confirmation_enabled" {checked(config.get("option_momentum_confirmation_enabled", True))}><br>
+
+Confirmation Percent:
+<input type="number" step="0.1" min="0.1" max="20" name="option_momentum_percent" value="{config.get("option_momentum_percent", 2.0)}"><br>
+
+Confirmation Timeout Seconds:
+<input type="number" min="1" max="300" name="confirmation_timeout_seconds" value="{config.get("confirmation_timeout_seconds", 10)}"><br>
+</div>
+
 EMA Alignment:
 <input type="checkbox" name="ema_alignment" {checked(e.get("ema_alignment"))}><br>
 
@@ -4388,17 +4401,6 @@ Cooldown Minutes:
 
 Max Trades Per Day:
 <input type="number" name="max_trades_per_day" value="{e.get("max_trades_per_day")}"><br>
-
-<h3>Option Momentum Confirmation</h3>
-
-Enable Option Momentum Confirmation:
-<input type="checkbox" name="option_momentum_confirmation_enabled" {checked(config.get("option_momentum_confirmation_enabled", True))}><br>
-
-Confirmation Percent:
-<input type="number" step="0.1" min="0.1" max="20" name="option_momentum_percent" value="{config.get("option_momentum_percent", 2.0)}"><br>
-
-Confirmation Timeout Seconds:
-<input type="number" min="1" max="300" name="confirmation_timeout_seconds" value="{config.get("confirmation_timeout_seconds", 10)}"><br>
 
 <h3>Risk</h3>
 
