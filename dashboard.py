@@ -4288,15 +4288,6 @@ Contract Selection Mode:
 <option value="closest_within_budget" {selected("closest_within_budget", config.get("contract_selection_mode", "strict_atm"))}>Closest Within Budget</option>
 </select><br>
 
-Option Momentum Confirmation:
-<input type="checkbox" name="option_momentum_confirmation_enabled" {checked(config.get("option_momentum_confirmation_enabled", True))}><br>
-
-Option Momentum %:
-<input type="number" step="0.1" min="0.1" max="20" name="option_momentum_percent" value="{config.get("option_momentum_percent", 2.0)}"><br>
-
-Confirmation Timeout Seconds:
-<input type="number" min="1" max="300" name="confirmation_timeout_seconds" value="{config.get("confirmation_timeout_seconds", 10)}"><br>
-
 Max Open Contracts:
 <input type="number" name="max_open_contracts" value="{config.get("max_open_contracts", 1)}" min="1" max="5"><br>
 
@@ -4397,6 +4388,17 @@ Cooldown Minutes:
 
 Max Trades Per Day:
 <input type="number" name="max_trades_per_day" value="{e.get("max_trades_per_day")}"><br>
+
+<h3>Option Momentum Confirmation</h3>
+
+Enable Option Momentum Confirmation:
+<input type="checkbox" name="option_momentum_confirmation_enabled" {checked(config.get("option_momentum_confirmation_enabled", True))}><br>
+
+Confirmation Percent:
+<input type="number" step="0.1" min="0.1" max="20" name="option_momentum_percent" value="{config.get("option_momentum_percent", 2.0)}"><br>
+
+Confirmation Timeout Seconds:
+<input type="number" min="1" max="300" name="confirmation_timeout_seconds" value="{config.get("confirmation_timeout_seconds", 10)}"><br>
 
 <h3>Risk</h3>
 
