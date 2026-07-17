@@ -9,6 +9,9 @@
     "bot_budget": 1000.0,
     "max_contract_price": 1.0,
     "contract_selection_mode": "strict_atm",
+    "option_momentum_confirmation_enabled": true,
+    "option_momentum_percent": 2.0,
+    "confirmation_timeout_seconds": 10,
     "max_open_contracts": 1,
     "strategy": {
         "ema_fast": 1,

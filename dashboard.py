@@ -111,7 +111,25 @@ BOT_STATE = {
     "last_broker_confirm_ms": None,
     "last_market_scan_ms": None,
     "last_indicators_ms": None,
-    "last_signal_ms": None
+    "last_signal_ms": None,
+    "pending_entry": {
+        "active": False,
+        "direction": "",
+        "decision": "",
+        "option_symbol": "",
+        "starting_option_price": None,
+        "required_confirmation_percent": 0,
+        "confirmation_price": None,
+        "current_option_price": None,
+        "time_remaining_seconds": 0,
+        "status": "NONE",
+        "reason": "",
+        "started_epoch": None,
+        "expires_epoch": None,
+        "contracts": 0,
+        "contract": {},
+        "market_context": {}
+    }
 }
 
 
@@ -151,6 +169,9 @@ def load_config():
     config.setdefault("max_contract_price", 1.00)
     config["max_open_contracts"] = clamp_int(config.get("max_open_contracts", 1), 1, 5, 1)
     config.setdefault("contract_selection_mode", "strict_atm")
+    config["option_momentum_confirmation_enabled"] = bool(config.get("option_momentum_confirmation_enabled", True))
+    config["option_momentum_percent"] = max(0.1, min(20.0, safe_float(config.get("option_momentum_percent", 2.0), 2.0)))
+    config["confirmation_timeout_seconds"] = clamp_int(config.get("confirmation_timeout_seconds", 10), 1, 300, 10)
     config.setdefault("minimum_confidence", 2)
     config["minimum_confidence"] = clamp_int(config.get("minimum_confidence", 2), 1, 10, 2)
     config["minimum_dominance_percent"] = clamp_int(config.get("minimum_dominance_percent", 60), 50, 100, 60)
@@ -941,6 +962,95 @@ def get_option_trade_price(contract):
                 pass
 
     return None
+
+
+def default_pending_entry():
+    return {
+        "active": False,
+        "direction": "",
+        "decision": "",
+        "option_symbol": "",
+        "starting_option_price": None,
+        "required_confirmation_percent": 0,
+        "confirmation_price": None,
+        "current_option_price": None,
+        "time_remaining_seconds": 0,
+        "status": "NONE",
+        "reason": "",
+        "started_epoch": None,
+        "expires_epoch": None,
+        "contracts": 0,
+        "contract": {},
+        "market_context": {}
+    }
+
+
+def get_pending_entry():
+    with BOT_LOCK:
+        return dict(BOT_STATE.get("pending_entry") or default_pending_entry())
+
+
+def set_pending_entry(pending):
+    with BOT_LOCK:
+        BOT_STATE["pending_entry"] = dict(pending)
+
+
+def clear_pending_entry(status="NONE", reason=""):
+    pending = default_pending_entry()
+    pending["status"] = status
+    pending["reason"] = reason
+    set_pending_entry(pending)
+
+
+def refresh_pending_time_remaining(pending):
+    expires_epoch = pending.get("expires_epoch")
+    pending["time_remaining_seconds"] = max(0, int(round(expires_epoch - time.time()))) if expires_epoch else 0
+    return pending
+
+
+def create_pending_entry(config, decision, side, contract, contracts, start_price, market_context):
+    momentum_percent = float(config.get("option_momentum_percent", 2.0))
+    timeout_seconds = int(config.get("confirmation_timeout_seconds", 10))
+    started_epoch = time.time()
+    confirmation_price = start_price * (1 + momentum_percent / 100)
+    pending = {
+        "active": True,
+        "direction": side,
+        "decision": decision,
+        "option_symbol": contract.get("symbol", ""),
+        "starting_option_price": start_price,
+        "required_confirmation_percent": momentum_percent,
+        "confirmation_price": confirmation_price,
+        "current_option_price": start_price,
+        "time_remaining_seconds": timeout_seconds,
+        "status": "WAITING FOR MOMENTUM",
+        "reason": "",
+        "started_epoch": started_epoch,
+        "expires_epoch": started_epoch + timeout_seconds,
+        "contracts": contracts,
+        "contract": dict(contract),
+        "market_context": dict(market_context)
+    }
+    set_pending_entry(pending)
+    add_bot_reason(
+        f"PENDING BUY {side}: {contract.get('symbol', '')} start {start_price:.2f}, "
+        f"confirm {confirmation_price:.2f}, timeout {timeout_seconds}s"
+    )
+    log_bot_audit(
+        "PENDING ENTRY",
+        decision,
+        config.get("symbol", ""),
+        market_context,
+        config,
+        option_symbol=contract.get("symbol", ""),
+        current_price=start_price,
+        skip_reason="waiting for option momentum confirmation"
+    )
+
+
+def pending_entry_snapshot():
+    pending = get_pending_entry()
+    return refresh_pending_time_remaining(pending)
 
 
 def parse_clock(value, default_hour=9, default_minute=35):
@@ -1735,6 +1845,81 @@ def log_accepted_trade(action, symbol, qty, price, pnl=""):
     add_bot_reason(f"{action} logged {symbol} qty {qty} price {price}")
 
 
+def execute_entry_buy(config, decision, side, contract, contracts, reference_price, market_context, label="ENTRY"):
+    if not option_market_is_open():
+        add_bot_reason(f"{label} skipped: options market is closed")
+        log_bot_audit(
+            "SKIP",
+            decision,
+            config.get("symbol", ""),
+            market_context,
+            config,
+            option_symbol=contract.get("symbol", ""),
+            skip_reason="options market closed"
+        )
+        return False
+
+    ok, order_status, status, text = submit_and_parse_option_order(
+        contract["symbol"],
+        contracts,
+        "buy_to_open",
+        label
+    )
+    order_id = extract_order_id(text)
+
+    if ok:
+        entry_price, entry_price_source, estimated_entry_price = resolve_actual_entry_price(
+            contract["symbol"],
+            contracts,
+            reference_price
+        )
+        trade_row = log_trade(
+            "BUY",
+            contract["symbol"],
+            contracts,
+            entry_price,
+            source="BOT",
+            market_context=market_context,
+            entry_price_source=entry_price_source,
+            estimated_entry_price=estimated_entry_price
+        )
+        log_bot_audit(
+            decision,
+            decision,
+            config.get("symbol", ""),
+            market_context,
+            config,
+            option_symbol=contract["symbol"],
+            entry_grade=trade_row.get("EntryGrade", ""),
+            entry_price=entry_price if entry_price_source == "BROKER_COST_BASIS" else "",
+            entry_price_source=entry_price_source,
+            estimated_entry_price=estimated_entry_price,
+            order_status=order_status,
+            order_id=order_id,
+            spy_price_at_entry=market_context.get("price", ""),
+            market_state_at_entry=market_context.get("market_state", ""),
+            reason_log=market_context.get("decision_reasons", [])
+        )
+        add_bot_reason(f"BUY logged {contract['symbol']} qty {contracts} price {entry_price} source {entry_price_source}")
+        add_bot_reason(f"SIGNAL entered {side}: {'; '.join(market_context.get('decision_reasons', []))}")
+        return True
+
+    add_bot_reason(f"SIGNAL entry rejected or not accepted: {order_status}")
+    skip_reason = order_status if order_status == "Max Open Contracts reached" else "entry rejected or not accepted"
+    log_bot_audit(
+        "SKIP",
+        decision,
+        config.get("symbol", ""),
+        market_context,
+        config,
+        option_symbol=contract.get("symbol", ""),
+        skip_reason=skip_reason,
+        order_status=order_status,
+        order_id=order_id
+    )
+    return False
+
+
 def try_surfer_entry(config, positions, market_context, call, put):
     if positions:
         add_bot_reason("SIGNAL no entry: already holding one position")
@@ -1815,58 +2000,101 @@ def try_surfer_entry(config, positions, market_context, call, put):
         log_bot_audit("SKIP", decision, config.get("symbol", ""), market_context, config, option_symbol=contract.get("symbol", ""), skip_reason="budget exceeded")
         return
 
-    if not option_market_is_open():
-        add_bot_reason("ENTRY skipped: options market is closed")
-        log_bot_audit("SKIP", decision, config.get("symbol", ""), market_context, config, option_symbol=contract.get("symbol", ""), skip_reason="options market closed")
+    if config.get("option_momentum_confirmation_enabled", True):
+        create_pending_entry(config, decision, side, contract, contracts, ask, market_context)
         return
 
-    ok, order_status, status, text = submit_and_parse_option_order(
-        contract["symbol"],
-        contracts,
-        "buy_to_open",
-        "ENTRY"
-    )
-    order_id = extract_order_id(text)
+    execute_entry_buy(config, decision, side, contract, contracts, ask, market_context, label="ENTRY")
 
-    if ok:
-        entry_price, entry_price_source, estimated_entry_price = resolve_actual_entry_price(
-            contract["symbol"],
-            contracts,
-            ask
-        )
-        trade_row = log_trade(
-            "BUY",
-            contract["symbol"],
-            contracts,
-            entry_price,
-            source="BOT",
-            market_context=market_context,
-            entry_price_source=entry_price_source,
-            estimated_entry_price=estimated_entry_price
-        )
-        log_bot_audit(
-            decision,
-            decision,
-            config.get("symbol", ""),
-            market_context,
-            config,
-            option_symbol=contract["symbol"],
-            entry_grade=trade_row.get("EntryGrade", ""),
-            entry_price=entry_price if entry_price_source == "BROKER_COST_BASIS" else "",
-            entry_price_source=entry_price_source,
-            estimated_entry_price=estimated_entry_price,
-            order_status=order_status,
-            order_id=order_id,
-            spy_price_at_entry=market_context.get("price", ""),
-            market_state_at_entry=market_context.get("market_state", ""),
-            reason_log=market_context.get("decision_reasons", [])
-        )
-        add_bot_reason(f"BUY logged {contract['symbol']} qty {contracts} price {entry_price} source {entry_price_source}")
-        add_bot_reason(f"SIGNAL entered {side}: {'; '.join(market_context.get('decision_reasons', []))}")
-    else:
-        add_bot_reason(f"SIGNAL entry rejected or not accepted: {order_status}")
-        skip_reason = order_status if order_status == "Max Open Contracts reached" else "entry rejected or not accepted"
-        log_bot_audit("SKIP", decision, config.get("symbol", ""), market_context, config, option_symbol=contract.get("symbol", ""), skip_reason=skip_reason, order_status=order_status, order_id=order_id)
+
+def process_pending_entry(config):
+    pending = get_pending_entry()
+    if not pending.get("active"):
+        return False
+
+    decision = pending.get("decision", "DO NOTHING")
+    side = pending.get("direction", "")
+    option_symbol = pending.get("option_symbol", "")
+    contract = pending.get("contract") or {"symbol": option_symbol}
+    contracts = int(pending.get("contracts") or config.get("contracts", 1))
+    market_context = pending.get("market_context") or current_market_context_snapshot()
+    start_price = safe_float(pending.get("starting_option_price"))
+    confirmation_price = safe_float(pending.get("confirmation_price"))
+
+    if not config.get("bot_enabled"):
+        pending["active"] = False
+        pending["status"] = "CANCELLED"
+        pending["reason"] = "bot disabled"
+        refresh_pending_time_remaining(pending)
+        set_pending_entry(pending)
+        add_bot_reason("PENDING BUY cancelled: bot disabled")
+        log_bot_audit("SKIP", decision, config.get("symbol", ""), market_context, config, option_symbol=option_symbol, skip_reason="pending entry cancelled: bot disabled")
+        return True
+
+    if not option_market_is_open():
+        pending["active"] = False
+        pending["status"] = "CANCELLED"
+        pending["reason"] = "options market closed"
+        refresh_pending_time_remaining(pending)
+        set_pending_entry(pending)
+        add_bot_reason("PENDING BUY cancelled: options market closed")
+        log_bot_audit("SKIP", decision, config.get("symbol", ""), market_context, config, option_symbol=option_symbol, skip_reason="pending entry cancelled: options market closed")
+        return True
+
+    quote = get_market_quote(option_symbol)
+    current_price = get_quote_price(quote)
+    pending["current_option_price"] = current_price
+    refresh_pending_time_remaining(pending)
+
+    if time.time() >= float(pending.get("expires_epoch") or 0):
+        pending["active"] = False
+        pending["status"] = "CANCELLED"
+        pending["reason"] = "confirmation timeout expired"
+        set_pending_entry(pending)
+        add_bot_reason("PENDING BUY cancelled: confirmation timeout expired")
+        log_bot_audit("SKIP", decision, config.get("symbol", ""), market_context, config, option_symbol=option_symbol, current_price=current_price, skip_reason="pending entry cancelled: confirmation timeout expired")
+        return True
+
+    if current_price is None:
+        pending["status"] = "WAITING FOR MOMENTUM"
+        pending["reason"] = "option quote unavailable"
+        set_pending_entry(pending)
+        print("PENDING ENTRY")
+        print("status:", pending["status"])
+        print("reason:", pending["reason"])
+        return True
+
+    print("PENDING ENTRY")
+    print("option_symbol:", option_symbol)
+    print("direction:", side)
+    print("starting_option_price:", start_price)
+    print("required_confirmation_percent:", pending.get("required_confirmation_percent"))
+    print("confirmation_price:", confirmation_price)
+    print("current_option_price:", current_price)
+    print("time_remaining_seconds:", pending.get("time_remaining_seconds"))
+
+    if current_price < start_price:
+        pending["active"] = False
+        pending["status"] = "CANCELLED"
+        pending["reason"] = "option price fell before confirmation"
+        set_pending_entry(pending)
+        add_bot_reason(f"PENDING BUY cancelled: option fell {current_price:.2f} < start {start_price:.2f}")
+        log_bot_audit("SKIP", decision, config.get("symbol", ""), market_context, config, option_symbol=option_symbol, current_price=current_price, skip_reason="pending entry cancelled: option price fell before confirmation")
+        return True
+
+    if current_price >= confirmation_price:
+        pending["status"] = "CONFIRMED"
+        pending["reason"] = "option momentum confirmed"
+        pending["active"] = False
+        set_pending_entry(pending)
+        add_bot_reason(f"PENDING BUY confirmed: {current_price:.2f} >= {confirmation_price:.2f}")
+        execute_entry_buy(config, decision, side, contract, contracts, current_price, market_context, label="MOMENTUM ENTRY")
+        return True
+
+    pending["status"] = "WAITING FOR MOMENTUM"
+    pending["reason"] = "waiting for option price confirmation"
+    set_pending_entry(pending)
+    return True
 
 
 def try_surfer_exit(config, positions, market_context):
@@ -2380,6 +2608,8 @@ def surfer_bot_loop():
             exit_poll_interval_ms = clamp_int(config["strategy"].get("exit_poll_interval_ms", 1000), 100, 5000, 1000)
             positions = get_position()
             if positions:
+                if get_pending_entry().get("active"):
+                    clear_pending_entry("CANCELLED", "broker position exists")
                 sync_trade_limits_from_file(config)
                 if config.get("strategy_mode") == "SURFER" and config.get("bot_enabled"):
                     now_ts = time.time()
@@ -2396,8 +2626,12 @@ def surfer_bot_loop():
                 time.sleep(exit_poll_interval_ms / 1000)
             else:
                 last_full_position_scan = 0
-                surfer_bot_tick()
-                time.sleep(max(1, interval))
+                if get_pending_entry().get("active"):
+                    process_pending_entry(config)
+                    time.sleep(exit_poll_interval_ms / 1000)
+                else:
+                    surfer_bot_tick()
+                    time.sleep(max(1, interval))
         except Exception as exc:
             set_last_error(exc)
             add_bot_reason(f"BOT ERROR {exc}")
@@ -2497,6 +2731,7 @@ def api_bot_state():
     sync_trade_limits_from_file(config)
 
     with BOT_LOCK:
+        pending_entry = refresh_pending_time_remaining(dict(BOT_STATE.get("pending_entry") or default_pending_entry()))
         return jsonify({
             "bullish_score": BOT_STATE["bullish_score"],
             "bearish_score": BOT_STATE["bearish_score"],
@@ -2538,6 +2773,7 @@ def api_bot_state():
             "last_market_scan_ms": BOT_STATE["last_market_scan_ms"],
             "last_indicators_ms": BOT_STATE["last_indicators_ms"],
             "last_signal_ms": BOT_STATE["last_signal_ms"],
+            "pending_entry": pending_entry,
             "config_strategy": dict(config.get("strategy", {}))
         })
 
@@ -2575,6 +2811,7 @@ def api_developer_diagnostics():
             "last_market_scan_ms": BOT_STATE["last_market_scan_ms"],
             "last_indicators_ms": BOT_STATE["last_indicators_ms"],
             "last_signal_ms": BOT_STATE["last_signal_ms"],
+            "pending_entry": refresh_pending_time_remaining(dict(BOT_STATE.get("pending_entry") or default_pending_entry())),
             "config_strategy": dict(config.get("strategy", {}))
         }
     bot_health = get_bot_health_data(positions, bot_snapshot)
@@ -2827,6 +3064,9 @@ def save_settings():
     config["max_contract_price"] = float(request.form.get("max_contract_price", 1))
     config["max_open_contracts"] = clamp_int(request.form.get("max_open_contracts", 1), 1, 5, 1)
     config["contract_selection_mode"] = request.form.get("contract_selection_mode", "strict_atm")
+    config["option_momentum_confirmation_enabled"] = request.form.get("option_momentum_confirmation_enabled") == "on"
+    config["option_momentum_percent"] = max(0.1, min(20.0, safe_float(request.form.get("option_momentum_percent", 2.0), 2.0)))
+    config["confirmation_timeout_seconds"] = clamp_int(request.form.get("confirmation_timeout_seconds", 10), 1, 300, 10)
     config["minimum_confidence"] = clamp_int(request.form.get("minimum_confidence", 2), 1, 10, 2)
     config["minimum_dominance_percent"] = clamp_int(request.form.get("minimum_dominance_percent", 60), 50, 100, 60)
 
@@ -3715,6 +3955,14 @@ Minimum Confidence Required: <span id="bot-minimum-confidence">{config.get("mini
 Dominance: <span id="bot-dominance">{float(bot_snapshot.get("dominance_percent") or 0):.1f}</span>%<br>
 Minimum Dominance Required: <span id="bot-minimum-dominance">{config.get("minimum_dominance_percent", 60)}</span>%<br>
 Current Signal: <span id="bot-current-signal">{bot_snapshot["current_signal"]}</span><br>
+Pending Entry: <span id="pending-entry-active">{ "YES" if bot_snapshot.get("pending_entry", {}).get("active") else "NO" }</span><br>
+Pending Direction: <span id="pending-entry-direction">{bot_snapshot.get("pending_entry", {}).get("direction") or "N/A"}</span><br>
+Starting Option Price: <span id="pending-entry-start-price">{fmt_premium(bot_snapshot.get("pending_entry", {}).get("starting_option_price"))}</span><br>
+Required Confirmation: <span id="pending-entry-required">{fmt_percent(bot_snapshot.get("pending_entry", {}).get("required_confirmation_percent"))}</span><br>
+Confirmation Price: <span id="pending-entry-confirm-price">{fmt_premium(bot_snapshot.get("pending_entry", {}).get("confirmation_price"))}</span><br>
+Current Option Price: <span id="pending-entry-current-price">{fmt_premium(bot_snapshot.get("pending_entry", {}).get("current_option_price"))}</span><br>
+Time Remaining: <span id="pending-entry-time-remaining">{bot_snapshot.get("pending_entry", {}).get("time_remaining_seconds", 0)}</span> sec<br>
+Pending Status: <span id="pending-entry-status">{bot_snapshot.get("pending_entry", {}).get("status", "NONE")}</span><br>
 Last Bot Action: <span id="bot-last-action">{bot_snapshot["last_action"]}</span><br>
 Trades Today: <span id="bot-trades-today">{bot_snapshot["trades_today"]}</span><br>
 Current P/L: <span id="bot-current-pl">{fmt_money(market_context.get("current_pl"))}</span><br>
@@ -4040,6 +4288,15 @@ Contract Selection Mode:
 <option value="closest_within_budget" {selected("closest_within_budget", config.get("contract_selection_mode", "strict_atm"))}>Closest Within Budget</option>
 </select><br>
 
+Option Momentum Confirmation:
+<input type="checkbox" name="option_momentum_confirmation_enabled" {checked(config.get("option_momentum_confirmation_enabled", True))}><br>
+
+Option Momentum %:
+<input type="number" step="0.1" min="0.1" max="20" name="option_momentum_percent" value="{config.get("option_momentum_percent", 2.0)}"><br>
+
+Confirmation Timeout Seconds:
+<input type="number" min="1" max="300" name="confirmation_timeout_seconds" value="{config.get("confirmation_timeout_seconds", 10)}"><br>
+
 Max Open Contracts:
 <input type="number" name="max_open_contracts" value="{config.get("max_open_contracts", 1)}" min="1" max="5"><br>
 
@@ -4290,6 +4547,15 @@ async function updateBotState() {{
     setText("bot-confidence", data.confidence);
     setText("bot-dominance", Number(data.dominance_percent || 0).toFixed(1));
     setText("bot-current-signal", data.current_signal);
+    const pending = data.pending_entry || {{}};
+    setText("pending-entry-active", pending.active ? "YES" : "NO");
+    setText("pending-entry-direction", pending.direction || "N/A");
+    setText("pending-entry-start-price", fmtMoney(pending.starting_option_price));
+    setText("pending-entry-required", `+${{Number(pending.required_confirmation_percent || 0).toFixed(2)}}%`);
+    setText("pending-entry-confirm-price", fmtMoney(pending.confirmation_price));
+    setText("pending-entry-current-price", fmtMoney(pending.current_option_price));
+    setText("pending-entry-time-remaining", pending.time_remaining_seconds || 0);
+    setText("pending-entry-status", pending.status || "NONE");
     setText("bot-last-action", data.last_action);
     setText("bot-trades-today", data.trades_today);
     renderReasonLog(data.reason_log);
