@@ -114,9 +114,18 @@ BOT_STATE = {
     "last_signal_ms": None,
     "pending_entry": {
         "active": False,
+        "id": "",
+        "timestamp": "",
+        "underlying": "",
         "direction": "",
         "decision": "",
         "option_symbol": "",
+        "signal_generated": "",
+        "momentum_status": "WAITING",
+        "breakout_status": "PASS",
+        "current_breakout_candle": 0,
+        "required_breakout_candles": 0,
+        "breakout_level": None,
         "starting_option_price": None,
         "required_confirmation_percent": 0,
         "confirmation_price": None,
@@ -129,7 +138,8 @@ BOT_STATE = {
         "contracts": 0,
         "contract": {},
         "market_context": {}
-    }
+    },
+    "pending_entry_history": []
 }
 
 
@@ -967,9 +977,18 @@ def get_option_trade_price(contract):
 def default_pending_entry():
     return {
         "active": False,
+        "id": "",
+        "timestamp": "",
+        "underlying": "",
         "direction": "",
         "decision": "",
         "option_symbol": "",
+        "signal_generated": "",
+        "momentum_status": "WAITING",
+        "breakout_status": "PASS",
+        "current_breakout_candle": 0,
+        "required_breakout_candles": 0,
+        "breakout_level": None,
         "starting_option_price": None,
         "required_confirmation_percent": 0,
         "confirmation_price": None,
@@ -1008,16 +1027,59 @@ def refresh_pending_time_remaining(pending):
     return pending
 
 
+def pending_history_record(pending, final_status=None, cancellation_reason=None, buy_submitted=False):
+    return {
+        "id": pending.get("id", ""),
+        "timestamp": pending.get("timestamp", ""),
+        "direction": pending.get("direction", ""),
+        "underlying": pending.get("underlying", ""),
+        "option_symbol": pending.get("option_symbol", ""),
+        "signal_generated": pending.get("signal_generated", pending.get("decision", "")),
+        "momentum_status": pending.get("momentum_status", "WAITING"),
+        "breakout_status": pending.get("breakout_status", "PASS"),
+        "current_breakout_candle": pending.get("current_breakout_candle", 0),
+        "required_breakout_candles": pending.get("required_breakout_candles", 0),
+        "breakout_level": pending.get("breakout_level"),
+        "final_status": final_status or pending.get("status", "WAITING FOR MOMENTUM"),
+        "cancellation_reason": cancellation_reason or pending.get("reason", ""),
+        "buy_submitted": bool(buy_submitted)
+    }
+
+
+def upsert_pending_history(pending, final_status=None, cancellation_reason=None, buy_submitted=False):
+    record = pending_history_record(pending, final_status, cancellation_reason, buy_submitted)
+    with BOT_LOCK:
+        history = list(BOT_STATE.get("pending_entry_history") or [])
+        existing_index = next((index for index, item in enumerate(history) if item.get("id") == record.get("id")), None)
+        if existing_index is None:
+            history.append(record)
+        else:
+            history[existing_index].update(record)
+        BOT_STATE["pending_entry_history"] = history[-20:]
+    return record
+
+
 def create_pending_entry(config, decision, side, contract, contracts, start_price, market_context):
     momentum_percent = float(config.get("option_momentum_percent", 2.0))
     timeout_seconds = int(config.get("confirmation_timeout_seconds", 10))
     started_epoch = time.time()
+    timestamp = market_now().strftime("%H:%M:%S")
+    pending_id = f"{market_now().strftime('%Y%m%d%H%M%S%f')}-{contract.get('symbol', '')}"
     confirmation_price = start_price * (1 + momentum_percent / 100)
     pending = {
         "active": True,
+        "id": pending_id,
+        "timestamp": timestamp,
+        "underlying": config.get("symbol", ""),
         "direction": side,
         "decision": decision,
         "option_symbol": contract.get("symbol", ""),
+        "signal_generated": decision,
+        "momentum_status": "WAITING",
+        "breakout_status": "PASS",
+        "current_breakout_candle": 0,
+        "required_breakout_candles": 0,
+        "breakout_level": None,
         "starting_option_price": start_price,
         "required_confirmation_percent": momentum_percent,
         "confirmation_price": confirmation_price,
@@ -1032,6 +1094,7 @@ def create_pending_entry(config, decision, side, contract, contracts, start_pric
         "market_context": dict(market_context)
     }
     set_pending_entry(pending)
+    upsert_pending_history(pending, final_status="WAITING")
     add_bot_reason(
         f"PENDING BUY {side}: {contract.get('symbol', '')} start {start_price:.2f}, "
         f"confirm {confirmation_price:.2f}, timeout {timeout_seconds}s"
@@ -1051,6 +1114,10 @@ def create_pending_entry(config, decision, side, contract, contracts, start_pric
 def pending_entry_snapshot():
     pending = get_pending_entry()
     return refresh_pending_time_remaining(pending)
+
+
+def pending_entry_history_snapshot():
+    return list(BOT_STATE.get("pending_entry_history") or [])[-20:]
 
 
 def parse_clock(value, default_hour=9, default_minute=35):
@@ -2025,8 +2092,10 @@ def process_pending_entry(config):
         pending["active"] = False
         pending["status"] = "CANCELLED"
         pending["reason"] = "bot disabled"
+        pending["momentum_status"] = "FAIL"
         refresh_pending_time_remaining(pending)
         set_pending_entry(pending)
+        upsert_pending_history(pending, final_status="CANCELLED", cancellation_reason=pending["reason"])
         add_bot_reason("PENDING BUY cancelled: bot disabled")
         log_bot_audit("SKIP", decision, config.get("symbol", ""), market_context, config, option_symbol=option_symbol, skip_reason="pending entry cancelled: bot disabled")
         return True
@@ -2035,8 +2104,10 @@ def process_pending_entry(config):
         pending["active"] = False
         pending["status"] = "CANCELLED"
         pending["reason"] = "options market closed"
+        pending["momentum_status"] = "FAIL"
         refresh_pending_time_remaining(pending)
         set_pending_entry(pending)
+        upsert_pending_history(pending, final_status="CANCELLED", cancellation_reason=pending["reason"])
         add_bot_reason("PENDING BUY cancelled: options market closed")
         log_bot_audit("SKIP", decision, config.get("symbol", ""), market_context, config, option_symbol=option_symbol, skip_reason="pending entry cancelled: options market closed")
         return True
@@ -2050,7 +2121,9 @@ def process_pending_entry(config):
         pending["active"] = False
         pending["status"] = "CANCELLED"
         pending["reason"] = "confirmation timeout expired"
+        pending["momentum_status"] = "FAIL"
         set_pending_entry(pending)
+        upsert_pending_history(pending, final_status="CANCELLED", cancellation_reason=pending["reason"])
         add_bot_reason("PENDING BUY cancelled: confirmation timeout expired")
         log_bot_audit("SKIP", decision, config.get("symbol", ""), market_context, config, option_symbol=option_symbol, current_price=current_price, skip_reason="pending entry cancelled: confirmation timeout expired")
         return True
@@ -2059,6 +2132,7 @@ def process_pending_entry(config):
         pending["status"] = "WAITING FOR MOMENTUM"
         pending["reason"] = "option quote unavailable"
         set_pending_entry(pending)
+        upsert_pending_history(pending, final_status="WAITING")
         print("PENDING ENTRY")
         print("status:", pending["status"])
         print("reason:", pending["reason"])
@@ -2077,7 +2151,9 @@ def process_pending_entry(config):
         pending["active"] = False
         pending["status"] = "CANCELLED"
         pending["reason"] = "option price fell before confirmation"
+        pending["momentum_status"] = "FAIL"
         set_pending_entry(pending)
+        upsert_pending_history(pending, final_status="CANCELLED", cancellation_reason=pending["reason"])
         add_bot_reason(f"PENDING BUY cancelled: option fell {current_price:.2f} < start {start_price:.2f}")
         log_bot_audit("SKIP", decision, config.get("symbol", ""), market_context, config, option_symbol=option_symbol, current_price=current_price, skip_reason="pending entry cancelled: option price fell before confirmation")
         return True
@@ -2085,15 +2161,23 @@ def process_pending_entry(config):
     if current_price >= confirmation_price:
         pending["status"] = "CONFIRMED"
         pending["reason"] = "option momentum confirmed"
+        pending["momentum_status"] = "PASS"
         pending["active"] = False
         set_pending_entry(pending)
         add_bot_reason(f"PENDING BUY confirmed: {current_price:.2f} >= {confirmation_price:.2f}")
-        execute_entry_buy(config, decision, side, contract, contracts, current_price, market_context, label="MOMENTUM ENTRY")
+        buy_submitted = execute_entry_buy(config, decision, side, contract, contracts, current_price, market_context, label="MOMENTUM ENTRY")
+        upsert_pending_history(
+            pending,
+            final_status="BUY SUBMITTED" if buy_submitted else "CONFIRMED",
+            buy_submitted=buy_submitted
+        )
         return True
 
     pending["status"] = "WAITING FOR MOMENTUM"
     pending["reason"] = "waiting for option price confirmation"
+    pending["momentum_status"] = "WAITING"
     set_pending_entry(pending)
+    upsert_pending_history(pending, final_status="WAITING")
     return True
 
 
@@ -2608,7 +2692,13 @@ def surfer_bot_loop():
             exit_poll_interval_ms = clamp_int(config["strategy"].get("exit_poll_interval_ms", 1000), 100, 5000, 1000)
             positions = get_position()
             if positions:
-                if get_pending_entry().get("active"):
+                active_pending = get_pending_entry()
+                if active_pending.get("active"):
+                    active_pending["active"] = False
+                    active_pending["status"] = "CANCELLED"
+                    active_pending["reason"] = "broker position exists"
+                    active_pending["momentum_status"] = "FAIL"
+                    upsert_pending_history(active_pending, final_status="CANCELLED", cancellation_reason=active_pending["reason"])
                     clear_pending_entry("CANCELLED", "broker position exists")
                 sync_trade_limits_from_file(config)
                 if config.get("strategy_mode") == "SURFER" and config.get("bot_enabled"):
@@ -2774,6 +2864,7 @@ def api_bot_state():
             "last_indicators_ms": BOT_STATE["last_indicators_ms"],
             "last_signal_ms": BOT_STATE["last_signal_ms"],
             "pending_entry": pending_entry,
+            "pending_entry_history": pending_entry_history_snapshot(),
             "config_strategy": dict(config.get("strategy", {}))
         })
 
@@ -3458,12 +3549,111 @@ Time: {escape_html(trade.get("Time", ""))}
 """
 
 
+def friendly_pending_status(status):
+    status = str(status or "NONE").upper()
+    if "WAITING" in status:
+        return "Waiting"
+    if status in ["CONFIRMED", "BUY SUBMITTED"]:
+        return "Confirmed"
+    if status == "CANCELLED":
+        return "Cancelled"
+    return status.title() if status else "None"
+
+
+def render_current_pending_entry(pending):
+    pending = refresh_pending_time_remaining(dict(pending or default_pending_entry()))
+    if not pending.get("active"):
+        return "No Pending Entry"
+
+    return f"""
+<div class="item">
+Direction: {escape_html(pending.get("direction") or "N/A")}<br>
+Status: {escape_html(friendly_pending_status(pending.get("status")))}<br>
+<br>
+Current Filter Progress:<br>
+Momentum Confirmation: {escape_html(pending.get("momentum_status") or "WAITING")}<br>
+Breakout Confirmation: {escape_html(pending.get("breakout_status") or "PASS")}<br>
+<br>
+Starting Option Price: {fmt_premium(pending.get("starting_option_price"))}<br>
+Current Option Price: {fmt_premium(pending.get("current_option_price"))}<br>
+Required Momentum %: {fmt_percent(pending.get("required_confirmation_percent"))}<br>
+Current Breakout Candle: {escape_html(pending.get("current_breakout_candle", 0))}<br>
+Required Breakout Candles: {escape_html(pending.get("required_breakout_candles", 0))}<br>
+Breakout Level: {fmt_premium(pending.get("breakout_level"))}<br>
+Time Remaining: {pending.get("time_remaining_seconds", 0)} sec<br>
+Reason: {escape_html(pending.get("reason") or "Waiting for option momentum confirmation")}
+</div>
+"""
+
+
+def render_pending_entry_history(history):
+    rows = list(history or [])[-20:]
+    if not rows:
+        return "No pending entry history."
+
+    html = []
+    for row in reversed(rows):
+        breakout_progress = f"""{row.get("current_breakout_candle", 0)}/{row.get("required_breakout_candles", 0)}"""
+        final_status = row.get("final_status") or row.get("status") or "WAITING"
+        buy_line = "<br>BUY SUBMITTED" if row.get("buy_submitted") else ""
+        cancel_reason = row.get("cancellation_reason") or ""
+        cancel_line = f"""<br>Cancellation Reason: {escape_html(cancel_reason)}""" if cancel_reason else ""
+        html.append(f"""
+<div class="trade-card bot">
+{escape_html(row.get("timestamp", ""))}<br>
+{escape_html(row.get("direction", ""))}<br>
+Underlying: {escape_html(row.get("underlying", ""))}<br>
+Option: {escape_html(row.get("option_symbol", ""))}<br>
+Signal Generated: {escape_html(row.get("signal_generated", ""))}<br>
+Momentum: {escape_html(row.get("momentum_status", "WAITING"))}<br>
+Breakout: {escape_html(row.get("breakout_status", "PASS"))} {escape_html(breakout_progress)}<br>
+Final Status: {escape_html(final_status)}
+{buy_line}
+{cancel_line}
+</div>
+""")
+    return "".join(html)
+
+
+def load_bot_audit_rows(limit=20):
+    try:
+        ensure_audit_file()
+        with open(BOT_AUDIT_FILE, "r", newline="") as f:
+            rows = list(csv.DictReader(f))
+        return rows[-limit:]
+    except:
+        return []
+
+
+def render_bot_audit_history(rows):
+    if not rows:
+        return "No bot audit records."
+
+    html = []
+    for row in reversed(rows[-20:]):
+        html.append(f"""
+<div class="trade-card bot">
+{escape_html(row.get("timestamp", ""))}<br>
+Action: {escape_html(row.get("action", ""))}<br>
+Decision: {escape_html(row.get("decision", ""))}<br>
+Symbol: {escape_html(row.get("symbol", ""))}<br>
+Option: {escape_html(row.get("option_symbol", ""))}<br>
+Market State: {escape_html(row.get("market_state", ""))}<br>
+Bullish/Bearish/Confidence: {escape_html(row.get("bullish_score", ""))} / {escape_html(row.get("bearish_score", ""))} / {escape_html(row.get("confidence", ""))}<br>
+Skip Reason: {escape_html(row.get("skip_reason", ""))}<br>
+Exit Reason: {escape_html(row.get("exit_reason", ""))}<br>
+Order Status: {escape_html(row.get("order_status", ""))}
+</div>
+""")
+    return "".join(html)
+
+
 def render_trade_list(summary):
     if not summary["trade_list"]:
         return "No closed trades yet."
 
     lines = []
-    for trade in summary["trade_list"]:
+    for trade in summary["trade_list"][-20:]:
         pnl_class = "good" if trade["pnl"] > 0 else "bad" if trade["pnl"] < 0 else ""
         entry_label = entry_source_label({"EntryPriceSource": trade["entry_price_source"]})
         lines.append(
@@ -3511,6 +3701,7 @@ Win Rate: {summary["win_rate"]:.2f}%<br>
 Total PnL: {fmt_money(summary["total_pnl"])}<br>
 Number of Trades: {summary["number_of_trades"]}<br>
 """
+    trade_list_label = "Bot Trades (Last 20)" if label == "BOT" else "Human Trades (Last 20)"
     return f"""
 <div class="performance-panel {panel_class}">
 <h3>{escape_html(label.title())}</h3>
@@ -3522,7 +3713,7 @@ Number of Trades: {summary["number_of_trades"]}<br>
 </form>
 <br><br>
 {stats_html}
-Trade List:<br>
+{trade_list_label}:<br>
 <div class="history-panel bot-trades-panel">
 {render_trade_list(summary)}
 </div>
@@ -3782,6 +3973,8 @@ def dashboard():
             "last_market_scan_ms": BOT_STATE["last_market_scan_ms"],
             "last_indicators_ms": BOT_STATE["last_indicators_ms"],
             "last_signal_ms": BOT_STATE["last_signal_ms"],
+            "pending_entry": refresh_pending_time_remaining(dict(BOT_STATE.get("pending_entry") or default_pending_entry())),
+            "pending_entry_history": pending_entry_history_snapshot(),
             "config_strategy": dict(config.get("strategy", {}))
         }
 
@@ -3801,6 +3994,7 @@ def dashboard():
     bot_health = get_bot_health_data(positions, bot_snapshot)
     developer_diagnostics = get_developer_diagnostics(config, positions, bot_snapshot, bot_health)
     position_cap = get_position_cap_status(positions, config)
+    bot_audit_rows = load_bot_audit_rows(20)
     levels = market_context.get("levels", {})
     distances = market_context.get("level_distances", {})
 
@@ -3966,14 +4160,6 @@ Minimum Confidence Required: <span id="bot-minimum-confidence">{config.get("mini
 Dominance: <span id="bot-dominance">{float(bot_snapshot.get("dominance_percent") or 0):.1f}</span>%<br>
 Minimum Dominance Required: <span id="bot-minimum-dominance">{config.get("minimum_dominance_percent", 60)}</span>%<br>
 Current Signal: <span id="bot-current-signal">{bot_snapshot["current_signal"]}</span><br>
-Pending Entry: <span id="pending-entry-active">{ "YES" if bot_snapshot.get("pending_entry", {}).get("active") else "NO" }</span><br>
-Pending Direction: <span id="pending-entry-direction">{bot_snapshot.get("pending_entry", {}).get("direction") or "N/A"}</span><br>
-Starting Option Price: <span id="pending-entry-start-price">{fmt_premium(bot_snapshot.get("pending_entry", {}).get("starting_option_price"))}</span><br>
-Required Confirmation: <span id="pending-entry-required">{fmt_percent(bot_snapshot.get("pending_entry", {}).get("required_confirmation_percent"))}</span><br>
-Confirmation Price: <span id="pending-entry-confirm-price">{fmt_premium(bot_snapshot.get("pending_entry", {}).get("confirmation_price"))}</span><br>
-Current Option Price: <span id="pending-entry-current-price">{fmt_premium(bot_snapshot.get("pending_entry", {}).get("current_option_price"))}</span><br>
-Time Remaining: <span id="pending-entry-time-remaining">{bot_snapshot.get("pending_entry", {}).get("time_remaining_seconds", 0)}</span> sec<br>
-Pending Status: <span id="pending-entry-status">{bot_snapshot.get("pending_entry", {}).get("status", "NONE")}</span><br>
 Last Bot Action: <span id="bot-last-action">{bot_snapshot["last_action"]}</span><br>
 Trades Today: <span id="bot-trades-today">{bot_snapshot["trades_today"]}</span><br>
 Current P/L: <span id="bot-current-pl">{fmt_money(market_context.get("current_pl"))}</span><br>
@@ -4233,6 +4419,36 @@ Status: OPEN
 
     html += f"""
 <div class="card">
+<h2>Current Decision</h2>
+Market State: {escape_html(bot_snapshot["market_state"])}<br>
+Bullish Score: {bot_snapshot["bullish_score"]} / 10<br>
+Bearish Score: {bot_snapshot["bearish_score"]} / 10<br>
+Confidence: {bot_snapshot["confidence"]} / 10<br>
+Dominance: {float(bot_snapshot.get("dominance_percent") or 0):.1f}%<br>
+Current Signal: {escape_html(bot_snapshot["current_signal"])}<br>
+Last Bot Action: {escape_html(bot_snapshot["last_action"])}<br>
+<br>
+Bot Reason Log:<br>
+<div class="item">{reason_log_html}</div>
+</div>
+
+<div class="card">
+<h2>Pending Entry (LIVE)</h2>
+<div id="pending-entry-live-content">
+{render_current_pending_entry(bot_snapshot.get("pending_entry"))}
+</div>
+</div>
+
+<div class="card">
+<h2>Pending Entry History (Last 20)</h2>
+<div class="history-panel pending-entry-history-panel" id="pending-entry-history-content">
+{render_pending_entry_history(bot_snapshot.get("pending_entry_history"))}
+</div>
+</div>
+"""
+
+    html += f"""
+<div class="card">
 <h2>Bot vs Human Performance</h2>
 <div class="performance-grid">
 {render_performance_panel("HUMAN", trade_performance["HUMAN"])}
@@ -4241,10 +4457,10 @@ Status: OPEN
 </div>
 """
 
-    visible_trades = enrich_trade_rows(get_trade_history_trades(limit=None))
+    visible_trades = enrich_trade_rows(get_trade_history_trades(limit=None))[-20:]
     html += """
 <div class="card">
-<h2>Trade History</h2>
+<h2>Trade History (Last 20)</h2>
 <form method="POST" action="/clear-trade-history-view" style="display:inline;">
 <button type="submit" class="red">Clear Trade History</button>
 </form>
@@ -4262,6 +4478,15 @@ Status: OPEN
         html += "No trades visible."
 
     html += """
+</div>
+</div>
+"""
+
+    html += f"""
+<div class="card">
+<h2>Bot Audit (Last 20)</h2>
+<div class="history-panel bot-audit-panel">
+{render_bot_audit_history(bot_audit_rows)}
 </div>
 </div>
 """
@@ -4547,6 +4772,83 @@ Status: OPEN
     }}).join("");
 }}
 
+function escapeHtml(value) {{
+    return String(value ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#039;");
+}}
+
+function friendlyPendingStatus(status) {{
+    const text = String(status || "NONE").toUpperCase();
+    if (text.includes("WAITING")) return "Waiting";
+    if (text === "CONFIRMED" || text === "BUY SUBMITTED") return "Confirmed";
+    if (text === "CANCELLED") return "Cancelled";
+    return text;
+}}
+
+function renderPendingEntry(pending) {{
+    const el = document.getElementById("pending-entry-live-content");
+    if (!el) return;
+
+    pending = pending || {{}};
+    if (!pending.active) {{
+        el.innerHTML = "No Pending Entry";
+        return;
+    }}
+
+    el.innerHTML = `
+<div class="item">
+Direction: ${{escapeHtml(pending.direction || "N/A")}}<br>
+Status: ${{escapeHtml(friendlyPendingStatus(pending.status))}}<br>
+<br>
+Current Filter Progress:<br>
+Momentum Confirmation: ${{escapeHtml(pending.momentum_status || "WAITING")}}<br>
+Breakout Confirmation: ${{escapeHtml(pending.breakout_status || "PASS")}}<br>
+<br>
+Starting Option Price: ${{fmtMoney(pending.starting_option_price)}}<br>
+Current Option Price: ${{fmtMoney(pending.current_option_price)}}<br>
+Required Momentum %: ${{fmtPercent(pending.required_confirmation_percent)}}<br>
+Current Breakout Candle: ${{escapeHtml(pending.current_breakout_candle ?? 0)}}<br>
+Required Breakout Candles: ${{escapeHtml(pending.required_breakout_candles ?? 0)}}<br>
+Breakout Level: ${{fmtMoney(pending.breakout_level)}}<br>
+Time Remaining: ${{pending.time_remaining_seconds || 0}} sec<br>
+Reason: ${{escapeHtml(pending.reason || "Waiting for option momentum confirmation")}}
+</div>`;
+}}
+
+function renderPendingEntryHistory(history) {{
+    const el = document.getElementById("pending-entry-history-content");
+    if (!el) return;
+
+    const rows = (history || []).slice(-20).reverse();
+    if (!rows.length) {{
+        el.innerHTML = "No pending entry history.";
+        return;
+    }}
+
+    el.innerHTML = rows.map((row) => {{
+        const breakoutProgress = `${{row.current_breakout_candle ?? 0}}/${{row.required_breakout_candles ?? 0}}`;
+        const buyLine = row.buy_submitted ? "<br>BUY SUBMITTED" : "";
+        const cancelLine = row.cancellation_reason ? `<br>Cancellation Reason: ${{escapeHtml(row.cancellation_reason)}}` : "";
+        return `
+<div class="trade-card bot">
+${{escapeHtml(row.timestamp || "")}}<br>
+${{escapeHtml(row.direction || "")}}<br>
+Underlying: ${{escapeHtml(row.underlying || "")}}<br>
+Option: ${{escapeHtml(row.option_symbol || "")}}<br>
+Signal Generated: ${{escapeHtml(row.signal_generated || "")}}<br>
+Momentum: ${{escapeHtml(row.momentum_status || "WAITING")}}<br>
+Breakout: ${{escapeHtml(row.breakout_status || "PASS")}} ${{escapeHtml(breakoutProgress)}}<br>
+Final Status: ${{escapeHtml(row.final_status || "WAITING")}}
+${{buyLine}}
+${{cancelLine}}
+</div>`;
+    }}).join("");
+}}
+
 async function updateBotState() {{
     const data = await getJson("/api/bot-state");
     setText("bot-spent-today", fmtMoney(data.spent_today));
@@ -4564,15 +4866,8 @@ async function updateBotState() {{
     setText("bot-confidence", data.confidence);
     setText("bot-dominance", Number(data.dominance_percent || 0).toFixed(1));
     setText("bot-current-signal", data.current_signal);
-    const pending = data.pending_entry || {{}};
-    setText("pending-entry-active", pending.active ? "YES" : "NO");
-    setText("pending-entry-direction", pending.direction || "N/A");
-    setText("pending-entry-start-price", fmtMoney(pending.starting_option_price));
-    setText("pending-entry-required", `+${{Number(pending.required_confirmation_percent || 0).toFixed(2)}}%`);
-    setText("pending-entry-confirm-price", fmtMoney(pending.confirmation_price));
-    setText("pending-entry-current-price", fmtMoney(pending.current_option_price));
-    setText("pending-entry-time-remaining", pending.time_remaining_seconds || 0);
-    setText("pending-entry-status", pending.status || "NONE");
+    renderPendingEntry(data.pending_entry);
+    renderPendingEntryHistory(data.pending_entry_history);
     setText("bot-last-action", data.last_action);
     setText("bot-trades-today", data.trades_today);
     renderReasonLog(data.reason_log);
