@@ -3523,7 +3523,9 @@ Number of Trades: {summary["number_of_trades"]}<br>
 <br><br>
 {stats_html}
 Trade List:<br>
+<div class="history-panel bot-trades-panel">
 {render_trade_list(summary)}
+</div>
 </div>
 """
 
@@ -3834,6 +3836,9 @@ def dashboard():
 <head>
 <title>Trading Bot Dashboard</title>
 <style>
+:root {{
+    --history-panel-height: 400px;
+}}
 body {{
     font-family: Arial;
     margin: 30px;
@@ -3898,6 +3903,12 @@ button {{
 }}
 .trade-card.bot {{ border-left-color: #00b7ff; }}
 .trade-card.human {{ border-left-color: #ffd166; }}
+.history-panel {{
+    max-height: var(--history-panel-height);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    padding-right: 8px;
+}}
 .badge {{
     display: inline-block;
     padding: 3px 8px;
@@ -4241,6 +4252,7 @@ Status: OPEN
 <button type="submit" class="yellow">Undo Clear Trade History</button>
 </form>
 <br><br>
+<div class="history-panel trade-history-panel">
 """
 
     if visible_trades:
@@ -4250,6 +4262,7 @@ Status: OPEN
         html += "No trades visible."
 
     html += """
+</div>
 </div>
 """
 
