@@ -40,7 +40,10 @@ TOKEN = os.getenv("TRADIER_TOKEN", "")
 ACCOUNT = os.getenv("TRADIER_ACCOUNT", "")
 BASE_URL = os.getenv("TRADIER_BASE_URL", "https://sandbox.tradier.com/v1")
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_HISTORY_LIMIT = 20
 BOT_AUDIT_FILE = os.path.join(APP_DIR, "bot_audit_log.csv")
+BOT_AUDIT_VISIBLE_FILE = os.path.join(APP_DIR, "dashboard_bot_audit_visible.csv")
+BOT_AUDIT_BACKUP_FILE = os.path.join(APP_DIR, "dashboard_bot_audit_last_cleared.csv")
 BOT_AUDIT_COLUMNS = [
     "timestamp", "action", "decision", "symbol", "option_symbol",
     "market_state", "bullish_score", "bearish_score", "confidence",
@@ -139,7 +142,8 @@ BOT_STATE = {
         "contract": {},
         "market_context": {}
     },
-    "pending_entry_history": []
+    "pending_entry_history": [],
+    "pending_entry_history_backup": []
 }
 
 
@@ -149,6 +153,22 @@ def clamp_int(value, minimum, maximum, default):
     except:
         number = default
     return max(minimum, min(maximum, number))
+
+
+def normalize_history_config(config):
+    history = config.setdefault("history", {})
+    history["use_global_limit"] = bool(history.get("use_global_limit", True))
+    history["global_limit"] = clamp_int(history.get("global_limit", DEFAULT_HISTORY_LIMIT), 1, 500, DEFAULT_HISTORY_LIMIT)
+    history["pending_entry_limit"] = clamp_int(history.get("pending_entry_limit", history["global_limit"]), 1, 500, history["global_limit"])
+    history["bot_trades_limit"] = clamp_int(history.get("bot_trades_limit", history["global_limit"]), 1, 500, history["global_limit"])
+    history["trade_history_limit"] = clamp_int(history.get("trade_history_limit", history["global_limit"]), 1, 500, history["global_limit"])
+    history["bot_audit_limit"] = clamp_int(history.get("bot_audit_limit", history["global_limit"]), 1, 500, history["global_limit"])
+    return history
+
+
+def history_limit(config, key):
+    history = normalize_history_config(config)
+    return history["global_limit"] if history.get("use_global_limit", True) else history.get(key, history["global_limit"])
 
 
 def load_config():
@@ -171,6 +191,7 @@ def load_config():
     config.setdefault("strategy_mode", "SURFER")
     config.setdefault("scanner", {"interval_seconds": 60})
     config.setdefault("strategy", {})
+    normalize_history_config(config)
     config.setdefault("decision_time", "09:35")
     config.setdefault("bot_budget", 100)
     config.setdefault("human_daily_trading_budget", 500)
@@ -505,6 +526,77 @@ def ensure_audit_file():
         writer.writeheader()
 
 
+def write_audit_header(path):
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=BOT_AUDIT_COLUMNS)
+        writer.writeheader()
+
+
+def ensure_audit_view_file(path):
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        write_audit_header(path)
+        return
+
+    with open(path, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+        fieldnames = reader.fieldnames or []
+
+    if fieldnames == BOT_AUDIT_COLUMNS:
+        return
+
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=BOT_AUDIT_COLUMNS)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({column: row.get(column, "") for column in BOT_AUDIT_COLUMNS})
+
+
+def append_audit_row(path, row):
+    ensure_audit_view_file(path)
+    with open(path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=BOT_AUDIT_COLUMNS)
+        writer.writerow({column: row.get(column, "") for column in BOT_AUDIT_COLUMNS})
+
+
+def load_bot_audit_view_rows(limit=None):
+    try:
+        ensure_audit_file()
+        if os.path.exists(BOT_AUDIT_VISIBLE_FILE):
+            ensure_audit_view_file(BOT_AUDIT_VISIBLE_FILE)
+        visible_path = BOT_AUDIT_VISIBLE_FILE if os.path.exists(BOT_AUDIT_VISIBLE_FILE) else BOT_AUDIT_FILE
+        with open(visible_path, "r", newline="") as f:
+            rows = list(csv.DictReader(f))
+        return rows[-limit:] if limit else rows
+    except:
+        return []
+
+
+def clear_bot_audit_view():
+    current_rows = load_bot_audit_view_rows(limit=None)
+    with open(BOT_AUDIT_BACKUP_FILE, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=BOT_AUDIT_COLUMNS)
+        writer.writeheader()
+        for row in current_rows:
+            writer.writerow({column: row.get(column, "") for column in BOT_AUDIT_COLUMNS})
+    write_audit_header(BOT_AUDIT_VISIBLE_FILE)
+
+
+def restore_bot_audit_view():
+    if not os.path.exists(BOT_AUDIT_BACKUP_FILE):
+        return False
+    ensure_audit_view_file(BOT_AUDIT_BACKUP_FILE)
+    with open(BOT_AUDIT_BACKUP_FILE, "r", newline="") as src:
+        backup_rows = list(csv.DictReader(src))
+
+    with open(BOT_AUDIT_VISIBLE_FILE, "w", newline="") as dst:
+        writer = csv.DictWriter(dst, fieldnames=BOT_AUDIT_COLUMNS)
+        writer.writeheader()
+        for row in backup_rows:
+            writer.writerow({column: row.get(column, "") for column in BOT_AUDIT_COLUMNS})
+    return True
+
+
 def log_bot_audit(action, decision, symbol, market_context, config, **extra):
     ensure_audit_file()
     reason_log = extra.get("reason_log") or market_context.get("decision_reasons") or market_context.get("reasons") or []
@@ -564,6 +656,8 @@ def log_bot_audit(action, decision, symbol, market_context, config, **extra):
     with open(BOT_AUDIT_FILE, "a", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=BOT_AUDIT_COLUMNS)
         writer.writerow({column: row.get(column, "") for column in BOT_AUDIT_COLUMNS})
+    if os.path.exists(BOT_AUDIT_VISIBLE_FILE):
+        append_audit_row(BOT_AUDIT_VISIBLE_FILE, row)
 
 
 def update_last_trade_review(review):
@@ -1055,7 +1149,7 @@ def upsert_pending_history(pending, final_status=None, cancellation_reason=None,
             history.append(record)
         else:
             history[existing_index].update(record)
-        BOT_STATE["pending_entry_history"] = history[-20:]
+        BOT_STATE["pending_entry_history"] = history
     return record
 
 
@@ -1116,8 +1210,21 @@ def pending_entry_snapshot():
     return refresh_pending_time_remaining(pending)
 
 
-def pending_entry_history_snapshot():
-    return list(BOT_STATE.get("pending_entry_history") or [])[-20:]
+def pending_entry_history_snapshot(limit=None):
+    history = list(BOT_STATE.get("pending_entry_history") or [])
+    return history[-limit:] if limit else history
+
+
+def clear_pending_entry_history():
+    with BOT_LOCK:
+        BOT_STATE["pending_entry_history_backup"] = list(BOT_STATE.get("pending_entry_history") or [])
+        BOT_STATE["pending_entry_history"] = []
+
+
+def restore_pending_entry_history():
+    with BOT_LOCK:
+        BOT_STATE["pending_entry_history"] = list(BOT_STATE.get("pending_entry_history_backup") or [])
+    return True
 
 
 def parse_clock(value, default_hour=9, default_minute=35):
@@ -2819,6 +2926,7 @@ def api_orders():
 def api_bot_state():
     config = load_config()
     sync_trade_limits_from_file(config)
+    pending_history_limit = history_limit(config, "pending_entry_limit")
 
     with BOT_LOCK:
         pending_entry = refresh_pending_time_remaining(dict(BOT_STATE.get("pending_entry") or default_pending_entry()))
@@ -2864,7 +2972,7 @@ def api_bot_state():
             "last_indicators_ms": BOT_STATE["last_indicators_ms"],
             "last_signal_ms": BOT_STATE["last_signal_ms"],
             "pending_entry": pending_entry,
-            "pending_entry_history": pending_entry_history_snapshot(),
+            "pending_entry_history": pending_entry_history_snapshot(pending_history_limit),
             "config_strategy": dict(config.get("strategy", {}))
         })
 
@@ -3134,6 +3242,30 @@ def restore_trade_history_view_route():
     return redirect("/")
 
 
+@app.route("/clear-pending-entry-history", methods=["POST"])
+def clear_pending_entry_history_route():
+    clear_pending_entry_history()
+    return redirect("/")
+
+
+@app.route("/restore-pending-entry-history", methods=["POST"])
+def restore_pending_entry_history_route():
+    restore_pending_entry_history()
+    return redirect("/")
+
+
+@app.route("/clear-bot-audit-view", methods=["POST"])
+def clear_bot_audit_view_route():
+    clear_bot_audit_view()
+    return redirect("/")
+
+
+@app.route("/restore-bot-audit-view", methods=["POST"])
+def restore_bot_audit_view_route():
+    restore_bot_audit_view()
+    return redirect("/")
+
+
 @app.route("/save-settings", methods=["POST"])
 def save_settings():
     config = load_config()
@@ -3160,6 +3292,13 @@ def save_settings():
     config["confirmation_timeout_seconds"] = clamp_int(request.form.get("confirmation_timeout_seconds", 10), 1, 300, 10)
     config["minimum_confidence"] = clamp_int(request.form.get("minimum_confidence", 2), 1, 10, 2)
     config["minimum_dominance_percent"] = clamp_int(request.form.get("minimum_dominance_percent", 60), 50, 100, 60)
+    history = config.setdefault("history", {})
+    history["use_global_limit"] = request.form.get("use_global_history_limit") == "on"
+    history["global_limit"] = clamp_int(request.form.get("global_history_limit", DEFAULT_HISTORY_LIMIT), 1, 500, DEFAULT_HISTORY_LIMIT)
+    history["pending_entry_limit"] = clamp_int(request.form.get("pending_entry_history_limit", history["global_limit"]), 1, 500, history["global_limit"])
+    history["bot_trades_limit"] = clamp_int(request.form.get("bot_trades_limit", history["global_limit"]), 1, 500, history["global_limit"])
+    history["trade_history_limit"] = clamp_int(request.form.get("trade_history_limit", history["global_limit"]), 1, 500, history["global_limit"])
+    history["bot_audit_limit"] = clamp_int(request.form.get("bot_audit_limit", history["global_limit"]), 1, 500, history["global_limit"])
 
     s = config["strategy"]
     s["ema_fast"] = int(request.form.get("ema_fast", 1))
@@ -3586,8 +3725,8 @@ Reason: {escape_html(pending.get("reason") or "Waiting for option momentum confi
 """
 
 
-def render_pending_entry_history(history):
-    rows = list(history or [])[-20:]
+def render_pending_entry_history(history, limit):
+    rows = list(history or [])[-limit:]
     if not rows:
         return "No pending entry history."
 
@@ -3615,22 +3754,19 @@ Final Status: {escape_html(final_status)}
     return "".join(html)
 
 
-def load_bot_audit_rows(limit=20):
+def load_bot_audit_rows(limit=None):
     try:
-        ensure_audit_file()
-        with open(BOT_AUDIT_FILE, "r", newline="") as f:
-            rows = list(csv.DictReader(f))
-        return rows[-limit:]
+        return load_bot_audit_view_rows(limit)
     except:
         return []
 
 
-def render_bot_audit_history(rows):
+def render_bot_audit_history(rows, limit):
     if not rows:
         return "No bot audit records."
 
     html = []
-    for row in reversed(rows[-20:]):
+    for row in reversed(rows[-limit:]):
         html.append(f"""
 <div class="trade-card bot">
 {escape_html(row.get("timestamp", ""))}<br>
@@ -3648,12 +3784,12 @@ Order Status: {escape_html(row.get("order_status", ""))}
     return "".join(html)
 
 
-def render_trade_list(summary):
+def render_trade_list(summary, limit):
     if not summary["trade_list"]:
         return "No closed trades yet."
 
     lines = []
-    for trade in summary["trade_list"][-20:]:
+    for trade in summary["trade_list"][-limit:]:
         pnl_class = "good" if trade["pnl"] > 0 else "bad" if trade["pnl"] < 0 else ""
         entry_label = entry_source_label({"EntryPriceSource": trade["entry_price_source"]})
         lines.append(
@@ -3670,7 +3806,7 @@ def render_trade_list(summary):
     return "".join(lines)
 
 
-def render_performance_panel(label, summary):
+def render_performance_panel(label, summary, limit):
     panel_class = label.lower()
     clear_action = "/clear-bot-trades" if label == "BOT" else "/clear-human-trades"
     restore_action = "/restore-bot-trades" if label == "BOT" else "/restore-human-trades"
@@ -3701,7 +3837,11 @@ Win Rate: {summary["win_rate"]:.2f}%<br>
 Total PnL: {fmt_money(summary["total_pnl"])}<br>
 Number of Trades: {summary["number_of_trades"]}<br>
 """
-    trade_list_label = "Bot Trades (Last 20)" if label == "BOT" else "Human Trades (Last 20)"
+    trade_list_label = (
+        f"""Bot Trades (Last <input type="number" form="settings-form" name="bot_trades_limit" value="{limit}" min="1" max="500" style="width:70px;">)"""
+        if label == "BOT"
+        else f"""Human Trades (Last {limit})"""
+    )
     return f"""
 <div class="performance-panel {panel_class}">
 <h3>{escape_html(label.title())}</h3>
@@ -3715,7 +3855,7 @@ Number of Trades: {summary["number_of_trades"]}<br>
 {stats_html}
 {trade_list_label}:<br>
 <div class="history-panel bot-trades-panel">
-{render_trade_list(summary)}
+{render_trade_list(summary, limit)}
 </div>
 </div>
 """
@@ -3994,7 +4134,12 @@ def dashboard():
     bot_health = get_bot_health_data(positions, bot_snapshot)
     developer_diagnostics = get_developer_diagnostics(config, positions, bot_snapshot, bot_health)
     position_cap = get_position_cap_status(positions, config)
-    bot_audit_rows = load_bot_audit_rows(20)
+    history_settings = normalize_history_config(config)
+    pending_history_limit = history_limit(config, "pending_entry_limit")
+    trade_history_limit = history_limit(config, "trade_history_limit")
+    bot_audit_limit = history_limit(config, "bot_audit_limit")
+    bot_trades_limit = history_limit(config, "bot_trades_limit")
+    bot_audit_rows = load_bot_audit_rows(bot_audit_limit)
     levels = market_context.get("levels", {})
     distances = market_context.get("level_distances", {})
 
@@ -4440,9 +4585,16 @@ Bot Reason Log:<br>
 </div>
 
 <div class="card">
-<h2>Pending Entry History (Last 20)</h2>
+<h2>Pending Entry History (Last <input type="number" form="settings-form" name="pending_entry_history_limit" value="{pending_history_limit}" min="1" max="500" style="width:70px;">)</h2>
+<form method="POST" action="/clear-pending-entry-history" style="display:inline;">
+<button type="submit" class="red">Clear Pending History</button>
+</form>
+<form method="POST" action="/restore-pending-entry-history" style="display:inline;">
+<button type="submit" class="yellow">Undo Clear Pending History</button>
+</form>
+<br><br>
 <div class="history-panel pending-entry-history-panel" id="pending-entry-history-content">
-{render_pending_entry_history(bot_snapshot.get("pending_entry_history"))}
+{render_pending_entry_history(bot_snapshot.get("pending_entry_history"), pending_history_limit)}
 </div>
 </div>
 """
@@ -4451,16 +4603,20 @@ Bot Reason Log:<br>
 <div class="card">
 <h2>Bot vs Human Performance</h2>
 <div class="performance-grid">
-{render_performance_panel("HUMAN", trade_performance["HUMAN"])}
-{render_performance_panel("BOT", trade_performance["BOT"])}
+{render_performance_panel("HUMAN", trade_performance["HUMAN"], bot_trades_limit)}
+{render_performance_panel("BOT", trade_performance["BOT"], bot_trades_limit)}
 </div>
 </div>
 """
 
-    visible_trades = enrich_trade_rows(get_trade_history_trades(limit=None))[-20:]
+    visible_trades = enrich_trade_rows(get_trade_history_trades(limit=trade_history_limit))
     html += """
 <div class="card">
-<h2>Trade History (Last 20)</h2>
+"""
+    html += f"""
+<h2>Trade History (Last <input type="number" form="settings-form" name="trade_history_limit" value="{trade_history_limit}" min="1" max="500" style="width:70px;">)</h2>
+"""
+    html += """
 <form method="POST" action="/clear-trade-history-view" style="display:inline;">
 <button type="submit" class="red">Clear Trade History</button>
 </form>
@@ -4484,9 +4640,16 @@ Bot Reason Log:<br>
 
     html += f"""
 <div class="card">
-<h2>Bot Audit (Last 20)</h2>
+<h2>Bot Audit (Last <input type="number" form="settings-form" name="bot_audit_limit" value="{bot_audit_limit}" min="1" max="500" style="width:70px;">)</h2>
+<form method="POST" action="/clear-bot-audit-view" style="display:inline;">
+<button type="submit" class="red">Clear Bot Audit</button>
+</form>
+<form method="POST" action="/restore-bot-audit-view" style="display:inline;">
+<button type="submit" class="yellow">Undo Clear Bot Audit</button>
+</form>
+<br><br>
 <div class="history-panel bot-audit-panel">
-{render_bot_audit_history(bot_audit_rows)}
+{render_bot_audit_history(bot_audit_rows, bot_audit_limit)}
 </div>
 </div>
 """
@@ -4495,7 +4658,7 @@ Bot Reason Log:<br>
 <div class="card">
 <h2>Settings</h2>
 
-<form method="POST" action="/save-settings">
+<form method="POST" action="/save-settings" id="settings-form">
 
 <h3>General</h3>
 
@@ -4568,6 +4731,16 @@ Strategy Mode:
 <option value="SURFER" {selected("SURFER", strategy_mode)}>SURFER</option>
 <option value="TSUNAMI" {selected("TSUNAMI", strategy_mode)}>TSUNAMI</option>
 </select><br>
+
+<h3>History Panels</h3>
+
+Use Global History Limit:
+<input type="checkbox" name="use_global_history_limit" {checked(history_settings.get("use_global_limit", True))}><br>
+
+Global History Limit:
+<input type="number" min="1" max="500" name="global_history_limit" value="{history_settings.get("global_limit", DEFAULT_HISTORY_LIMIT)}"><br>
+
+If global limit is enabled, Pending Entry History, Bot Trades, Trade History, and Bot Audit use this same value. Disable it to use the per-panel Last inputs above.<br>
 
 <h3>Indicators</h3>
 
