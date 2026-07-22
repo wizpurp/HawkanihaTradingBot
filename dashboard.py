@@ -133,9 +133,17 @@ BOT_STATE = {
         "required_breakout_candles": 0,
         "breakout_level": None,
         "starting_option_price": None,
+        "confirmation_price_source": "",
         "required_confirmation_percent": 0,
         "confirmation_price": None,
         "current_option_price": None,
+        "current_momentum_gain_percent": 0,
+        "current_pre_confirmation_drawdown_percent": 0,
+        "maximum_allowed_drawdown_percent": 0,
+        "momentum_timeout_seconds": 0,
+        "elapsed_time_seconds": 0,
+        "retry_cooldown_remaining_seconds": 0,
+        "final_cancellation_trigger": "",
         "time_remaining_seconds": 0,
         "status": "NONE",
         "reason": "",
@@ -220,8 +228,10 @@ def load_config():
     config["max_open_contracts"] = clamp_int(config.get("max_open_contracts", 1), 1, 5, 1)
     config.setdefault("contract_selection_mode", "strict_atm")
     config["option_momentum_confirmation_enabled"] = bool(config.get("option_momentum_confirmation_enabled", True))
-    config["option_momentum_percent"] = max(0.1, min(20.0, safe_float(config.get("option_momentum_percent", 2.0), 2.0)))
-    config["confirmation_timeout_seconds"] = clamp_int(config.get("confirmation_timeout_seconds", 10), 1, 300, 10)
+    config["option_momentum_percent"] = max(0.1, min(20.0, safe_float(config.get("option_momentum_percent", 1.0), 1.0)))
+    config["confirmation_timeout_seconds"] = clamp_int(config.get("confirmation_timeout_seconds", 60), 1, 300, 60)
+    config["pre_confirmation_max_drawdown_percent"] = max(0.0, min(50.0, safe_float(config.get("pre_confirmation_max_drawdown_percent", 5.0), 5.0)))
+    config["pending_entry_retry_cooldown_seconds"] = clamp_int(config.get("pending_entry_retry_cooldown_seconds", 60), 0, 600, 60)
     config["two_candle_or_confirmation_enabled"] = bool(config.get("two_candle_or_confirmation_enabled", True))
     config["required_breakout_candles"] = clamp_int(config.get("required_breakout_candles", 2), 1, 10, 2)
     config.setdefault("minimum_confidence", 2)
@@ -1089,6 +1099,36 @@ def get_option_trade_price(contract):
     return None
 
 
+def valid_price(value):
+    try:
+        price = float(value)
+        return price if price > 0 else None
+    except:
+        return None
+
+
+def get_option_confirmation_price(quote_or_contract):
+    if not quote_or_contract:
+        return None, "NONE"
+
+    bid = valid_price(quote_or_contract.get("bid"))
+    ask = valid_price(quote_or_contract.get("ask"))
+    if bid is not None and ask is not None:
+        return (bid + ask) / 2, "MIDPOINT"
+
+    last = valid_price(quote_or_contract.get("last"))
+    if last is not None:
+        return last, "LAST"
+
+    if ask is not None:
+        return ask, "ASK"
+
+    if bid is not None:
+        return bid, "BID"
+
+    return None, "NONE"
+
+
 def default_pending_entry():
     return {
         "active": False,
@@ -1105,9 +1145,17 @@ def default_pending_entry():
         "required_breakout_candles": 0,
         "breakout_level": None,
         "starting_option_price": None,
+        "confirmation_price_source": "",
         "required_confirmation_percent": 0,
         "confirmation_price": None,
         "current_option_price": None,
+        "current_momentum_gain_percent": 0,
+        "current_pre_confirmation_drawdown_percent": 0,
+        "maximum_allowed_drawdown_percent": 0,
+        "momentum_timeout_seconds": 0,
+        "elapsed_time_seconds": 0,
+        "retry_cooldown_remaining_seconds": 0,
+        "final_cancellation_trigger": "",
         "time_remaining_seconds": 0,
         "status": "NONE",
         "reason": "",
@@ -1143,6 +1191,8 @@ def refresh_pending_time_remaining(pending):
 
 
 def pending_history_record(pending, final_status=None, cancellation_reason=None, buy_submitted=False):
+    status = final_status or pending.get("status", "WAITING FOR MOMENTUM")
+    now_epoch = time.time()
     return {
         "id": pending.get("id", ""),
         "timestamp": pending.get("timestamp", ""),
@@ -1155,7 +1205,20 @@ def pending_history_record(pending, final_status=None, cancellation_reason=None,
         "current_breakout_candle": pending.get("current_breakout_candle", 0),
         "required_breakout_candles": pending.get("required_breakout_candles", 0),
         "breakout_level": pending.get("breakout_level"),
-        "final_status": final_status or pending.get("status", "WAITING FOR MOMENTUM"),
+        "starting_option_price": pending.get("starting_option_price"),
+        "current_option_price": pending.get("current_option_price"),
+        "confirmation_price": pending.get("confirmation_price"),
+        "confirmation_price_source": pending.get("confirmation_price_source", ""),
+        "current_momentum_gain_percent": pending.get("current_momentum_gain_percent", 0),
+        "current_pre_confirmation_drawdown_percent": pending.get("current_pre_confirmation_drawdown_percent", 0),
+        "maximum_allowed_drawdown_percent": pending.get("maximum_allowed_drawdown_percent", 0),
+        "momentum_timeout_seconds": pending.get("momentum_timeout_seconds", 0),
+        "elapsed_time_seconds": pending.get("elapsed_time_seconds", 0),
+        "retry_cooldown_remaining_seconds": pending.get("retry_cooldown_remaining_seconds", 0),
+        "final_cancellation_trigger": pending.get("final_cancellation_trigger", ""),
+        "updated_epoch": now_epoch,
+        "completed_epoch": now_epoch if status in ["CANCELLED", "BUY SUBMITTED", "CONFIRMED"] else None,
+        "final_status": status,
         "cancellation_reason": cancellation_reason or pending.get("reason", ""),
         "buy_submitted": bool(buy_submitted)
     }
@@ -1213,11 +1276,44 @@ def upsert_pending_history(pending, final_status=None, cancellation_reason=None,
     return record
 
 
-def create_pending_entry(config, decision, side, contract, contracts, start_price, market_context):
+def pending_retry_cooldown_remaining(config, direction, option_symbol):
+    cooldown_seconds = clamp_int(config.get("pending_entry_retry_cooldown_seconds", 60), 0, 600, 60)
+    if cooldown_seconds <= 0:
+        return 0
+
+    rows = load_pending_history_rows(visible=False)
+    now_epoch = time.time()
+    for row in reversed(rows):
+        if row.get("direction") != direction or row.get("option_symbol") != option_symbol:
+            continue
+        if row.get("final_status") not in ["CANCELLED"]:
+            continue
+
+        timestamp = row.get("completed_epoch") or row.get("updated_epoch") or row.get("cancelled_epoch")
+        if timestamp is None:
+            continue
+
+        remaining = cooldown_seconds - int(now_epoch - float(timestamp))
+        return max(0, remaining)
+
+    return 0
+
+
+def equivalent_pending_entry_active(direction, option_symbol):
+    pending = get_pending_entry()
+    return (
+        pending.get("active")
+        and pending.get("direction") == direction
+        and pending.get("option_symbol") == option_symbol
+    )
+
+
+def create_pending_entry(config, decision, side, contract, contracts, start_price, market_context, price_source=""):
     momentum_enabled = bool(config.get("option_momentum_confirmation_enabled", True))
     breakout_enabled = bool(config.get("two_candle_or_confirmation_enabled", True))
-    momentum_percent = float(config.get("option_momentum_percent", 2.0)) if momentum_enabled else 0
-    timeout_seconds = int(config.get("confirmation_timeout_seconds", 10))
+    momentum_percent = float(config.get("option_momentum_percent", 1.0)) if momentum_enabled else 0
+    timeout_seconds = int(config.get("confirmation_timeout_seconds", 60))
+    max_drawdown_percent = max(0.0, min(50.0, safe_float(config.get("pre_confirmation_max_drawdown_percent", 5.0), 5.0)))
     started_epoch = time.time()
     timestamp = market_now().strftime("%H:%M:%S")
     pending_id = f"{market_now().strftime('%Y%m%d%H%M%S%f')}-{contract.get('symbol', '')}"
@@ -1251,9 +1347,17 @@ def create_pending_entry(config, decision, side, contract, contracts, start_pric
         "required_breakout_candles": breakout.get("required", 0),
         "breakout_level": breakout.get("level"),
         "starting_option_price": start_price,
+        "confirmation_price_source": price_source,
         "required_confirmation_percent": momentum_percent,
         "confirmation_price": confirmation_price,
         "current_option_price": start_price,
+        "current_momentum_gain_percent": 0,
+        "current_pre_confirmation_drawdown_percent": 0,
+        "maximum_allowed_drawdown_percent": max_drawdown_percent,
+        "momentum_timeout_seconds": timeout_seconds,
+        "elapsed_time_seconds": 0,
+        "retry_cooldown_remaining_seconds": 0,
+        "final_cancellation_trigger": "",
         "time_remaining_seconds": timeout_seconds,
         "status": status,
         "reason": breakout.get("reason", ""),
@@ -1667,6 +1771,16 @@ def update_opening_range_breakout_confirmation(config, direction):
 
     with BOT_LOCK:
         state = dict(BOT_STATE.get("opening_range_confirmation", {}).get(direction) or default_opening_range_confirmation_state())
+
+    if state.get("status") == "PASS":
+        return {
+            "status": "PASS",
+            "count": int(state.get("count") or required),
+            "required": required,
+            "level": state.get("level"),
+            "last_processed_candle": state.get("last_processed_candle", ""),
+            "reason": state.get("reason", "opening-range breakout confirmed")
+        }
 
     if now.time() < opening_range_end:
         state.update({
@@ -2463,7 +2577,25 @@ def try_surfer_entry(config, positions, market_context, call, put):
         return
 
     if config.get("option_momentum_confirmation_enabled", True) or config.get("two_candle_or_confirmation_enabled", True):
-        create_pending_entry(config, decision, side, contract, contracts, ask, market_context)
+        option_symbol = contract.get("symbol", "")
+        if equivalent_pending_entry_active(side, option_symbol):
+            add_bot_reason(f"PENDING BUY reused: active {side} setup already exists for {option_symbol}")
+            log_bot_audit("SKIP", decision, config.get("symbol", ""), market_context, config, option_symbol=option_symbol, skip_reason="equivalent pending entry already active")
+            return
+
+        retry_remaining = pending_retry_cooldown_remaining(config, side, option_symbol)
+        if retry_remaining > 0:
+            add_bot_reason(f"Pending retry blocked: cooldown active, {retry_remaining}s remaining")
+            log_bot_audit("SKIP", decision, config.get("symbol", ""), market_context, config, option_symbol=option_symbol, skip_reason=f"pending retry cooldown active {retry_remaining}s remaining")
+            return
+
+        confirmation_start_price, confirmation_price_source = get_option_confirmation_price(contract)
+        if confirmation_start_price is None:
+            add_bot_reason(f"PENDING BUY skipped {side}: no confirmation price")
+            log_bot_audit("SKIP", decision, config.get("symbol", ""), market_context, config, option_symbol=option_symbol, skip_reason="no option confirmation price")
+            return
+
+        create_pending_entry(config, decision, side, contract, contracts, confirmation_start_price, market_context, confirmation_price_source)
         return
 
     execute_entry_buy(config, decision, side, contract, contracts, ask, market_context, label="ENTRY")
@@ -2489,6 +2621,7 @@ def process_pending_entry(config):
         pending["active"] = False
         pending["status"] = "CANCELLED"
         pending["reason"] = "bot disabled"
+        pending["final_cancellation_trigger"] = "bot disabled"
         pending["momentum_status"] = "FAIL"
         refresh_pending_time_remaining(pending)
         set_pending_entry(pending)
@@ -2501,6 +2634,7 @@ def process_pending_entry(config):
         pending["active"] = False
         pending["status"] = "CANCELLED"
         pending["reason"] = "options market closed"
+        pending["final_cancellation_trigger"] = "market closed"
         pending["momentum_status"] = "FAIL"
         refresh_pending_time_remaining(pending)
         set_pending_entry(pending)
@@ -2510,8 +2644,15 @@ def process_pending_entry(config):
         return True
 
     quote = get_market_quote(option_symbol)
-    current_price = get_quote_price(quote)
+    current_price, current_price_source = get_option_confirmation_price(quote)
     pending["current_option_price"] = current_price
+    pending["confirmation_price_source"] = current_price_source
+    pending["elapsed_time_seconds"] = int(time.time() - float(pending.get("started_epoch") or time.time()))
+    pending["momentum_timeout_seconds"] = int(pending.get("momentum_timeout_seconds") or config.get("confirmation_timeout_seconds", 60))
+    pending["maximum_allowed_drawdown_percent"] = max(0.0, min(50.0, safe_float(
+        pending.get("maximum_allowed_drawdown_percent", config.get("pre_confirmation_max_drawdown_percent", 5.0)),
+        5.0
+    )))
     breakout = update_opening_range_breakout_confirmation(config, side) if breakout_enabled else {
         "status": "PASS",
         "count": 0,
@@ -2528,7 +2669,12 @@ def process_pending_entry(config):
     if time.time() >= float(pending.get("expires_epoch") or 0):
         pending["active"] = False
         pending["status"] = "CANCELLED"
-        pending["reason"] = "confirmation timeout expired"
+        if pending.get("momentum_status") == "PASS" and pending.get("breakout_status") != "PASS":
+            pending["reason"] = "breakout confirmation failed"
+            pending["final_cancellation_trigger"] = "breakout confirmation failed"
+        else:
+            pending["reason"] = "momentum confirmation timeout expired"
+            pending["final_cancellation_trigger"] = "momentum confirmation timeout expired"
         if pending.get("momentum_status") != "PASS":
             pending["momentum_status"] = "FAIL"
         if pending.get("breakout_status") != "PASS":
@@ -2540,7 +2686,7 @@ def process_pending_entry(config):
         return True
 
     if current_price is None:
-        pending["status"] = "WAITING FOR MOMENTUM"
+        pending["status"] = "WAITING FOR MOMENTUM" if pending.get("momentum_status") != "PASS" else "WAITING FOR BREAKOUT"
         pending["reason"] = "option quote unavailable"
         set_pending_entry(pending)
         upsert_pending_history(pending, final_status="WAITING")
@@ -2549,6 +2695,10 @@ def process_pending_entry(config):
         print("reason:", pending["reason"])
         return True
 
+    if start_price:
+        pending["current_momentum_gain_percent"] = ((current_price - start_price) / start_price) * 100
+        pending["current_pre_confirmation_drawdown_percent"] = max(0, ((start_price - current_price) / start_price) * 100)
+
     print("PENDING ENTRY")
     print("option_symbol:", option_symbol)
     print("direction:", side)
@@ -2556,21 +2706,35 @@ def process_pending_entry(config):
     print("required_confirmation_percent:", pending.get("required_confirmation_percent"))
     print("confirmation_price:", confirmation_price)
     print("current_option_price:", current_price)
+    print("confirmation_price_source:", pending.get("confirmation_price_source"))
+    print("current_momentum_gain_percent:", pending.get("current_momentum_gain_percent"))
+    print("current_pre_confirmation_drawdown_percent:", pending.get("current_pre_confirmation_drawdown_percent"))
+    print("maximum_allowed_drawdown_percent:", pending.get("maximum_allowed_drawdown_percent"))
     print("breakout_status:", pending.get("breakout_status"))
     print("current_breakout_candle:", pending.get("current_breakout_candle"))
     print("required_breakout_candles:", pending.get("required_breakout_candles"))
     print("breakout_level:", pending.get("breakout_level"))
     print("time_remaining_seconds:", pending.get("time_remaining_seconds"))
 
-    if momentum_enabled and current_price < start_price:
+    max_drawdown_percent = safe_float(pending.get("maximum_allowed_drawdown_percent"), 5.0)
+    if (
+        momentum_enabled
+        and pending.get("momentum_status") != "PASS"
+        and max_drawdown_percent > 0
+        and pending.get("current_pre_confirmation_drawdown_percent", 0) >= max_drawdown_percent
+    ):
         pending["active"] = False
         pending["status"] = "CANCELLED"
-        pending["reason"] = "option price fell before confirmation"
+        pending["reason"] = "maximum pre-confirmation drawdown hit"
+        pending["final_cancellation_trigger"] = "maximum pre-confirmation drawdown hit"
         pending["momentum_status"] = "FAIL"
         set_pending_entry(pending)
         upsert_pending_history(pending, final_status="CANCELLED", cancellation_reason=pending["reason"])
-        add_bot_reason(f"PENDING BUY cancelled: option fell {current_price:.2f} < start {start_price:.2f}")
-        log_bot_audit("SKIP", decision, config.get("symbol", ""), market_context, config, option_symbol=option_symbol, current_price=current_price, skip_reason="pending entry cancelled: option price fell before confirmation")
+        add_bot_reason(
+            f"PENDING BUY cancelled: drawdown {pending.get('current_pre_confirmation_drawdown_percent', 0):.2f}% "
+            f">= max {max_drawdown_percent:.2f}%"
+        )
+        log_bot_audit("SKIP", decision, config.get("symbol", ""), market_context, config, option_symbol=option_symbol, current_price=current_price, skip_reason="pending entry cancelled: maximum pre-confirmation drawdown hit")
         return True
 
     if not momentum_enabled:
@@ -2601,7 +2765,8 @@ def process_pending_entry(config):
     if not momentum_passed:
         pending["status"] = "WAITING FOR MOMENTUM"
         pending["reason"] = "waiting for option price confirmation"
-        pending["momentum_status"] = "WAITING"
+        if pending.get("momentum_status") != "PASS":
+            pending["momentum_status"] = "WAITING"
     elif not breakout_passed:
         pending["status"] = "WAITING FOR BREAKOUT"
         pending["reason"] = breakout.get("reason") or "waiting for two completed opening-range breakout candles"
@@ -3619,8 +3784,10 @@ def save_settings():
     config["max_open_contracts"] = clamp_int(request.form.get("max_open_contracts", 1), 1, 5, 1)
     config["contract_selection_mode"] = request.form.get("contract_selection_mode", "strict_atm")
     config["option_momentum_confirmation_enabled"] = request.form.get("option_momentum_confirmation_enabled") == "on"
-    config["option_momentum_percent"] = max(0.1, min(20.0, safe_float(request.form.get("option_momentum_percent", 2.0), 2.0)))
-    config["confirmation_timeout_seconds"] = clamp_int(request.form.get("confirmation_timeout_seconds", 10), 1, 300, 10)
+    config["option_momentum_percent"] = max(0.1, min(20.0, safe_float(request.form.get("option_momentum_percent", 1.0), 1.0)))
+    config["confirmation_timeout_seconds"] = clamp_int(request.form.get("confirmation_timeout_seconds", 60), 1, 300, 60)
+    config["pre_confirmation_max_drawdown_percent"] = max(0.0, min(50.0, safe_float(request.form.get("pre_confirmation_max_drawdown_percent", 5.0), 5.0)))
+    config["pending_entry_retry_cooldown_seconds"] = clamp_int(request.form.get("pending_entry_retry_cooldown_seconds", 60), 0, 600, 60)
     config["two_candle_or_confirmation_enabled"] = request.form.get("two_candle_or_confirmation_enabled") == "on"
     config["required_breakout_candles"] = clamp_int(request.form.get("required_breakout_candles", 2), 1, 10, 2)
     config["minimum_confidence"] = clamp_int(request.form.get("minimum_confidence", 2), 1, 10, 2)
@@ -4048,7 +4215,15 @@ Breakout Confirmation: {escape_html(pending.get("breakout_status") or "PASS")}<b
 <br>
 Starting Option Price: {fmt_premium(pending.get("starting_option_price"))}<br>
 Current Option Price: {fmt_premium(pending.get("current_option_price"))}<br>
+Confirmation Target Price: {fmt_premium(pending.get("confirmation_price"))}<br>
+Confirmation Price Source: {escape_html(pending.get("confirmation_price_source") or "N/A")}<br>
 Required Momentum %: {fmt_percent(pending.get("required_confirmation_percent"))}<br>
+Current Momentum Gain %: {fmt_percent(pending.get("current_momentum_gain_percent"))}<br>
+Current Pre-Confirmation Drawdown %: {fmt_percent(pending.get("current_pre_confirmation_drawdown_percent"))}<br>
+Maximum Allowed Drawdown %: {fmt_percent(pending.get("maximum_allowed_drawdown_percent"))}<br>
+Momentum Timeout: {escape_html(pending.get("momentum_timeout_seconds", 0))} sec<br>
+Elapsed Time: {escape_html(pending.get("elapsed_time_seconds", 0))} sec<br>
+Retry Cooldown Remaining: {escape_html(pending.get("retry_cooldown_remaining_seconds", 0))} sec<br>
 Current Breakout Candle: {escape_html(pending.get("current_breakout_candle", 0))}<br>
 Required Breakout Candles: {escape_html(pending.get("required_breakout_candles", 0))}<br>
 Breakout Level: {fmt_premium(pending.get("breakout_level"))}<br>
@@ -4079,6 +4254,18 @@ Option: {escape_html(row.get("option_symbol", ""))}<br>
 Signal Generated: {escape_html(row.get("signal_generated", ""))}<br>
 Momentum: {escape_html(row.get("momentum_status", "WAITING"))}<br>
 Breakout: {escape_html(row.get("breakout_status", "PASS"))} {escape_html(breakout_progress)}<br>
+Starting Option Price: {fmt_premium(row.get("starting_option_price"))}<br>
+Current Option Price: {fmt_premium(row.get("current_option_price"))}<br>
+Confirmation Target Price: {fmt_premium(row.get("confirmation_price"))}<br>
+Confirmation Price Source: {escape_html(row.get("confirmation_price_source", "N/A"))}<br>
+Current Momentum Gain %: {fmt_percent(row.get("current_momentum_gain_percent"))}<br>
+Current Pre-Confirmation Drawdown %: {fmt_percent(row.get("current_pre_confirmation_drawdown_percent"))}<br>
+Maximum Allowed Drawdown %: {fmt_percent(row.get("maximum_allowed_drawdown_percent"))}<br>
+Momentum Timeout: {escape_html(row.get("momentum_timeout_seconds", 0))} sec<br>
+Elapsed Time: {escape_html(row.get("elapsed_time_seconds", 0))} sec<br>
+Retry Cooldown Remaining: {escape_html(row.get("retry_cooldown_remaining_seconds", 0))} sec<br>
+Breakout Progress: {escape_html(breakout_progress)}<br>
+Final Cancellation Trigger: {escape_html(row.get("final_cancellation_trigger", ""))}<br>
 Final Status: {escape_html(final_status)}
 {buy_line}
 {cancel_line}
@@ -5113,10 +5300,16 @@ Enable Option Momentum Confirmation:
 <input type="checkbox" name="option_momentum_confirmation_enabled" {checked(config.get("option_momentum_confirmation_enabled", True))}><br>
 
 Confirmation Percent:
-<input type="number" step="0.1" min="0.1" max="20" name="option_momentum_percent" value="{config.get("option_momentum_percent", 2.0)}"><br>
+<input type="number" step="0.1" min="0.1" max="20" name="option_momentum_percent" value="{config.get("option_momentum_percent", 1.0)}"><br>
 
 Confirmation Timeout Seconds:
-<input type="number" min="1" max="300" name="confirmation_timeout_seconds" value="{config.get("confirmation_timeout_seconds", 10)}"><br>
+<input type="number" min="1" max="300" name="confirmation_timeout_seconds" value="{config.get("confirmation_timeout_seconds", 60)}"><br>
+
+Pre-Confirmation Max Drawdown %:
+<input type="number" step="0.1" min="0" max="50" name="pre_confirmation_max_drawdown_percent" value="{config.get("pre_confirmation_max_drawdown_percent", 5.0)}"><br>
+
+Pending Entry Retry Cooldown Seconds:
+<input type="number" min="0" max="600" name="pending_entry_retry_cooldown_seconds" value="{config.get("pending_entry_retry_cooldown_seconds", 60)}"><br>
 
 Enable Two-Candle OR Confirmation:
 <input type="checkbox" name="two_candle_or_confirmation_enabled" {checked(config.get("two_candle_or_confirmation_enabled", True))}><br>
@@ -5322,7 +5515,15 @@ Breakout Confirmation: ${{escapeHtml(pending.breakout_status || "PASS")}}<br>
 <br>
 Starting Option Price: ${{fmtMoney(pending.starting_option_price)}}<br>
 Current Option Price: ${{fmtMoney(pending.current_option_price)}}<br>
+Confirmation Target Price: ${{fmtMoney(pending.confirmation_price)}}<br>
+Confirmation Price Source: ${{escapeHtml(pending.confirmation_price_source || "N/A")}}<br>
 Required Momentum %: ${{fmtPercent(pending.required_confirmation_percent)}}<br>
+Current Momentum Gain %: ${{fmtPercent(pending.current_momentum_gain_percent)}}<br>
+Current Pre-Confirmation Drawdown %: ${{fmtPercent(pending.current_pre_confirmation_drawdown_percent)}}<br>
+Maximum Allowed Drawdown %: ${{fmtPercent(pending.maximum_allowed_drawdown_percent)}}<br>
+Momentum Timeout: ${{escapeHtml(pending.momentum_timeout_seconds ?? 0)}} sec<br>
+Elapsed Time: ${{escapeHtml(pending.elapsed_time_seconds ?? 0)}} sec<br>
+Retry Cooldown Remaining: ${{escapeHtml(pending.retry_cooldown_remaining_seconds ?? 0)}} sec<br>
 Current Breakout Candle: ${{escapeHtml(pending.current_breakout_candle ?? 0)}}<br>
 Required Breakout Candles: ${{escapeHtml(pending.required_breakout_candles ?? 0)}}<br>
 Breakout Level: ${{fmtMoney(pending.breakout_level)}}<br>
@@ -5355,6 +5556,18 @@ Option: ${{escapeHtml(row.option_symbol || "")}}<br>
 Signal Generated: ${{escapeHtml(row.signal_generated || "")}}<br>
 Momentum: ${{escapeHtml(row.momentum_status || "WAITING")}}<br>
 Breakout: ${{escapeHtml(row.breakout_status || "PASS")}} ${{escapeHtml(breakoutProgress)}}<br>
+Starting Option Price: ${{fmtMoney(row.starting_option_price)}}<br>
+Current Option Price: ${{fmtMoney(row.current_option_price)}}<br>
+Confirmation Target Price: ${{fmtMoney(row.confirmation_price)}}<br>
+Confirmation Price Source: ${{escapeHtml(row.confirmation_price_source || "N/A")}}<br>
+Current Momentum Gain %: ${{fmtPercent(row.current_momentum_gain_percent)}}<br>
+Current Pre-Confirmation Drawdown %: ${{fmtPercent(row.current_pre_confirmation_drawdown_percent)}}<br>
+Maximum Allowed Drawdown %: ${{fmtPercent(row.maximum_allowed_drawdown_percent)}}<br>
+Momentum Timeout: ${{escapeHtml(row.momentum_timeout_seconds ?? 0)}} sec<br>
+Elapsed Time: ${{escapeHtml(row.elapsed_time_seconds ?? 0)}} sec<br>
+Retry Cooldown Remaining: ${{escapeHtml(row.retry_cooldown_remaining_seconds ?? 0)}} sec<br>
+Breakout Progress: ${{escapeHtml(breakoutProgress)}}<br>
+Final Cancellation Trigger: ${{escapeHtml(row.final_cancellation_trigger || "")}}<br>
 Final Status: ${{escapeHtml(row.final_status || "WAITING")}}
 ${{buyLine}}
 ${{cancelLine}}

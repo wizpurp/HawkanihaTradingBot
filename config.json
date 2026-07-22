@@ -10,8 +10,8 @@
     "max_contract_price": 1.0,
     "contract_selection_mode": "strict_atm",
     "option_momentum_confirmation_enabled": true,
-    "option_momentum_percent": 2.0,
-    "confirmation_timeout_seconds": 10,
+    "option_momentum_percent": 1.0,
+    "confirmation_timeout_seconds": 60,
     "max_open_contracts": 1,
     "strategy": {
         "ema_fast": 1,
@@ -56,5 +56,7 @@
     "human_starting_account_balance": 2000.0,
     "minimum_dominance_percent": 60,
     "two_candle_or_confirmation_enabled": true,
-    "required_breakout_candles": 2
+    "required_breakout_candles": 2,
+    "pre_confirmation_max_drawdown_percent": 5.0,
+    "pending_entry_retry_cooldown_seconds": 60
 }
