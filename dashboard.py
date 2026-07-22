@@ -146,7 +146,23 @@ BOT_STATE = {
         "market_context": {}
     },
     "pending_entry_history": [],
-    "pending_entry_history_backup": []
+    "pending_entry_history_backup": [],
+    "opening_range_confirmation": {
+        "CALL": {
+            "count": 0,
+            "status": "WAITING",
+            "level": None,
+            "last_processed_candle": "",
+            "reason": ""
+        },
+        "PUT": {
+            "count": 0,
+            "status": "WAITING",
+            "level": None,
+            "last_processed_candle": "",
+            "reason": ""
+        }
+    }
 }
 
 
@@ -206,6 +222,8 @@ def load_config():
     config["option_momentum_confirmation_enabled"] = bool(config.get("option_momentum_confirmation_enabled", True))
     config["option_momentum_percent"] = max(0.1, min(20.0, safe_float(config.get("option_momentum_percent", 2.0), 2.0)))
     config["confirmation_timeout_seconds"] = clamp_int(config.get("confirmation_timeout_seconds", 10), 1, 300, 10)
+    config["two_candle_or_confirmation_enabled"] = bool(config.get("two_candle_or_confirmation_enabled", True))
+    config["required_breakout_candles"] = clamp_int(config.get("required_breakout_candles", 2), 1, 10, 2)
     config.setdefault("minimum_confidence", 2)
     config["minimum_confidence"] = clamp_int(config.get("minimum_confidence", 2), 1, 10, 2)
     config["minimum_dominance_percent"] = clamp_int(config.get("minimum_dominance_percent", 60), 50, 100, 60)
@@ -1196,12 +1214,28 @@ def upsert_pending_history(pending, final_status=None, cancellation_reason=None,
 
 
 def create_pending_entry(config, decision, side, contract, contracts, start_price, market_context):
-    momentum_percent = float(config.get("option_momentum_percent", 2.0))
+    momentum_enabled = bool(config.get("option_momentum_confirmation_enabled", True))
+    breakout_enabled = bool(config.get("two_candle_or_confirmation_enabled", True))
+    momentum_percent = float(config.get("option_momentum_percent", 2.0)) if momentum_enabled else 0
     timeout_seconds = int(config.get("confirmation_timeout_seconds", 10))
     started_epoch = time.time()
     timestamp = market_now().strftime("%H:%M:%S")
     pending_id = f"{market_now().strftime('%Y%m%d%H%M%S%f')}-{contract.get('symbol', '')}"
-    confirmation_price = start_price * (1 + momentum_percent / 100)
+    confirmation_price = start_price * (1 + momentum_percent / 100) if momentum_enabled else start_price
+    opposite_side = "PUT" if side == "CALL" else "CALL" if side == "PUT" else ""
+    reset_opening_range_confirmation(opposite_side)
+    breakout = initialize_opening_range_breakout_confirmation(config, side) if breakout_enabled else {
+        "status": "PASS",
+        "count": 0,
+        "required": 0,
+        "level": None,
+        "reason": "two-candle opening-range confirmation disabled"
+    }
+    breakout_status = breakout.get("status", "WAITING")
+    momentum_status = "WAITING" if momentum_enabled else "PASS"
+    status = "WAITING FOR MOMENTUM" if momentum_enabled else "WAITING FOR BREAKOUT"
+    if momentum_status == "PASS" and breakout_status == "PASS":
+        status = "CONFIRMED"
     pending = {
         "active": True,
         "id": pending_id,
@@ -1211,18 +1245,18 @@ def create_pending_entry(config, decision, side, contract, contracts, start_pric
         "decision": decision,
         "option_symbol": contract.get("symbol", ""),
         "signal_generated": decision,
-        "momentum_status": "WAITING",
-        "breakout_status": "PASS",
-        "current_breakout_candle": 0,
-        "required_breakout_candles": 0,
-        "breakout_level": None,
+        "momentum_status": momentum_status,
+        "breakout_status": breakout_status,
+        "current_breakout_candle": breakout.get("count", 0),
+        "required_breakout_candles": breakout.get("required", 0),
+        "breakout_level": breakout.get("level"),
         "starting_option_price": start_price,
         "required_confirmation_percent": momentum_percent,
         "confirmation_price": confirmation_price,
         "current_option_price": start_price,
         "time_remaining_seconds": timeout_seconds,
-        "status": "WAITING FOR MOMENTUM",
-        "reason": "",
+        "status": status,
+        "reason": breakout.get("reason", ""),
         "started_epoch": started_epoch,
         "expires_epoch": started_epoch + timeout_seconds,
         "contracts": contracts,
@@ -1233,7 +1267,8 @@ def create_pending_entry(config, decision, side, contract, contracts, start_pric
     upsert_pending_history(pending, final_status="WAITING")
     add_bot_reason(
         f"PENDING BUY {side}: {contract.get('symbol', '')} start {start_price:.2f}, "
-        f"confirm {confirmation_price:.2f}, timeout {timeout_seconds}s"
+        f"confirm {confirmation_price:.2f}, breakout {breakout_status} "
+        f"{breakout.get('count', 0)}/{breakout.get('required', 0)}, timeout {timeout_seconds}s"
     )
     log_bot_audit(
         "PENDING ENTRY",
@@ -1243,7 +1278,7 @@ def create_pending_entry(config, decision, side, contract, contracts, start_pric
         config,
         option_symbol=contract.get("symbol", ""),
         current_price=start_price,
-        skip_reason="waiting for option momentum confirmation"
+        skip_reason="waiting for entry confirmation"
     )
 
 
@@ -1522,6 +1557,206 @@ def high_low_from_bars(bars):
     if not bars:
         return None, None
     return max(bar["high"] for bar in bars), min(bar["low"] for bar in bars)
+
+
+def completed_intraday_bars(symbol, now=None):
+    now = now or market_now()
+    return [
+        bar for bar in get_intraday_bars(symbol)
+        if bar.get("time") and bar["time"] + timedelta(minutes=1) <= now
+    ]
+
+
+def default_opening_range_confirmation_state():
+    return {
+        "count": 0,
+        "status": "WAITING",
+        "level": None,
+        "last_processed_candle": "",
+        "reason": ""
+    }
+
+
+def reset_opening_range_confirmation(direction):
+    direction = str(direction or "").upper()
+    if direction not in ["CALL", "PUT"]:
+        return
+    with BOT_LOCK:
+        BOT_STATE["opening_range_confirmation"][direction] = default_opening_range_confirmation_state()
+
+
+def initialize_opening_range_breakout_confirmation(config, direction):
+    direction = str(direction or "").upper()
+    required = clamp_int(config.get("required_breakout_candles", 2), 1, 10, 2)
+    if not config.get("two_candle_or_confirmation_enabled", True):
+        return {
+            "status": "PASS",
+            "count": 0,
+            "required": 0,
+            "level": None,
+            "last_processed_candle": "",
+            "reason": "two-candle opening-range confirmation disabled"
+        }
+
+    now = market_now()
+    today = now.date()
+    symbol = config.get("symbol", "SPY")
+    opening_range_start = datetime_time(9, 30)
+    opening_range_end = parse_clock(config.get("decision_time", "09:35"))
+    bars = completed_intraday_bars(symbol, now)
+    opening_bars = [
+        bar for bar in bars
+        if bar["time"].date() == today and opening_range_start <= bar["time"].time() < opening_range_end
+    ]
+    opening_high, opening_low = high_low_from_bars(opening_bars)
+    level = opening_high if direction == "CALL" else opening_low if direction == "PUT" else None
+    confirmation_bars = [
+        bar for bar in bars
+        if bar["time"].date() == today
+        and opening_range_end <= bar["time"].time() <= datetime_time(16, 0)
+    ]
+    last_processed = confirmation_bars[-1]["time"].strftime("%Y-%m-%d %H:%M:%S") if confirmation_bars else ""
+    state = {
+        "count": 0,
+        "status": "WAITING",
+        "level": level,
+        "last_processed_candle": last_processed,
+        "reason": "waiting for completed breakout candle after signal"
+    }
+    if level is None:
+        state["reason"] = "opening range candles unavailable"
+
+    with BOT_LOCK:
+        BOT_STATE["opening_range_confirmation"][direction] = dict(state)
+    return {
+        "status": state["status"],
+        "count": state["count"],
+        "required": required,
+        "level": state["level"],
+        "last_processed_candle": state["last_processed_candle"],
+        "reason": state["reason"]
+    }
+
+
+def update_opening_range_breakout_confirmation(config, direction):
+    direction = str(direction or "").upper()
+    required = clamp_int(config.get("required_breakout_candles", 2), 1, 10, 2)
+    if direction not in ["CALL", "PUT"]:
+        return {
+            "status": "FAIL",
+            "count": 0,
+            "required": required,
+            "level": None,
+            "reason": "invalid breakout direction"
+        }
+
+    if not config.get("two_candle_or_confirmation_enabled", True):
+        return {
+            "status": "PASS",
+            "count": required,
+            "required": required,
+            "level": None,
+            "reason": "two-candle opening-range confirmation disabled"
+        }
+
+    now = market_now()
+    today = now.date()
+    symbol = config.get("symbol", "SPY")
+    opening_range_start = datetime_time(9, 30)
+    opening_range_end = parse_clock(config.get("decision_time", "09:35"))
+
+    with BOT_LOCK:
+        state = dict(BOT_STATE.get("opening_range_confirmation", {}).get(direction) or default_opening_range_confirmation_state())
+
+    if now.time() < opening_range_end:
+        state.update({
+            "count": 0,
+            "status": "WAITING",
+            "level": None,
+            "reason": "opening range is not complete"
+        })
+        with BOT_LOCK:
+            BOT_STATE["opening_range_confirmation"][direction] = dict(state)
+        return {
+            "status": state["status"],
+            "count": state["count"],
+            "required": required,
+            "level": state["level"],
+            "reason": state["reason"]
+        }
+
+    bars = completed_intraday_bars(symbol, now)
+    opening_bars = [
+        bar for bar in bars
+        if bar["time"].date() == today and opening_range_start <= bar["time"].time() < opening_range_end
+    ]
+    opening_high, opening_low = high_low_from_bars(opening_bars)
+    level = opening_high if direction == "CALL" else opening_low
+
+    if level is None:
+        state.update({
+            "count": 0,
+            "status": "WAITING",
+            "level": None,
+            "reason": "opening range candles unavailable"
+        })
+        with BOT_LOCK:
+            BOT_STATE["opening_range_confirmation"][direction] = dict(state)
+        return {
+            "status": state["status"],
+            "count": state["count"],
+            "required": required,
+            "level": state["level"],
+            "reason": state["reason"]
+        }
+
+    confirmation_bars = [
+        bar for bar in bars
+        if bar["time"].date() == today
+        and opening_range_end <= bar["time"].time() <= datetime_time(16, 0)
+    ]
+    last_processed = state.get("last_processed_candle") or ""
+    new_bars = [
+        bar for bar in confirmation_bars
+        if bar["time"].strftime("%Y-%m-%d %H:%M:%S") > last_processed
+    ]
+
+    state["level"] = level
+    state["required"] = required
+    for bar in new_bars:
+        candle_id = bar["time"].strftime("%Y-%m-%d %H:%M:%S")
+        close_price = float(bar.get("close") or 0)
+        closes_beyond_level = close_price > level if direction == "CALL" else close_price < level
+
+        if closes_beyond_level:
+            state["count"] = min(required, int(state.get("count") or 0) + 1)
+            state["status"] = "PASS" if state["count"] >= required else "WAITING"
+            state["reason"] = (
+                f"{direction} breakout candle {state['count']}/{required}: "
+                f"{close_price:.2f} {'>' if direction == 'CALL' else '<'} {level:.2f}"
+            )
+        else:
+            state["count"] = 0
+            state["status"] = "FAIL"
+            state["reason"] = f"{direction} breakout reset: candle closed inside opening range"
+
+        state["last_processed_candle"] = candle_id
+
+    if not new_bars and state.get("status") != "PASS":
+        state["status"] = "WAITING"
+        state["reason"] = state.get("reason") or "waiting for completed breakout candle"
+
+    with BOT_LOCK:
+        BOT_STATE["opening_range_confirmation"][direction] = dict(state)
+
+    return {
+        "status": state.get("status", "WAITING"),
+        "count": int(state.get("count") or 0),
+        "required": required,
+        "level": state.get("level"),
+        "last_processed_candle": state.get("last_processed_candle", ""),
+        "reason": state.get("reason", "")
+    }
 
 
 def build_real_market_structure(symbol, quote, current_price, config=None):
@@ -2227,7 +2462,7 @@ def try_surfer_entry(config, positions, market_context, call, put):
         log_bot_audit("SKIP", decision, config.get("symbol", ""), market_context, config, option_symbol=contract.get("symbol", ""), skip_reason="budget exceeded")
         return
 
-    if config.get("option_momentum_confirmation_enabled", True):
+    if config.get("option_momentum_confirmation_enabled", True) or config.get("two_candle_or_confirmation_enabled", True):
         create_pending_entry(config, decision, side, contract, contracts, ask, market_context)
         return
 
@@ -2247,6 +2482,8 @@ def process_pending_entry(config):
     market_context = pending.get("market_context") or current_market_context_snapshot()
     start_price = safe_float(pending.get("starting_option_price"))
     confirmation_price = safe_float(pending.get("confirmation_price"))
+    momentum_enabled = bool(config.get("option_momentum_confirmation_enabled", True))
+    breakout_enabled = bool(config.get("two_candle_or_confirmation_enabled", True))
 
     if not config.get("bot_enabled"):
         pending["active"] = False
@@ -2275,13 +2512,27 @@ def process_pending_entry(config):
     quote = get_market_quote(option_symbol)
     current_price = get_quote_price(quote)
     pending["current_option_price"] = current_price
+    breakout = update_opening_range_breakout_confirmation(config, side) if breakout_enabled else {
+        "status": "PASS",
+        "count": 0,
+        "required": 0,
+        "level": None,
+        "reason": "two-candle opening-range confirmation disabled"
+    }
+    pending["breakout_status"] = breakout.get("status", "WAITING")
+    pending["current_breakout_candle"] = breakout.get("count", 0)
+    pending["required_breakout_candles"] = breakout.get("required", 0)
+    pending["breakout_level"] = breakout.get("level")
     refresh_pending_time_remaining(pending)
 
     if time.time() >= float(pending.get("expires_epoch") or 0):
         pending["active"] = False
         pending["status"] = "CANCELLED"
         pending["reason"] = "confirmation timeout expired"
-        pending["momentum_status"] = "FAIL"
+        if pending.get("momentum_status") != "PASS":
+            pending["momentum_status"] = "FAIL"
+        if pending.get("breakout_status") != "PASS":
+            pending["breakout_status"] = "FAIL"
         set_pending_entry(pending)
         upsert_pending_history(pending, final_status="CANCELLED", cancellation_reason=pending["reason"])
         add_bot_reason("PENDING BUY cancelled: confirmation timeout expired")
@@ -2305,9 +2556,13 @@ def process_pending_entry(config):
     print("required_confirmation_percent:", pending.get("required_confirmation_percent"))
     print("confirmation_price:", confirmation_price)
     print("current_option_price:", current_price)
+    print("breakout_status:", pending.get("breakout_status"))
+    print("current_breakout_candle:", pending.get("current_breakout_candle"))
+    print("required_breakout_candles:", pending.get("required_breakout_candles"))
+    print("breakout_level:", pending.get("breakout_level"))
     print("time_remaining_seconds:", pending.get("time_remaining_seconds"))
 
-    if current_price < start_price:
+    if momentum_enabled and current_price < start_price:
         pending["active"] = False
         pending["status"] = "CANCELLED"
         pending["reason"] = "option price fell before confirmation"
@@ -2318,13 +2573,23 @@ def process_pending_entry(config):
         log_bot_audit("SKIP", decision, config.get("symbol", ""), market_context, config, option_symbol=option_symbol, current_price=current_price, skip_reason="pending entry cancelled: option price fell before confirmation")
         return True
 
-    if current_price >= confirmation_price:
-        pending["status"] = "CONFIRMED"
-        pending["reason"] = "option momentum confirmed"
+    if not momentum_enabled:
         pending["momentum_status"] = "PASS"
+    elif current_price >= confirmation_price:
+        pending["momentum_status"] = "PASS"
+
+    momentum_passed = pending.get("momentum_status") == "PASS"
+    breakout_passed = pending.get("breakout_status") == "PASS"
+
+    if momentum_passed and breakout_passed:
+        pending["status"] = "CONFIRMED"
+        pending["reason"] = "option momentum and opening-range breakout confirmed"
         pending["active"] = False
         set_pending_entry(pending)
-        add_bot_reason(f"PENDING BUY confirmed: {current_price:.2f} >= {confirmation_price:.2f}")
+        add_bot_reason(
+            f"PENDING BUY confirmed: momentum {current_price:.2f} >= {confirmation_price:.2f}; "
+            f"breakout {pending.get('current_breakout_candle')}/{pending.get('required_breakout_candles')}"
+        )
         buy_submitted = execute_entry_buy(config, decision, side, contract, contracts, current_price, market_context, label="MOMENTUM ENTRY")
         upsert_pending_history(
             pending,
@@ -2333,9 +2598,13 @@ def process_pending_entry(config):
         )
         return True
 
-    pending["status"] = "WAITING FOR MOMENTUM"
-    pending["reason"] = "waiting for option price confirmation"
-    pending["momentum_status"] = "WAITING"
+    if not momentum_passed:
+        pending["status"] = "WAITING FOR MOMENTUM"
+        pending["reason"] = "waiting for option price confirmation"
+        pending["momentum_status"] = "WAITING"
+    elif not breakout_passed:
+        pending["status"] = "WAITING FOR BREAKOUT"
+        pending["reason"] = breakout.get("reason") or "waiting for two completed opening-range breakout candles"
     set_pending_entry(pending)
     upsert_pending_history(pending, final_status="WAITING")
     return True
@@ -3352,6 +3621,8 @@ def save_settings():
     config["option_momentum_confirmation_enabled"] = request.form.get("option_momentum_confirmation_enabled") == "on"
     config["option_momentum_percent"] = max(0.1, min(20.0, safe_float(request.form.get("option_momentum_percent", 2.0), 2.0)))
     config["confirmation_timeout_seconds"] = clamp_int(request.form.get("confirmation_timeout_seconds", 10), 1, 300, 10)
+    config["two_candle_or_confirmation_enabled"] = request.form.get("two_candle_or_confirmation_enabled") == "on"
+    config["required_breakout_candles"] = clamp_int(request.form.get("required_breakout_candles", 2), 1, 10, 2)
     config["minimum_confidence"] = clamp_int(request.form.get("minimum_confidence", 2), 1, 10, 2)
     config["minimum_dominance_percent"] = clamp_int(request.form.get("minimum_dominance_percent", 60), 50, 100, 60)
     history = config.setdefault("history", {})
@@ -4846,6 +5117,12 @@ Confirmation Percent:
 
 Confirmation Timeout Seconds:
 <input type="number" min="1" max="300" name="confirmation_timeout_seconds" value="{config.get("confirmation_timeout_seconds", 10)}"><br>
+
+Enable Two-Candle OR Confirmation:
+<input type="checkbox" name="two_candle_or_confirmation_enabled" {checked(config.get("two_candle_or_confirmation_enabled", True))}><br>
+
+Required Breakout Candles:
+<input type="number" min="1" max="10" name="required_breakout_candles" value="{config.get("required_breakout_candles", 2)}"><br>
 </div>
 
 EMA Alignment:
