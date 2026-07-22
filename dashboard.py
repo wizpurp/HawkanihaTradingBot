@@ -44,6 +44,9 @@ DEFAULT_HISTORY_LIMIT = 20
 BOT_AUDIT_FILE = os.path.join(APP_DIR, "bot_audit_log.csv")
 BOT_AUDIT_VISIBLE_FILE = os.path.join(APP_DIR, "dashboard_bot_audit_visible.csv")
 BOT_AUDIT_BACKUP_FILE = os.path.join(APP_DIR, "dashboard_bot_audit_last_cleared.csv")
+PENDING_ENTRY_HISTORY_FILE = os.path.join(APP_DIR, "pending_entry_history.json")
+PENDING_ENTRY_HISTORY_VISIBLE_FILE = os.path.join(APP_DIR, "dashboard_pending_entry_history_visible.json")
+PENDING_ENTRY_HISTORY_BACKUP_FILE = os.path.join(APP_DIR, "dashboard_pending_entry_history_last_cleared.json")
 BOT_AUDIT_COLUMNS = [
     "timestamp", "action", "decision", "symbol", "option_symbol",
     "market_state", "bullish_score", "bearish_score", "confidence",
@@ -1140,16 +1143,55 @@ def pending_history_record(pending, final_status=None, cancellation_reason=None,
     }
 
 
+def load_json_history(path):
+    try:
+        if not os.path.exists(path):
+            return []
+        with open(path, "r") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except:
+        return []
+
+
+def write_json_history(path, rows):
+    with open(path, "w") as f:
+        json.dump(list(rows or []), f, indent=2)
+
+
+def load_pending_history_rows(limit=None, visible=True):
+    if visible and os.path.exists(PENDING_ENTRY_HISTORY_VISIBLE_FILE):
+        rows = load_json_history(PENDING_ENTRY_HISTORY_VISIBLE_FILE)
+    else:
+        rows = load_json_history(PENDING_ENTRY_HISTORY_FILE)
+    return rows[-limit:] if limit else rows
+
+
+def write_pending_history_rows(rows, visible=True):
+    path = PENDING_ENTRY_HISTORY_VISIBLE_FILE if visible else PENDING_ENTRY_HISTORY_FILE
+    write_json_history(path, rows)
+
+
+def upsert_history_record(rows, record):
+    updated_rows = list(rows or [])
+    existing_index = next((index for index, item in enumerate(updated_rows) if item.get("id") == record.get("id")), None)
+    if existing_index is None:
+        updated_rows.append(record)
+    else:
+        updated_rows[existing_index].update(record)
+    return updated_rows
+
+
 def upsert_pending_history(pending, final_status=None, cancellation_reason=None, buy_submitted=False):
     record = pending_history_record(pending, final_status, cancellation_reason, buy_submitted)
+    permanent_history = upsert_history_record(load_pending_history_rows(visible=False), record)
+    write_pending_history_rows(permanent_history, visible=False)
+
+    visible_history = upsert_history_record(load_pending_history_rows(visible=True), record)
+    write_pending_history_rows(visible_history, visible=True)
+
     with BOT_LOCK:
-        history = list(BOT_STATE.get("pending_entry_history") or [])
-        existing_index = next((index for index, item in enumerate(history) if item.get("id") == record.get("id")), None)
-        if existing_index is None:
-            history.append(record)
-        else:
-            history[existing_index].update(record)
-        BOT_STATE["pending_entry_history"] = history
+        BOT_STATE["pending_entry_history"] = visible_history
     return record
 
 
@@ -1211,20 +1253,31 @@ def pending_entry_snapshot():
 
 
 def pending_entry_history_snapshot(limit=None):
-    history = list(BOT_STATE.get("pending_entry_history") or [])
+    history = load_pending_history_rows(visible=True)
     return history[-limit:] if limit else history
 
 
 def clear_pending_entry_history():
+    current_history = load_pending_history_rows(visible=True)
+    write_json_history(PENDING_ENTRY_HISTORY_BACKUP_FILE, current_history)
+    write_pending_history_rows([], visible=True)
     with BOT_LOCK:
-        BOT_STATE["pending_entry_history_backup"] = list(BOT_STATE.get("pending_entry_history") or [])
+        BOT_STATE["pending_entry_history_backup"] = current_history
         BOT_STATE["pending_entry_history"] = []
 
 
 def restore_pending_entry_history():
+    backup_history = load_json_history(PENDING_ENTRY_HISTORY_BACKUP_FILE)
+    write_pending_history_rows(backup_history, visible=True)
     with BOT_LOCK:
-        BOT_STATE["pending_entry_history"] = list(BOT_STATE.get("pending_entry_history_backup") or [])
+        BOT_STATE["pending_entry_history_backup"] = backup_history
+        BOT_STATE["pending_entry_history"] = backup_history
     return True
+
+
+def initialize_pending_entry_history():
+    with BOT_LOCK:
+        BOT_STATE["pending_entry_history"] = load_pending_history_rows(visible=True)
 
 
 def parse_clock(value, default_hour=9, default_minute=35):
@@ -2927,6 +2980,9 @@ def api_bot_state():
     config = load_config()
     sync_trade_limits_from_file(config)
     pending_history_limit = history_limit(config, "pending_entry_limit")
+    bot_trades_limit = history_limit(config, "bot_trades_limit")
+    trade_history_limit = history_limit(config, "trade_history_limit")
+    bot_audit_limit = history_limit(config, "bot_audit_limit")
 
     with BOT_LOCK:
         pending_entry = refresh_pending_time_remaining(dict(BOT_STATE.get("pending_entry") or default_pending_entry()))
@@ -2973,6 +3029,12 @@ def api_bot_state():
             "last_signal_ms": BOT_STATE["last_signal_ms"],
             "pending_entry": pending_entry,
             "pending_entry_history": pending_entry_history_snapshot(pending_history_limit),
+            "history_limits": {
+                "pending_entry_limit": pending_history_limit,
+                "bot_trades_limit": bot_trades_limit,
+                "trade_history_limit": trade_history_limit,
+                "bot_audit_limit": bot_audit_limit
+            },
             "config_strategy": dict(config.get("strategy", {}))
         })
 
@@ -4992,11 +5054,12 @@ Reason: ${{escapeHtml(pending.reason || "Waiting for option momentum confirmatio
 </div>`;
 }}
 
-function renderPendingEntryHistory(history) {{
+function renderPendingEntryHistory(history, limit) {{
     const el = document.getElementById("pending-entry-history-content");
     if (!el) return;
 
-    const rows = (history || []).slice(-20).reverse();
+    limit = Number(limit || {DEFAULT_HISTORY_LIMIT});
+    const rows = (history || []).slice(-limit).reverse();
     if (!rows.length) {{
         el.innerHTML = "No pending entry history.";
         return;
@@ -5039,8 +5102,9 @@ async function updateBotState() {{
     setText("bot-confidence", data.confidence);
     setText("bot-dominance", Number(data.dominance_percent || 0).toFixed(1));
     setText("bot-current-signal", data.current_signal);
+    const pendingHistoryLimit = Number(data.history_limits?.pending_entry_limit || {DEFAULT_HISTORY_LIMIT});
     renderPendingEntry(data.pending_entry);
-    renderPendingEntryHistory(data.pending_entry_history);
+    renderPendingEntryHistory(data.pending_entry_history, pendingHistoryLimit);
     setText("bot-last-action", data.last_action);
     setText("bot-trades-today", data.trades_today);
     renderReasonLog(data.reason_log);
@@ -5231,5 +5295,6 @@ document.addEventListener("DOMContentLoaded", async () => {{
 
 
 if __name__ == "__main__":
+    initialize_pending_entry_history()
     threading.Thread(target=surfer_bot_loop, daemon=True).start()
     app.run(host="127.0.0.1", port=5000)
