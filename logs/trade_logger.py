@@ -22,6 +22,9 @@ TRADE_COLUMNS = [
     "Source", "EntryGrade", "LiveGrade", "ExitGrade", "BotGrade", "OverallGrade",
     "TradeScore", "GradeReason", "HoldTime", "PeakPrice",
     "HardStopPrice", "TrailingStopPrice", "MaxDrawdownFromPeakPercent",
+    "ProfitLockEnabled", "ProfitLockActivated", "ProfitLockActivationPrice",
+    "MinimumProfitFloor", "PercentageTrailingStop", "EffectiveTrailingStop",
+    "StopControlRule",
     "PnLPercent", "ExitReason", "EntryPriceSource", "EstimatedEntryPrice",
     "EntryMarketState", "EntryBullishScore", "EntryBearishScore",
     "EntryConfidence", "EntryDominancePercent", "EntryDecision", "EntryReasonLog",
@@ -170,6 +173,13 @@ def log_trade(
     peak_price = ""
     hard_stop_price = ""
     trailing_stop_price = ""
+    profit_lock_enabled = ""
+    profit_lock_activated = ""
+    profit_lock_activation_price = ""
+    minimum_profit_floor = ""
+    percentage_trailing_stop = ""
+    effective_trailing_stop = ""
+    stop_control_rule = ""
     max_drawdown_from_peak_percent = ""
     pnl_percent = ""
     exit_reason = ""
@@ -214,15 +224,24 @@ def log_trade(
             peak_price = stop_values["peak_price"]
             hard_stop_price = stop_values["hard_stop_price"]
             trailing_stop_price = stop_values["trailing_stop_price"]
+            profit_lock_enabled = stop_values.get("profit_lock_enabled", "")
+            profit_lock_activated = stop_values.get("profit_lock_activated", "")
+            profit_lock_activation_price = stop_values.get("profit_lock_activation_price", "")
+            minimum_profit_floor = stop_values.get("minimum_profit_floor", "")
+            percentage_trailing_stop = stop_values.get("percentage_trailing_stop", "")
+            effective_trailing_stop = stop_values.get("effective_trailing_stop", trailing_stop_price)
+            stop_control_rule = stop_values.get("stop_control_rule", "")
             max_drawdown_from_peak_percent = stop_values["drawdown_from_peak_percent"]
             trailing_percent = stop_values["trailing_stop_percent"]
+            effective_stop = stop_values.get("effective_trailing_stop", trailing_stop_price)
+            stop_control_rule = stop_values.get("stop_control_rule", "")
             if not stop_values.get("stop_armed", False):
-                trailing_lines = ["Trailing stop inactive.", "Trailing stop price has not reached entry."]
+                trailing_lines = ["Trailing stop inactive.", "Effective stop has not reached entry."]
             else:
                 trailing_lines = (
-                    ["Trailing stop hit.", f"Drawdown {max_drawdown_from_peak_percent:.2f}% >= {trailing_percent:.2f}%."]
-                    if max_drawdown_from_peak_percent >= trailing_percent
-                    else ["Trailing stop not hit.", f"Drawdown {max_drawdown_from_peak_percent:.2f}% < {trailing_percent:.2f}%."]
+                    ["Trailing stop hit.", f"Current {sell_price:.2f} <= effective stop {safe_float(effective_stop):.2f}.", f"Rule: {stop_control_rule}."]
+                    if sell_price <= safe_float(effective_stop)
+                    else ["Trailing stop not hit.", f"Drawdown {max_drawdown_from_peak_percent:.2f}% < {trailing_percent:.2f}%.", f"Rule: {stop_control_rule}."]
                 )
             exit_reason = "\n".join(trailing_lines + [str(reason) for reason in (market_context.get("decision_reasons") or [])])
 
@@ -245,6 +264,13 @@ def log_trade(
         "PeakPrice": peak_price,
         "HardStopPrice": hard_stop_price,
         "TrailingStopPrice": trailing_stop_price,
+        "ProfitLockEnabled": profit_lock_enabled,
+        "ProfitLockActivated": profit_lock_activated,
+        "ProfitLockActivationPrice": profit_lock_activation_price,
+        "MinimumProfitFloor": minimum_profit_floor,
+        "PercentageTrailingStop": percentage_trailing_stop,
+        "EffectiveTrailingStop": effective_trailing_stop,
+        "StopControlRule": stop_control_rule,
         "MaxDrawdownFromPeakPercent": max_drawdown_from_peak_percent,
         "PnLPercent": pnl_percent,
         "ExitReason": exit_reason,
