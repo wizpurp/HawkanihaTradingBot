@@ -27,9 +27,8 @@
         "trailing_stop_percent": 15.0,
         "exit_poll_interval_ms": 1000,
         "direction_threshold_percent": 60.0,
-        "enable_minimum_profit_lock": true,
-        "profit_lock_activation_gain": 1.0,
-        "minimum_locked_profit": 0.5
+        "enable_profit_floor_trailing_stop": true,
+        "locked_profit_amount": 0.0
     },
     "scanner": {
         "interval_seconds": 60

@@ -22,8 +22,8 @@ TRADE_COLUMNS = [
     "Source", "EntryGrade", "LiveGrade", "ExitGrade", "BotGrade", "OverallGrade",
     "TradeScore", "GradeReason", "HoldTime", "PeakPrice",
     "HardStopPrice", "TrailingStopPrice", "MaxDrawdownFromPeakPercent",
-    "ProfitLockEnabled", "ProfitLockActivated", "ProfitLockActivationPrice",
-    "MinimumProfitFloor", "PercentageTrailingStop", "EffectiveTrailingStop",
+    "ProfitFloorEnabled", "LockedProfitAmount", "ProfitFloorPrice",
+    "ProfitFloorActivated", "PercentageTrailingStop", "EffectiveTrailingStop",
     "StopControlRule",
     "PnLPercent", "ExitReason", "EntryPriceSource", "EstimatedEntryPrice",
     "EntryMarketState", "EntryBullishScore", "EntryBearishScore",
@@ -173,10 +173,10 @@ def log_trade(
     peak_price = ""
     hard_stop_price = ""
     trailing_stop_price = ""
-    profit_lock_enabled = ""
-    profit_lock_activated = ""
-    profit_lock_activation_price = ""
-    minimum_profit_floor = ""
+    profit_floor_enabled = ""
+    locked_profit_amount = ""
+    profit_floor_price = ""
+    profit_floor_activated = ""
     percentage_trailing_stop = ""
     effective_trailing_stop = ""
     stop_control_rule = ""
@@ -224,10 +224,10 @@ def log_trade(
             peak_price = stop_values["peak_price"]
             hard_stop_price = stop_values["hard_stop_price"]
             trailing_stop_price = stop_values["trailing_stop_price"]
-            profit_lock_enabled = stop_values.get("profit_lock_enabled", "")
-            profit_lock_activated = stop_values.get("profit_lock_activated", "")
-            profit_lock_activation_price = stop_values.get("profit_lock_activation_price", "")
-            minimum_profit_floor = stop_values.get("minimum_profit_floor", "")
+            profit_floor_enabled = stop_values.get("profit_floor_enabled", "")
+            locked_profit_amount = stop_values.get("locked_profit_amount", "")
+            profit_floor_price = stop_values.get("profit_floor_price", "")
+            profit_floor_activated = stop_values.get("profit_floor_activated", "")
             percentage_trailing_stop = stop_values.get("percentage_trailing_stop", "")
             effective_trailing_stop = stop_values.get("effective_trailing_stop", trailing_stop_price)
             stop_control_rule = stop_values.get("stop_control_rule", "")
@@ -264,10 +264,10 @@ def log_trade(
         "PeakPrice": peak_price,
         "HardStopPrice": hard_stop_price,
         "TrailingStopPrice": trailing_stop_price,
-        "ProfitLockEnabled": profit_lock_enabled,
-        "ProfitLockActivated": profit_lock_activated,
-        "ProfitLockActivationPrice": profit_lock_activation_price,
-        "MinimumProfitFloor": minimum_profit_floor,
+        "ProfitFloorEnabled": profit_floor_enabled,
+        "LockedProfitAmount": locked_profit_amount,
+        "ProfitFloorPrice": profit_floor_price,
+        "ProfitFloorActivated": profit_floor_activated,
         "PercentageTrailingStop": percentage_trailing_stop,
         "EffectiveTrailingStop": effective_trailing_stop,
         "StopControlRule": stop_control_rule,
@@ -442,3 +442,4 @@ def read_permanent_trades():
             return list(csv.DictReader(f))
     except:
         return []
+

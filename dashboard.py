@@ -62,8 +62,8 @@ BOT_AUDIT_COLUMNS = [
     "calculated_stop_price", "stop_armed", "no_sell_reason",
     "sell_trigger_reason", "trailing_drawdown_percent",
     "entry_price_source", "estimated_entry_price",
-    "profit_lock_enabled", "profit_lock_activated",
-    "profit_lock_activation_price", "minimum_profit_floor",
+    "profit_floor_enabled", "locked_profit_amount",
+    "profit_floor_price", "profit_floor_activated",
     "percentage_trailing_stop", "effective_trailing_stop",
     "stop_control_rule"
 ]
@@ -98,7 +98,7 @@ BOT_STATE = {
     "running": False,
     "day": None,
     "position_peaks": {},
-    "position_profit_lock_active": {},
+    "position_profit_floor_active": {},
     "position_effective_stops": {},
     "position_max_profit": {},
     "position_max_drawdown": {},
@@ -254,9 +254,8 @@ def load_config():
     config["strategy"].setdefault("use_volume", False)
     config["strategy"].setdefault("hard_stop_percent", 20)
     config["strategy"].setdefault("trailing_stop_percent", 15)
-    config["strategy"]["enable_minimum_profit_lock"] = bool(config["strategy"].get("enable_minimum_profit_lock", True))
-    config["strategy"]["profit_lock_activation_gain"] = max(0.0, safe_float(config["strategy"].get("profit_lock_activation_gain", 1.0), 1.0))
-    config["strategy"]["minimum_locked_profit"] = max(0.0, safe_float(config["strategy"].get("minimum_locked_profit", 0.50), 0.50))
+    config["strategy"]["enable_profit_floor_trailing_stop"] = bool(config["strategy"].get("enable_profit_floor_trailing_stop", True))
+    config["strategy"]["locked_profit_amount"] = max(0.0, min(2.0, safe_float(config["strategy"].get("locked_profit_amount", 0.0), 0.0)))
     config["strategy"]["exit_poll_interval_ms"] = clamp_int(
         config["strategy"].get("exit_poll_interval_ms", 1000),
         100,
@@ -462,13 +461,12 @@ def calculate_stop_state(symbol, entry_price, current_price, config=None, update
     strategy = config.get("strategy", {})
     hard_stop_percent = float(strategy.get("hard_stop_percent", 20))
     trailing_stop_percent = float(strategy.get("trailing_stop_percent", 15))
-    profit_lock_enabled = bool(strategy.get("enable_minimum_profit_lock", True))
-    profit_lock_activation_gain = max(0.0, safe_float(strategy.get("profit_lock_activation_gain", 1.0), 1.0))
-    minimum_locked_profit = max(0.0, safe_float(strategy.get("minimum_locked_profit", 0.50), 0.50))
+    profit_floor_enabled = bool(strategy.get("enable_profit_floor_trailing_stop", True))
+    locked_profit_amount = max(0.0, min(2.0, safe_float(strategy.get("locked_profit_amount", 0.0), 0.0)))
 
     with BOT_LOCK:
         peak_price = BOT_STATE["position_peaks"].get(symbol, entry_price)
-        existing_profit_lock_active = bool(BOT_STATE["position_profit_lock_active"].get(symbol, False))
+        existing_profit_floor_active = bool(BOT_STATE["position_profit_floor_active"].get(symbol, False))
         existing_effective_stop = BOT_STATE["position_effective_stops"].get(symbol)
 
     if current_price is not None:
@@ -476,27 +474,28 @@ def calculate_stop_state(symbol, entry_price, current_price, config=None, update
 
     hard_stop_price = entry_price * (1 - hard_stop_percent / 100) if entry_price is not None else None
     percentage_trailing_stop = peak_price * (1 - trailing_stop_percent / 100) if peak_price is not None else None
-    profit_lock_activation_price = entry_price + profit_lock_activation_gain if entry_price is not None else None
-    profit_lock_activated = (
-        profit_lock_enabled
+    profit_floor_price = entry_price + locked_profit_amount if profit_floor_enabled and entry_price is not None else None
+    profit_floor_activated = (
+        profit_floor_enabled
         and (
-            existing_profit_lock_active
+            existing_profit_floor_active
             or (
                 peak_price is not None
-                and profit_lock_activation_price is not None
-                and peak_price >= profit_lock_activation_price
+                and profit_floor_price is not None
+                and peak_price >= profit_floor_price
+                and entry_price is not None
+                and peak_price > entry_price
             )
         )
     )
-    minimum_profit_floor = entry_price + minimum_locked_profit if profit_lock_enabled and entry_price is not None else None
     trailing_stop_price = percentage_trailing_stop
     stop_control_rule = "HARD STOP"
 
-    if profit_lock_activated and minimum_profit_floor is not None and percentage_trailing_stop is not None:
-        trailing_stop_price = max(percentage_trailing_stop, minimum_profit_floor)
+    if profit_floor_activated and profit_floor_price is not None and percentage_trailing_stop is not None:
+        trailing_stop_price = max(percentage_trailing_stop, profit_floor_price)
         if existing_effective_stop is not None:
             trailing_stop_price = max(trailing_stop_price, existing_effective_stop)
-        stop_control_rule = "MINIMUM PROFIT LOCK" if minimum_profit_floor >= percentage_trailing_stop else "PERCENTAGE TRAILING STOP"
+        stop_control_rule = "PROFIT FLOOR" if profit_floor_price >= percentage_trailing_stop else "PERCENTAGE TRAILING STOP"
     elif percentage_trailing_stop is not None and entry_price is not None and percentage_trailing_stop >= entry_price:
         stop_control_rule = "PERCENTAGE TRAILING STOP"
 
@@ -506,8 +505,8 @@ def calculate_stop_state(symbol, entry_price, current_price, config=None, update
     if update_state:
         with BOT_LOCK:
             BOT_STATE["position_peaks"][symbol] = peak_price
-            BOT_STATE["position_profit_lock_active"][symbol] = profit_lock_activated
-            if profit_lock_activated and trailing_stop_price is not None:
+            BOT_STATE["position_profit_floor_active"][symbol] = profit_floor_activated
+            if profit_floor_activated and trailing_stop_price is not None:
                 BOT_STATE["position_effective_stops"][symbol] = trailing_stop_price
 
     return {
@@ -521,10 +520,10 @@ def calculate_stop_state(symbol, entry_price, current_price, config=None, update
         "current_price": current_price,
         "stop_armed": stop_armed,
         "drawdown_from_peak_percent": drawdown_from_peak_percent,
-        "profit_lock_enabled": profit_lock_enabled,
-        "profit_lock_activated": profit_lock_activated,
-        "profit_lock_activation_price": profit_lock_activation_price,
-        "minimum_profit_floor": minimum_profit_floor,
+        "profit_floor_enabled": profit_floor_enabled,
+        "locked_profit_amount": locked_profit_amount,
+        "profit_floor_activated": profit_floor_activated,
+        "profit_floor_price": profit_floor_price,
         "stop_control_rule": stop_control_rule
     }
 
@@ -795,10 +794,10 @@ def log_bot_audit(action, decision, symbol, market_context, config, **extra):
         "trailing_drawdown_percent": extra.get("trailing_drawdown_percent", ""),
         "entry_price_source": extra.get("entry_price_source", ""),
         "estimated_entry_price": extra.get("estimated_entry_price", ""),
-        "profit_lock_enabled": extra.get("profit_lock_enabled", ""),
-        "profit_lock_activated": extra.get("profit_lock_activated", ""),
-        "profit_lock_activation_price": extra.get("profit_lock_activation_price", ""),
-        "minimum_profit_floor": extra.get("minimum_profit_floor", ""),
+        "profit_floor_enabled": extra.get("profit_floor_enabled", ""),
+        "locked_profit_amount": extra.get("locked_profit_amount", ""),
+        "profit_floor_price": extra.get("profit_floor_price", ""),
+        "profit_floor_activated": extra.get("profit_floor_activated", ""),
         "percentage_trailing_stop": extra.get("percentage_trailing_stop", ""),
         "effective_trailing_stop": extra.get("effective_trailing_stop", ""),
         "stop_control_rule": extra.get("stop_control_rule", "")
@@ -3075,7 +3074,7 @@ def try_surfer_exit(config, positions, market_context):
             add_bot_reason(f"EXIT sold {symbol}: {reason}")
             with BOT_LOCK:
                 BOT_STATE["position_peaks"].pop(symbol, None)
-                BOT_STATE["position_profit_lock_active"].pop(symbol, None)
+                BOT_STATE["position_profit_floor_active"].pop(symbol, None)
                 BOT_STATE["position_effective_stops"].pop(symbol, None)
                 BOT_STATE["position_max_profit"].pop(symbol, None)
                 BOT_STATE["position_max_drawdown"].pop(symbol, None)
@@ -3117,10 +3116,10 @@ def fast_exit_audit_fields(
         "no_sell_reason": no_sell_reason,
         "sell_trigger_reason": sell_trigger_reason,
         "trailing_drawdown_percent": trailing_drawdown,
-        "profit_lock_enabled": stop_values.get("profit_lock_enabled", ""),
-        "profit_lock_activated": stop_values.get("profit_lock_activated", ""),
-        "profit_lock_activation_price": stop_values.get("profit_lock_activation_price", ""),
-        "minimum_profit_floor": stop_values.get("minimum_profit_floor", ""),
+        "profit_floor_enabled": stop_values.get("profit_floor_enabled", ""),
+        "locked_profit_amount": stop_values.get("locked_profit_amount", ""),
+        "profit_floor_price": stop_values.get("profit_floor_price", ""),
+        "profit_floor_activated": stop_values.get("profit_floor_activated", ""),
         "percentage_trailing_stop": stop_values.get("percentage_trailing_stop", ""),
         "effective_trailing_stop": stop_values.get("effective_trailing_stop", trailing_stop_price),
         "stop_control_rule": stop_values.get("stop_control_rule", "")
@@ -3240,10 +3239,10 @@ def fast_exit_poll(config, positions):
     print("highest_option_price_since_entry:", peak)
     print("hard_stop_price:", hard_stop_price)
     print("trailing_stop_percent:", trailing_stop_percent)
-    print("profit_lock_enabled:", stop_values.get("profit_lock_enabled"))
-    print("profit_lock_activated:", stop_values.get("profit_lock_activated"))
-    print("profit_lock_activation_price:", stop_values.get("profit_lock_activation_price"))
-    print("minimum_profit_floor:", stop_values.get("minimum_profit_floor"))
+    print("profit_floor_enabled:", stop_values.get("profit_floor_enabled"))
+    print("locked_profit_amount:", stop_values.get("locked_profit_amount"))
+    print("profit_floor_price:", stop_values.get("profit_floor_price"))
+    print("profit_floor_activated:", stop_values.get("profit_floor_activated"))
     print("percentage_trailing_stop:", percentage_trailing_stop)
     print("calculated_stop_price:", trailing_stop_price)
     print("effective_trailing_stop:", trailing_stop_price)
@@ -3374,7 +3373,7 @@ def fast_exit_poll(config, positions):
         add_bot_reason(f"FAST EXIT sold {symbol}: {reason}")
         with BOT_LOCK:
             BOT_STATE["position_peaks"].pop(symbol, None)
-            BOT_STATE["position_profit_lock_active"].pop(symbol, None)
+            BOT_STATE["position_profit_floor_active"].pop(symbol, None)
             BOT_STATE["position_effective_stops"].pop(symbol, None)
             BOT_STATE["position_max_profit"].pop(symbol, None)
             BOT_STATE["position_max_drawdown"].pop(symbol, None)
@@ -4060,9 +4059,8 @@ def save_settings():
     s["use_volume"] = request.form.get("use_volume") == "on"
     s["hard_stop_percent"] = float(request.form.get("hard_stop_percent", 20))
     s["trailing_stop_percent"] = float(request.form.get("trailing_stop_percent", 15))
-    s["enable_minimum_profit_lock"] = request.form.get("enable_minimum_profit_lock") == "on"
-    s["profit_lock_activation_gain"] = max(0.0, safe_float(request.form.get("profit_lock_activation_gain", 1.0), 1.0))
-    s["minimum_locked_profit"] = max(0.0, safe_float(request.form.get("minimum_locked_profit", 0.50), 0.50))
+    s["enable_profit_floor_trailing_stop"] = request.form.get("enable_profit_floor_trailing_stop") == "on"
+    s["locked_profit_amount"] = max(0.0, min(2.0, safe_float(request.form.get("locked_profit_amount", 0.0), 0.0)))
     s["exit_poll_interval_ms"] = clamp_int(request.form.get("exit_poll_interval_ms", 1000), 100, 5000, 1000)
     s["direction_threshold_percent"] = float(request.form.get("direction_threshold_percent", 60))
 
@@ -4385,10 +4383,10 @@ Exit: {fmt_trade_price(trade.get("Exit"))}<br>
 Peak Price: {fmt_trade_price(trade.get("PeakPrice"))}<br>
 Hard Stop Price: {fmt_trade_price(trade.get("HardStopPrice"))}<br>
 Trailing Stop Price: {fmt_trade_price(trade.get("TrailingStopPrice"))}<br>
-Profit Lock Enabled: {escape_html(trade.get("ProfitLockEnabled", ""))}<br>
-Profit Lock Activated: {escape_html(trade.get("ProfitLockActivated", ""))}<br>
-Profit Lock Activation Price: {fmt_trade_price(trade.get("ProfitLockActivationPrice"))}<br>
-Minimum Profit Floor: {fmt_trade_price(trade.get("MinimumProfitFloor"))}<br>
+Profit Floor Enabled: {escape_html(trade.get("ProfitFloorEnabled", ""))}<br>
+Locked Profit Amount: {fmt_trade_price(trade.get("LockedProfitAmount"))}<br>
+Profit Floor Price: {fmt_trade_price(trade.get("ProfitFloorPrice"))}<br>
+Profit Floor Activated: {escape_html(trade.get("ProfitFloorActivated", ""))}<br>
 Percentage Trailing Stop: {fmt_trade_price(trade.get("PercentageTrailingStop"))}<br>
 Effective Trailing Stop: {fmt_trade_price(trade.get("EffectiveTrailingStop"))}<br>
 Stop Control Rule: {escape_html(trade.get("StopControlRule", ""))}<br>
@@ -4433,10 +4431,10 @@ Exit: {fmt_trade_price(trade.get("Exit"))}<br>
 Peak Price: {fmt_trade_price(trade.get("PeakPrice"))}<br>
 Hard Stop Price: {fmt_trade_price(trade.get("HardStopPrice"))}<br>
 Trailing Stop Price: {fmt_trade_price(trade.get("TrailingStopPrice"))}<br>
-Profit Lock Enabled: {escape_html(trade.get("ProfitLockEnabled", ""))}<br>
-Profit Lock Activated: {escape_html(trade.get("ProfitLockActivated", ""))}<br>
-Profit Lock Activation Price: {fmt_trade_price(trade.get("ProfitLockActivationPrice"))}<br>
-Minimum Profit Floor: {fmt_trade_price(trade.get("MinimumProfitFloor"))}<br>
+Profit Floor Enabled: {escape_html(trade.get("ProfitFloorEnabled", ""))}<br>
+Locked Profit Amount: {fmt_trade_price(trade.get("LockedProfitAmount"))}<br>
+Profit Floor Price: {fmt_trade_price(trade.get("ProfitFloorPrice"))}<br>
+Profit Floor Activated: {escape_html(trade.get("ProfitFloorActivated", ""))}<br>
 Percentage Trailing Stop: {fmt_trade_price(trade.get("PercentageTrailingStop"))}<br>
 Effective Trailing Stop: {fmt_trade_price(trade.get("EffectiveTrailingStop"))}<br>
 Stop Control Rule: {escape_html(trade.get("StopControlRule", ""))}<br>
@@ -4701,10 +4699,10 @@ def get_position_pl_data(pos):
         "peak_price": stop_values["peak_price"],
         "trailing_stop_percent": stop_values["trailing_stop_percent"],
         "trailing_stop_price": stop_values["trailing_stop_price"],
-        "profit_lock_enabled": stop_values["profit_lock_enabled"],
-        "profit_lock_activated": stop_values["profit_lock_activated"],
-        "profit_lock_activation_price": stop_values["profit_lock_activation_price"],
-        "minimum_profit_floor": stop_values["minimum_profit_floor"],
+        "profit_floor_enabled": stop_values["profit_floor_enabled"],
+        "locked_profit_amount": stop_values["locked_profit_amount"],
+        "profit_floor_price": stop_values["profit_floor_price"],
+        "profit_floor_activated": stop_values["profit_floor_activated"],
         "percentage_trailing_stop": stop_values["percentage_trailing_stop"],
         "effective_trailing_stop": stop_values["effective_trailing_stop"],
         "stop_control_rule": stop_values["stop_control_rule"],
@@ -4762,10 +4760,10 @@ def get_bot_health_data(positions, bot_snapshot):
         "current_price": None,
         "peak_price": None,
         "trailing_stop_price": None,
-        "profit_lock_enabled": False,
-        "profit_lock_activated": False,
-        "profit_lock_activation_price": None,
-        "minimum_profit_floor": None,
+        "profit_floor_enabled": False,
+        "locked_profit_amount": None,
+        "profit_floor_price": None,
+        "profit_floor_activated": False,
         "percentage_trailing_stop": None,
         "effective_trailing_stop": None,
         "stop_control_rule": "HARD STOP",
@@ -4789,10 +4787,10 @@ def get_bot_health_data(positions, bot_snapshot):
             "current_price": pl.get("current_price"),
             "peak_price": pl.get("peak_price"),
             "trailing_stop_price": pl.get("trailing_stop_price"),
-            "profit_lock_enabled": pl.get("profit_lock_enabled"),
-            "profit_lock_activated": pl.get("profit_lock_activated"),
-            "profit_lock_activation_price": pl.get("profit_lock_activation_price"),
-            "minimum_profit_floor": pl.get("minimum_profit_floor"),
+            "profit_floor_enabled": pl.get("profit_floor_enabled"),
+            "locked_profit_amount": pl.get("locked_profit_amount"),
+            "profit_floor_price": pl.get("profit_floor_price"),
+            "profit_floor_activated": pl.get("profit_floor_activated"),
             "percentage_trailing_stop": pl.get("percentage_trailing_stop"),
             "effective_trailing_stop": pl.get("effective_trailing_stop"),
             "stop_control_rule": pl.get("stop_control_rule"),
@@ -5295,10 +5293,10 @@ Max Trades Per Day: {e.get("max_trades_per_day")}
 <div class="item"><div class="label">Current</div><div class="value" id="exit-current">{fmt_money(bot_health["current_price"])}</div></div>
 <div class="item"><div class="label">Peak</div><div class="value" id="exit-peak">{fmt_money(bot_health["peak_price"])}</div></div>
 <div class="item"><div class="label">Trailing Stop</div><div class="value" id="exit-trailing-stop">{fmt_money(bot_health["trailing_stop_price"])}</div></div>
-<div class="item"><div class="label">Profit Lock Enabled</div><div class="value" id="exit-profit-lock-enabled">{ "YES" if bot_health["profit_lock_enabled"] else "NO" }</div></div>
-<div class="item"><div class="label">Profit Lock Activated</div><div class="value" id="exit-profit-lock-activated">{ "YES" if bot_health["profit_lock_activated"] else "NO" }</div></div>
-<div class="item"><div class="label">Activation Price</div><div class="value" id="exit-profit-lock-activation-price">{fmt_money(bot_health["profit_lock_activation_price"])}</div></div>
-<div class="item"><div class="label">Minimum Profit Floor</div><div class="value" id="exit-minimum-profit-floor">{fmt_money(bot_health["minimum_profit_floor"])}</div></div>
+<div class="item"><div class="label">Profit Floor Enabled</div><div class="value" id="exit-profit-floor-enabled">{ "YES" if bot_health["profit_floor_enabled"] else "NO" }</div></div>
+<div class="item"><div class="label">Locked Profit Amount</div><div class="value" id="exit-locked-profit-amount">{fmt_money(bot_health["locked_profit_amount"])}</div></div>
+<div class="item"><div class="label">Profit Floor Price</div><div class="value" id="exit-profit-floor-price">{fmt_money(bot_health["profit_floor_price"])}</div></div>
+<div class="item"><div class="label">Profit Floor Activated</div><div class="value" id="exit-profit-floor-activated">{ "YES" if bot_health["profit_floor_activated"] else "NO" }</div></div>
 <div class="item"><div class="label">Percentage Stop</div><div class="value" id="exit-percentage-trailing-stop">{fmt_money(bot_health["percentage_trailing_stop"])}</div></div>
 <div class="item"><div class="label">Effective Stop</div><div class="value" id="exit-effective-trailing-stop">{fmt_money(bot_health["effective_trailing_stop"])}</div></div>
 <div class="item"><div class="label">Stop Rule</div><div class="value" id="exit-stop-control-rule">{escape_html(bot_health["stop_control_rule"])}</div></div>
@@ -5352,10 +5350,10 @@ Hard Stop %: {pl["hard_stop_percent"]:.2f}%<br>
 Hard Stop Price: {fmt_money(pl["hard_stop_price"])}<br>
 Peak Price: {fmt_money(pl["peak_price"])}<br>
 Trailing Stop %: {pl["trailing_stop_percent"]:.2f}%<br>
-Profit Lock Enabled: {"YES" if pl.get("profit_lock_enabled") else "NO"}<br>
-Profit Lock Activated: {"YES" if pl.get("profit_lock_activated") else "NO"}<br>
-Profit Lock Activation Price: {fmt_money(pl.get("profit_lock_activation_price"))}<br>
-Minimum Profit Floor: {fmt_money(pl.get("minimum_profit_floor"))}<br>
+Profit Floor Enabled: {"YES" if pl.get("profit_floor_enabled") else "NO"}<br>
+Locked Profit Amount: {fmt_money(pl.get("locked_profit_amount"))}<br>
+Profit Floor Price: {fmt_money(pl.get("profit_floor_price"))}<br>
+Profit Floor Activated: {"YES" if pl.get("profit_floor_activated") else "NO"}<br>
 Percentage Trailing Stop: {fmt_money(pl.get("percentage_trailing_stop"))}<br>
 Effective Trailing Stop: {fmt_money(pl.get("effective_trailing_stop"))}<br>
 Stop Control Rule: {escape_html(pl.get("stop_control_rule"))}<br>
@@ -5653,14 +5651,11 @@ Hard Stop %:
 Trailing Stop %:
 <input type="number" step="0.1" name="trailing_stop_percent" value="{s.get("trailing_stop_percent")}"><br>
 
-Enable Minimum Profit Lock:
-<input type="checkbox" name="enable_minimum_profit_lock" {checked(s.get("enable_minimum_profit_lock", True))}><br>
+Profit Floor Trailing Stop:
+<input type="checkbox" name="enable_profit_floor_trailing_stop" {checked(s.get("enable_profit_floor_trailing_stop", True))}><br>
 
-Profit Lock Activation Gain:
-<input type="number" step="0.01" min="0" name="profit_lock_activation_gain" value="{s.get("profit_lock_activation_gain", 1.0)}"><br>
-
-Minimum Locked Profit:
-<input type="number" step="0.01" min="0" name="minimum_locked_profit" value="{s.get("minimum_locked_profit", 0.50)}"><br>
+Locked Profit Amount:
+<input type="number" step="0.01" min="0" max="2" name="locked_profit_amount" value="{s.get("locked_profit_amount", 0.0)}"><br>
 
 <h3>Opening Direction</h3>
 
@@ -5769,10 +5764,10 @@ Hard Stop %: ${{Number(pl.hard_stop_percent || 0).toFixed(2)}}%<br>
 Hard Stop Price: ${{fmtMoney(pl.hard_stop_price)}}<br>
 Peak Price: ${{fmtMoney(pl.peak_price)}}<br>
 Trailing Stop %: ${{Number(pl.trailing_stop_percent || 0).toFixed(2)}}%<br>
-Profit Lock Enabled: ${{pl.profit_lock_enabled ? "YES" : "NO"}}<br>
-Profit Lock Activated: ${{pl.profit_lock_activated ? "YES" : "NO"}}<br>
-Profit Lock Activation Price: ${{fmtMoney(pl.profit_lock_activation_price)}}<br>
-Minimum Profit Floor: ${{fmtMoney(pl.minimum_profit_floor)}}<br>
+Profit Floor Enabled: ${{pl.profit_floor_enabled ? "YES" : "NO"}}<br>
+Locked Profit Amount: ${{fmtMoney(pl.locked_profit_amount)}}<br>
+Profit Floor Price: ${{fmtMoney(pl.profit_floor_price)}}<br>
+Profit Floor Activated: ${{pl.profit_floor_activated ? "YES" : "NO"}}<br>
 Percentage Trailing Stop: ${{fmtMoney(pl.percentage_trailing_stop)}}<br>
 Effective Trailing Stop: ${{fmtMoney(pl.effective_trailing_stop)}}<br>
 Stop Control Rule: ${{escapeHtml(pl.stop_control_rule || "HARD STOP")}}<br>
@@ -5993,10 +5988,10 @@ async function updateDeveloperDiagnostics() {{
     setText("exit-current", fmtMoney(position.current_price));
     setText("exit-peak", fmtMoney(position.peak_price));
     setText("exit-trailing-stop", fmtMoney(position.trailing_stop_price));
-    setText("exit-profit-lock-enabled", position.profit_lock_enabled ? "YES" : "NO");
-    setText("exit-profit-lock-activated", position.profit_lock_activated ? "YES" : "NO");
-    setText("exit-profit-lock-activation-price", fmtMoney(position.profit_lock_activation_price));
-    setText("exit-minimum-profit-floor", fmtMoney(position.minimum_profit_floor));
+    setText("exit-profit-floor-enabled", position.profit_floor_enabled ? "YES" : "NO");
+    setText("exit-locked-profit-amount", fmtMoney(position.locked_profit_amount));
+    setText("exit-profit-floor-price", fmtMoney(position.profit_floor_price));
+    setText("exit-profit-floor-activated", position.profit_floor_activated ? "YES" : "NO");
     setText("exit-percentage-trailing-stop", fmtMoney(position.percentage_trailing_stop));
     setText("exit-effective-trailing-stop", fmtMoney(position.effective_trailing_stop));
     setText("exit-stop-control-rule", position.stop_control_rule || "HARD STOP");
@@ -6111,3 +6106,4 @@ if __name__ == "__main__":
     initialize_pending_entry_history()
     threading.Thread(target=surfer_bot_loop, daemon=True).start()
     app.run(host="127.0.0.1", port=5000)
+
