@@ -61,7 +61,11 @@ BOT_AUDIT_COLUMNS = [
     "highest_option_price_since_entry", "trailing_stop_percent",
     "calculated_stop_price", "stop_armed", "no_sell_reason",
     "sell_trigger_reason", "trailing_drawdown_percent",
-    "entry_price_source", "estimated_entry_price"
+    "entry_price_source", "estimated_entry_price",
+    "profit_lock_enabled", "profit_lock_activated",
+    "profit_lock_activation_price", "minimum_profit_floor",
+    "percentage_trailing_stop", "effective_trailing_stop",
+    "stop_control_rule"
 ]
 BOT_LOCK = threading.Lock()
 BOT_STATE = {
@@ -94,6 +98,8 @@ BOT_STATE = {
     "running": False,
     "day": None,
     "position_peaks": {},
+    "position_profit_lock_active": {},
+    "position_effective_stops": {},
     "position_max_profit": {},
     "position_max_drawdown": {},
     "last_trade_review": {},
@@ -248,6 +254,9 @@ def load_config():
     config["strategy"].setdefault("use_volume", False)
     config["strategy"].setdefault("hard_stop_percent", 20)
     config["strategy"].setdefault("trailing_stop_percent", 15)
+    config["strategy"]["enable_minimum_profit_lock"] = bool(config["strategy"].get("enable_minimum_profit_lock", True))
+    config["strategy"]["profit_lock_activation_gain"] = max(0.0, safe_float(config["strategy"].get("profit_lock_activation_gain", 1.0), 1.0))
+    config["strategy"]["minimum_locked_profit"] = max(0.0, safe_float(config["strategy"].get("minimum_locked_profit", 0.50), 0.50))
     config["strategy"]["exit_poll_interval_ms"] = clamp_int(
         config["strategy"].get("exit_poll_interval_ms", 1000),
         100,
@@ -295,6 +304,8 @@ def grade_entry_setup(market_context):
     bearish_score = int(market_context.get("bearish_score") or 0)
     market_state = market_context.get("market_state", "NEUTRAL")
     reasons = list(market_context.get("reasons", []))
+    decision = market_context.get("decision", "")
+    selected_direction = "CALL" if decision == "BUY CALL" else "PUT" if decision == "BUY PUT" else score_direction(bullish_score, bearish_score)
     score = 50 + (confidence * 15)
     grade_reasons = []
 
@@ -321,19 +332,68 @@ def grade_entry_setup(market_context):
 
     score += min(12, len(reasons) * 2)
 
-    for phrase in ["EMA aligned", "MA aligned", "Price above VWAP", "Price below VWAP"]:
-        if any(phrase in reason for reason in reasons):
-            score += 3
+    bullish_reason_phrases = [
+        "EMA aligned bullish",
+        "MA aligned bullish",
+        "MACD bullish",
+        "Price above VWAP",
+        "Volume confirmation bullish",
+        "Green ticks",
+        "Broke previous day high",
+        "Broke previous week high",
+        "Broke last hour high",
+        "Broke opening range high"
+    ]
+    bearish_reason_phrases = [
+        "EMA aligned bearish",
+        "MA aligned bearish",
+        "MACD bearish",
+        "Price below VWAP",
+        "Volume confirmation bearish",
+        "Red ticks",
+        "Broke previous day low",
+        "Broke previous week low",
+        "Broke last hour low",
+        "Broke opening range low"
+    ]
+    matching_phrases = bullish_reason_phrases if selected_direction == "CALL" else bearish_reason_phrases if selected_direction == "PUT" else []
+    opposing_phrases = bearish_reason_phrases if selected_direction == "CALL" else bullish_reason_phrases if selected_direction == "PUT" else []
+    matching_confirmations = sum(1 for phrase in matching_phrases if any(phrase in reason for reason in reasons))
+    opposing_confirmations = sum(1 for phrase in opposing_phrases if any(phrase in reason for reason in reasons))
+    score += min(15, matching_confirmations * 3)
+    if opposing_confirmations:
+        score -= min(30, opposing_confirmations * 6)
+        grade_reasons.append(f"{opposing_confirmations} opposing confirmations")
+    if (selected_direction == "CALL" and bearish_score >= bullish_score) or (selected_direction == "PUT" and bullish_score >= bearish_score):
+        score -= 30
+        grade_reasons.append("Entry direction conflicts with score winner")
 
-    if any("Volume confirmation" in reason for reason in reasons):
+    def has_matching_phrase(phrases):
+        return any(phrase in reason for phrase in phrases for reason in reasons)
+
+    if has_matching_phrase([phrase for phrase in matching_phrases if phrase.startswith("Volume confirmation")]):
         score += 4
         grade_reasons.append("Volume confirmation")
-    if any("ticks" in reason.lower() for reason in reasons):
+    if has_matching_phrase([phrase for phrase in matching_phrases if phrase in ["Green ticks", "Red ticks"]]):
         score += 4
         grade_reasons.append("Opening direction confirmation")
-    if any("Broke previous" in reason or "Broke last hour" in reason for reason in reasons):
+    if has_matching_phrase([phrase for phrase in matching_phrases if phrase in [
+        "Broke previous day high", "Broke previous week high", "Broke last hour high",
+        "Broke previous day low", "Broke previous week low", "Broke last hour low"
+    ]]):
         score += 5
         grade_reasons.append("Market structure confirmation")
+
+    if market_state in ["CHOPPY", "STAGNANT"]:
+        score = min(score, 59)
+    elif confidence <= 1:
+        score = min(score, 69)
+    elif confidence == 2:
+        score = min(score, 79)
+    elif confidence == 3:
+        score = min(score, 89)
+    elif confidence == 4:
+        score = min(score, 94)
 
     grade_reasons.extend(reasons[:6])
     return grade_from_score(score), max(0, min(100, int(round(score)))), "; ".join(grade_reasons[:10])
@@ -394,19 +454,61 @@ def position_hold_time(symbol):
 
 def stop_debug_values(symbol, entry_price, current_price, config=None):
     config = config or load_config()
-    hard_stop_percent = float(config.get("strategy", {}).get("hard_stop_percent", 20))
-    trailing_stop_percent = float(config.get("strategy", {}).get("trailing_stop_percent", 15))
+    return calculate_stop_state(symbol, entry_price, current_price, config)
+
+
+def calculate_stop_state(symbol, entry_price, current_price, config=None, update_state=True):
+    config = config or load_config()
+    strategy = config.get("strategy", {})
+    hard_stop_percent = float(strategy.get("hard_stop_percent", 20))
+    trailing_stop_percent = float(strategy.get("trailing_stop_percent", 15))
+    profit_lock_enabled = bool(strategy.get("enable_minimum_profit_lock", True))
+    profit_lock_activation_gain = max(0.0, safe_float(strategy.get("profit_lock_activation_gain", 1.0), 1.0))
+    minimum_locked_profit = max(0.0, safe_float(strategy.get("minimum_locked_profit", 0.50), 0.50))
 
     with BOT_LOCK:
         peak_price = BOT_STATE["position_peaks"].get(symbol, entry_price)
+        existing_profit_lock_active = bool(BOT_STATE["position_profit_lock_active"].get(symbol, False))
+        existing_effective_stop = BOT_STATE["position_effective_stops"].get(symbol)
 
     if current_price is not None:
         peak_price = max(peak_price or entry_price, current_price)
 
     hard_stop_price = entry_price * (1 - hard_stop_percent / 100) if entry_price is not None else None
-    trailing_stop_price = peak_price * (1 - trailing_stop_percent / 100) if peak_price is not None else None
+    percentage_trailing_stop = peak_price * (1 - trailing_stop_percent / 100) if peak_price is not None else None
+    profit_lock_activation_price = entry_price + profit_lock_activation_gain if entry_price is not None else None
+    profit_lock_activated = (
+        profit_lock_enabled
+        and (
+            existing_profit_lock_active
+            or (
+                peak_price is not None
+                and profit_lock_activation_price is not None
+                and peak_price >= profit_lock_activation_price
+            )
+        )
+    )
+    minimum_profit_floor = entry_price + minimum_locked_profit if profit_lock_enabled and entry_price is not None else None
+    trailing_stop_price = percentage_trailing_stop
+    stop_control_rule = "HARD STOP"
+
+    if profit_lock_activated and minimum_profit_floor is not None and percentage_trailing_stop is not None:
+        trailing_stop_price = max(percentage_trailing_stop, minimum_profit_floor)
+        if existing_effective_stop is not None:
+            trailing_stop_price = max(trailing_stop_price, existing_effective_stop)
+        stop_control_rule = "MINIMUM PROFIT LOCK" if minimum_profit_floor >= percentage_trailing_stop else "PERCENTAGE TRAILING STOP"
+    elif percentage_trailing_stop is not None and entry_price is not None and percentage_trailing_stop >= entry_price:
+        stop_control_rule = "PERCENTAGE TRAILING STOP"
+
     stop_armed = trailing_stop_price >= entry_price if trailing_stop_price is not None and entry_price is not None else False
     drawdown_from_peak_percent = ((peak_price - current_price) / peak_price) * 100 if peak_price and current_price is not None else 0
+
+    if update_state:
+        with BOT_LOCK:
+            BOT_STATE["position_peaks"][symbol] = peak_price
+            BOT_STATE["position_profit_lock_active"][symbol] = profit_lock_activated
+            if profit_lock_activated and trailing_stop_price is not None:
+                BOT_STATE["position_effective_stops"][symbol] = trailing_stop_price
 
     return {
         "hard_stop_percent": hard_stop_percent,
@@ -414,8 +516,16 @@ def stop_debug_values(symbol, entry_price, current_price, config=None):
         "peak_price": peak_price,
         "trailing_stop_percent": trailing_stop_percent,
         "trailing_stop_price": trailing_stop_price,
+        "percentage_trailing_stop": percentage_trailing_stop,
+        "effective_trailing_stop": trailing_stop_price,
+        "current_price": current_price,
         "stop_armed": stop_armed,
-        "drawdown_from_peak_percent": drawdown_from_peak_percent
+        "drawdown_from_peak_percent": drawdown_from_peak_percent,
+        "profit_lock_enabled": profit_lock_enabled,
+        "profit_lock_activated": profit_lock_activated,
+        "profit_lock_activation_price": profit_lock_activation_price,
+        "minimum_profit_floor": minimum_profit_floor,
+        "stop_control_rule": stop_control_rule
     }
 
 
@@ -426,14 +536,17 @@ def current_exit_display(symbol, stop_values):
     drawdown = stop_values.get("drawdown_from_peak_percent", 0)
     trailing_percent = stop_values.get("trailing_stop_percent", 0)
     stop_armed = stop_values.get("stop_armed", False)
+    current_price = stop_values.get("current_price")
+    effective_stop = stop_values.get("effective_trailing_stop")
+    stop_control_rule = stop_values.get("stop_control_rule", "HARD STOP")
 
     if not stop_armed:
-        trailing_reasons = ["Trailing stop inactive.", "Trailing stop price has not reached entry."]
+        trailing_reasons = ["Trailing stop inactive.", "Effective stop has not reached entry."]
     else:
         trailing_reasons = (
-            ["Trailing stop hit.", f"Drawdown {drawdown:.2f}% >= {trailing_percent:.2f}%."]
-            if drawdown >= trailing_percent
-            else ["Trailing stop not hit.", f"Drawdown {drawdown:.2f}% < {trailing_percent:.2f}%."]
+            ["Trailing stop hit.", f"Current {current_price:.2f} <= effective stop {effective_stop:.2f}.", f"Rule: {stop_control_rule}."]
+            if current_price is not None and effective_stop is not None and current_price <= effective_stop
+            else ["Trailing stop not hit.", f"Drawdown {drawdown:.2f}% < {trailing_percent:.2f}%.", f"Rule: {stop_control_rule}."]
         )
     reasons = trailing_reasons + [str(reason) for reason in reasons]
 
@@ -681,7 +794,14 @@ def log_bot_audit(action, decision, symbol, market_context, config, **extra):
         "sell_trigger_reason": extra.get("sell_trigger_reason", ""),
         "trailing_drawdown_percent": extra.get("trailing_drawdown_percent", ""),
         "entry_price_source": extra.get("entry_price_source", ""),
-        "estimated_entry_price": extra.get("estimated_entry_price", "")
+        "estimated_entry_price": extra.get("estimated_entry_price", ""),
+        "profit_lock_enabled": extra.get("profit_lock_enabled", ""),
+        "profit_lock_activated": extra.get("profit_lock_activated", ""),
+        "profit_lock_activation_price": extra.get("profit_lock_activation_price", ""),
+        "minimum_profit_floor": extra.get("minimum_profit_floor", ""),
+        "percentage_trailing_stop": extra.get("percentage_trailing_stop", ""),
+        "effective_trailing_stop": extra.get("effective_trailing_stop", ""),
+        "stop_control_rule": extra.get("stop_control_rule", "")
     }
 
     with open(BOT_AUDIT_FILE, "a", newline="") as f:
@@ -2024,6 +2144,49 @@ def calculate_dominance_percent(bullish_score, bearish_score):
     return (max(bullish_score, bearish_score) / total_score) * 100
 
 
+def score_direction(bullish_score, bearish_score):
+    if bullish_score > bearish_score:
+        return "CALL"
+    if bearish_score > bullish_score:
+        return "PUT"
+    return "NONE"
+
+
+def direction_safety_check(decision, market_context):
+    bullish_score = int(market_context.get("bullish_score") or 0)
+    bearish_score = int(market_context.get("bearish_score") or 0)
+    confidence = abs(bullish_score - bearish_score)
+    dominance_percent = calculate_dominance_percent(bullish_score, bearish_score)
+    selected_direction = "CALL" if decision == "BUY CALL" else "PUT" if decision == "BUY PUT" else "NONE"
+    winning_direction = score_direction(bullish_score, bearish_score)
+    passed = (
+        (selected_direction == "CALL" and bullish_score > bearish_score)
+        or (selected_direction == "PUT" and bearish_score > bullish_score)
+    )
+    return {
+        "passed": passed,
+        "selected_direction": selected_direction,
+        "winning_direction": winning_direction,
+        "bullish_score": bullish_score,
+        "bearish_score": bearish_score,
+        "confidence": confidence,
+        "dominance_percent": dominance_percent
+    }
+
+
+def log_direction_safety_result(prefix, decision, market_context):
+    result = direction_safety_check(decision, market_context)
+    message = (
+        f"{prefix}: bullish={result['bullish_score']} bearish={result['bearish_score']} "
+        f"confidence={result['confidence']} dominance={result['dominance_percent']:.1f}% "
+        f"selected={result['selected_direction']} winner={result['winning_direction']} "
+        f"result={'PASS' if result['passed'] else 'FAIL'}"
+    )
+    add_bot_reason(message)
+    print(message)
+    return result
+
+
 def build_market_context(config, positions=None):
     s = config["strategy"]
     e = config["entry_rules"]
@@ -2173,8 +2336,9 @@ def build_market_context(config, positions=None):
                 max_drawdown = min(BOT_STATE["position_max_drawdown"].get(position_symbol, current_pl), current_pl)
                 BOT_STATE["position_max_profit"][position_symbol] = max_profit
                 BOT_STATE["position_max_drawdown"][position_symbol] = max_drawdown
-            trailing_stop_price = peak * (1 - (float(s.get("trailing_stop_percent", 15)) / 100))
-            distance_to_trailing_stop = position_price - trailing_stop_price
+            stop_values = calculate_stop_state(position_symbol, entry_price, position_price, config)
+            trailing_stop_price = stop_values.get("effective_trailing_stop")
+            distance_to_trailing_stop = position_price - trailing_stop_price if trailing_stop_price is not None else None
             if current_pl > 0:
                 reasons.append("Current P/L supports holding")
 
@@ -2185,10 +2349,20 @@ def build_market_context(config, positions=None):
     dominance_percent = calculate_dominance_percent(bullish_score, bearish_score)
     market_state = "NEUTRAL"
 
-    if bullish_score >= minimum_signals and confidence >= minimum_confidence and dominance_percent >= minimum_dominance_percent:
+    if (
+        bullish_score > bearish_score
+        and bullish_score >= minimum_signals
+        and confidence >= minimum_confidence
+        and dominance_percent >= minimum_dominance_percent
+    ):
         market_state = "BULLISH"
         current_signal = "CALL"
-    elif bearish_score >= minimum_signals and confidence >= minimum_confidence and dominance_percent >= minimum_dominance_percent:
+    elif (
+        bearish_score > bullish_score
+        and bearish_score >= minimum_signals
+        and confidence >= minimum_confidence
+        and dominance_percent >= minimum_dominance_percent
+    ):
         market_state = "BEARISH"
         current_signal = "PUT"
     else:
@@ -2267,26 +2441,30 @@ def decide_surfer_action(config, positions, market_context):
             BOT_STATE["position_peaks"][symbol] = peak
 
         pnl_percent = ((current_price - entry_price) / entry_price) * 100 if current_price and entry_price else 0
-        trailing_stop_price = peak * (1 - trailing_stop_percent / 100) if peak else 0
+        stop_values = calculate_stop_state(symbol, entry_price, current_price, config)
+        trailing_stop_price = stop_values.get("effective_trailing_stop") or 0
         trailing_drawdown = ((peak - current_price) / peak) * 100 if current_price and peak else 0
-        trailing_stop_active = trailing_stop_price >= entry_price
+        trailing_stop_active = bool(stop_values.get("stop_armed"))
+        stop_control_rule = stop_values.get("stop_control_rule", "HARD STOP")
 
         if pnl_percent <= -hard_stop_percent:
             return "SELL", ["Hard stop hit", f"P/L {pnl_percent:.2f}%"]
-        if trailing_stop_active and trailing_drawdown >= trailing_stop_percent:
-            return "SELL", ["Trailing stop hit", f"Drawdown {trailing_drawdown:.2f}%"]
+        if trailing_stop_active and current_price is not None and current_price <= trailing_stop_price:
+            return "SELL", ["Trailing stop hit", f"Current {current_price:.2f} <= effective stop {trailing_stop_price:.2f}", f"Rule: {stop_control_rule}"]
 
         trailing_reason = "Trailing stop not hit" if trailing_stop_active else "Trailing stop inactive"
         return "HOLD", ["Hard stop not hit", trailing_reason] + market_context.get("reasons", [])
 
     if (
-        market_context.get("bullish_score", 0) >= minimum_signals
+        market_context.get("bullish_score", 0) > market_context.get("bearish_score", 0)
+        and market_context.get("bullish_score", 0) >= minimum_signals
         and confidence >= minimum_confidence
         and dominance_percent >= minimum_dominance_percent
     ):
         return "BUY CALL", market_context.get("reasons", [])
     if (
-        market_context.get("bearish_score", 0) >= minimum_signals
+        market_context.get("bearish_score", 0) > market_context.get("bullish_score", 0)
+        and market_context.get("bearish_score", 0) >= minimum_signals
         and confidence >= minimum_confidence
         and dominance_percent >= minimum_dominance_percent
     ):
@@ -2432,6 +2610,25 @@ def execute_entry_buy(config, decision, side, contract, contracts, reference_pri
             config,
             option_symbol=contract.get("symbol", ""),
             skip_reason="options market closed"
+        )
+        return False
+
+    safety = log_direction_safety_result(f"{label} ORDER SAFETY", decision, market_context)
+    if not safety["passed"]:
+        add_bot_reason("SIGNAL DIRECTION MISMATCH: order submission cancelled")
+        log_bot_audit(
+            "SKIP",
+            decision,
+            config.get("symbol", ""),
+            market_context,
+            config,
+            option_symbol=contract.get("symbol", ""),
+            skip_reason=(
+                "SIGNAL DIRECTION MISMATCH "
+                f"bullish={safety['bullish_score']} bearish={safety['bearish_score']} "
+                f"confidence={safety['confidence']} dominance={safety['dominance_percent']:.1f}% "
+                f"selected={safety['selected_direction']} winner={safety['winning_direction']}"
+            )
         )
         return False
 
@@ -2593,6 +2790,25 @@ def try_surfer_entry(config, positions, market_context, call, put):
         if confirmation_start_price is None:
             add_bot_reason(f"PENDING BUY skipped {side}: no confirmation price")
             log_bot_audit("SKIP", decision, config.get("symbol", ""), market_context, config, option_symbol=option_symbol, skip_reason="no option confirmation price")
+            return
+
+        safety = log_direction_safety_result("PENDING ENTRY SAFETY", decision, market_context)
+        if not safety["passed"]:
+            add_bot_reason("SIGNAL DIRECTION MISMATCH: pending entry cancelled")
+            log_bot_audit(
+                "SKIP",
+                decision,
+                config.get("symbol", ""),
+                market_context,
+                config,
+                option_symbol=option_symbol,
+                skip_reason=(
+                    "SIGNAL DIRECTION MISMATCH "
+                    f"bullish={safety['bullish_score']} bearish={safety['bearish_score']} "
+                    f"confidence={safety['confidence']} dominance={safety['dominance_percent']:.1f}% "
+                    f"selected={safety['selected_direction']} winner={safety['winning_direction']}"
+                )
+            )
             return
 
         create_pending_entry(config, decision, side, contract, contracts, confirmation_start_price, market_context, confirmation_price_source)
@@ -2859,6 +3075,8 @@ def try_surfer_exit(config, positions, market_context):
             add_bot_reason(f"EXIT sold {symbol}: {reason}")
             with BOT_LOCK:
                 BOT_STATE["position_peaks"].pop(symbol, None)
+                BOT_STATE["position_profit_lock_active"].pop(symbol, None)
+                BOT_STATE["position_effective_stops"].pop(symbol, None)
                 BOT_STATE["position_max_profit"].pop(symbol, None)
                 BOT_STATE["position_max_drawdown"].pop(symbol, None)
             return True
@@ -2882,8 +3100,10 @@ def fast_exit_audit_fields(
     trailing_drawdown,
     stop_armed,
     no_sell_reason="",
-    sell_trigger_reason=""
+    sell_trigger_reason="",
+    stop_values=None
 ):
+    stop_values = stop_values or {}
     return {
         "option_symbol": symbol,
         "entry_price": entry_price,
@@ -2896,7 +3116,14 @@ def fast_exit_audit_fields(
         "stop_armed": stop_armed,
         "no_sell_reason": no_sell_reason,
         "sell_trigger_reason": sell_trigger_reason,
-        "trailing_drawdown_percent": trailing_drawdown
+        "trailing_drawdown_percent": trailing_drawdown,
+        "profit_lock_enabled": stop_values.get("profit_lock_enabled", ""),
+        "profit_lock_activated": stop_values.get("profit_lock_activated", ""),
+        "profit_lock_activation_price": stop_values.get("profit_lock_activation_price", ""),
+        "minimum_profit_floor": stop_values.get("minimum_profit_floor", ""),
+        "percentage_trailing_stop": stop_values.get("percentage_trailing_stop", ""),
+        "effective_trailing_stop": stop_values.get("effective_trailing_stop", trailing_stop_price),
+        "stop_control_rule": stop_values.get("stop_control_rule", "")
     }
 
 
@@ -2947,10 +3174,14 @@ def fast_exit_poll(config, positions):
         BOT_STATE["thread_alive"] = True
 
     hard_stop_price = entry_price * (1 - hard_stop_percent / 100)
-    trailing_stop_price = peak * (1 - trailing_stop_percent / 100)
+    stop_values = calculate_stop_state(symbol, entry_price, current_price, config)
+    peak = stop_values.get("peak_price", peak)
+    percentage_trailing_stop = stop_values.get("percentage_trailing_stop")
+    trailing_stop_price = stop_values.get("effective_trailing_stop")
     trailing_drawdown = ((peak - current_price) / peak) * 100 if peak else 0
     distance_to_trailing_stop = current_price - trailing_stop_price
-    stop_armed = trailing_stop_price >= entry_price
+    stop_armed = bool(stop_values.get("stop_armed"))
+    stop_control_rule = stop_values.get("stop_control_rule", "HARD STOP")
     no_sell_reason = ""
     sell_trigger_reason = ""
     decision = "HOLD"
@@ -2960,7 +3191,9 @@ def fast_exit_poll(config, positions):
         f"Current {current_price:.2f}",
         f"Peak {peak:.2f}",
         f"Hard stop price {hard_stop_price:.2f}",
-        f"Trailing stop price {trailing_stop_price:.2f}",
+        f"Percentage trailing stop {percentage_trailing_stop:.2f}",
+        f"Effective trailing stop {trailing_stop_price:.2f}",
+        f"Stop control rule {stop_control_rule}",
         f"Drawdown {trailing_drawdown:.2f}%"
     ]
 
@@ -2968,22 +3201,24 @@ def fast_exit_poll(config, positions):
         decision = "SELL"
         sell_trigger_reason = f"Hard stop hit: P/L {pnl_percent:.2f}% <= -{hard_stop_percent:.2f}%"
         reasons = ["Hard stop hit", f"P/L {pnl_percent:.2f}% <= -{hard_stop_percent:.2f}%"] + reasons
-    elif stop_armed and trailing_drawdown >= trailing_stop_percent:
+    elif stop_armed and current_price <= trailing_stop_price:
         decision = "SELL"
-        sell_trigger_reason = f"Trailing stop hit: drawdown {trailing_drawdown:.2f}% >= {trailing_stop_percent:.2f}%"
-        reasons = ["Trailing stop hit", f"Drawdown {trailing_drawdown:.2f}% >= {trailing_stop_percent:.2f}%"] + reasons
+        sell_trigger_reason = f"Trailing stop hit: current {current_price:.2f} <= effective stop {trailing_stop_price:.2f} ({stop_control_rule})"
+        reasons = ["Trailing stop hit", f"Current {current_price:.2f} <= effective stop {trailing_stop_price:.2f}", f"Rule: {stop_control_rule}"] + reasons
     else:
         if stop_armed:
-            no_sell_reason = f"Hard stop not hit; trailing stop not hit; stop_armed={stop_armed}; drawdown {trailing_drawdown:.2f}% < {trailing_stop_percent:.2f}%"
+            no_sell_reason = f"Hard stop not hit; trailing stop not hit; stop_armed={stop_armed}; current {current_price:.2f} > effective stop {trailing_stop_price:.2f}; rule={stop_control_rule}"
             reasons = [
                 "Trailing stop not hit.",
-                f"Drawdown {trailing_drawdown:.2f}% < {trailing_stop_percent:.2f}%."
+                f"Current {current_price:.2f} > effective stop {trailing_stop_price:.2f}.",
+                f"Rule: {stop_control_rule}."
             ] + reasons
         else:
-            no_sell_reason = f"Hard stop not hit; trailing stop inactive; stop_armed={stop_armed}; trailing_stop_price {trailing_stop_price:.2f} <= entry {entry_price:.2f}"
+            no_sell_reason = f"Hard stop not hit; trailing stop inactive; stop_armed={stop_armed}; effective_stop {trailing_stop_price:.2f} <= entry {entry_price:.2f}"
             reasons = [
                 "Trailing stop inactive.",
-                f"Trailing stop price {trailing_stop_price:.2f} <= entry {entry_price:.2f}."
+                f"Effective stop {trailing_stop_price:.2f} <= entry {entry_price:.2f}.",
+                f"Rule: {stop_control_rule}."
             ] + reasons
 
     market_context = current_market_context_snapshot()
@@ -3005,7 +3240,14 @@ def fast_exit_poll(config, positions):
     print("highest_option_price_since_entry:", peak)
     print("hard_stop_price:", hard_stop_price)
     print("trailing_stop_percent:", trailing_stop_percent)
+    print("profit_lock_enabled:", stop_values.get("profit_lock_enabled"))
+    print("profit_lock_activated:", stop_values.get("profit_lock_activated"))
+    print("profit_lock_activation_price:", stop_values.get("profit_lock_activation_price"))
+    print("minimum_profit_floor:", stop_values.get("minimum_profit_floor"))
+    print("percentage_trailing_stop:", percentage_trailing_stop)
     print("calculated_stop_price:", trailing_stop_price)
+    print("effective_trailing_stop:", trailing_stop_price)
+    print("stop_control_rule:", stop_control_rule)
     print("drawdown_percent:", trailing_drawdown)
     print("stop_armed:", stop_armed)
     print("no_sell_reason:", no_sell_reason)
@@ -3032,7 +3274,8 @@ def fast_exit_poll(config, positions):
                 trailing_stop_price,
                 trailing_drawdown,
                 stop_armed,
-                no_sell_reason=no_sell_reason
+                no_sell_reason=no_sell_reason,
+                stop_values=stop_values
             )
         )
         record_tick_finished(tick_started_at)
@@ -3063,7 +3306,8 @@ def fast_exit_poll(config, positions):
                 trailing_stop_price,
                 trailing_drawdown,
                 stop_armed,
-                sell_trigger_reason=sell_trigger_reason
+                sell_trigger_reason=sell_trigger_reason,
+                stop_values=stop_values
             )
         )
         record_tick_finished(tick_started_at)
@@ -3112,7 +3356,8 @@ def fast_exit_poll(config, positions):
                 trailing_stop_price,
                 trailing_drawdown,
                 stop_armed,
-                sell_trigger_reason=sell_trigger_reason
+                sell_trigger_reason=sell_trigger_reason,
+                stop_values=stop_values
             )
         )
         update_last_trade_review({
@@ -3129,6 +3374,8 @@ def fast_exit_poll(config, positions):
         add_bot_reason(f"FAST EXIT sold {symbol}: {reason}")
         with BOT_LOCK:
             BOT_STATE["position_peaks"].pop(symbol, None)
+            BOT_STATE["position_profit_lock_active"].pop(symbol, None)
+            BOT_STATE["position_effective_stops"].pop(symbol, None)
             BOT_STATE["position_max_profit"].pop(symbol, None)
             BOT_STATE["position_max_drawdown"].pop(symbol, None)
         record_tick_finished(tick_started_at)
@@ -3157,7 +3404,8 @@ def fast_exit_poll(config, positions):
             trailing_stop_price,
             trailing_drawdown,
             stop_armed,
-            sell_trigger_reason=sell_trigger_reason
+            sell_trigger_reason=sell_trigger_reason,
+            stop_values=stop_values
         )
     )
     record_tick_finished(tick_started_at)
@@ -3812,6 +4060,9 @@ def save_settings():
     s["use_volume"] = request.form.get("use_volume") == "on"
     s["hard_stop_percent"] = float(request.form.get("hard_stop_percent", 20))
     s["trailing_stop_percent"] = float(request.form.get("trailing_stop_percent", 15))
+    s["enable_minimum_profit_lock"] = request.form.get("enable_minimum_profit_lock") == "on"
+    s["profit_lock_activation_gain"] = max(0.0, safe_float(request.form.get("profit_lock_activation_gain", 1.0), 1.0))
+    s["minimum_locked_profit"] = max(0.0, safe_float(request.form.get("minimum_locked_profit", 0.50), 0.50))
     s["exit_poll_interval_ms"] = clamp_int(request.form.get("exit_poll_interval_ms", 1000), 100, 5000, 1000)
     s["direction_threshold_percent"] = float(request.form.get("direction_threshold_percent", 60))
 
@@ -4134,6 +4385,13 @@ Exit: {fmt_trade_price(trade.get("Exit"))}<br>
 Peak Price: {fmt_trade_price(trade.get("PeakPrice"))}<br>
 Hard Stop Price: {fmt_trade_price(trade.get("HardStopPrice"))}<br>
 Trailing Stop Price: {fmt_trade_price(trade.get("TrailingStopPrice"))}<br>
+Profit Lock Enabled: {escape_html(trade.get("ProfitLockEnabled", ""))}<br>
+Profit Lock Activated: {escape_html(trade.get("ProfitLockActivated", ""))}<br>
+Profit Lock Activation Price: {fmt_trade_price(trade.get("ProfitLockActivationPrice"))}<br>
+Minimum Profit Floor: {fmt_trade_price(trade.get("MinimumProfitFloor"))}<br>
+Percentage Trailing Stop: {fmt_trade_price(trade.get("PercentageTrailingStop"))}<br>
+Effective Trailing Stop: {fmt_trade_price(trade.get("EffectiveTrailingStop"))}<br>
+Stop Control Rule: {escape_html(trade.get("StopControlRule", ""))}<br>
 Max Drawdown From Peak: {fmt_percent(trade.get("MaxDrawdownFromPeakPercent"))}<br>
 PnL: <span class="{pnl_class}">{pnl_display} ({fmt_percent(pnl_percent)})</span><br>
 Hold Time: {escape_html(trade.get("HoldTime") or "N/A")}<br>
@@ -4175,6 +4433,13 @@ Exit: {fmt_trade_price(trade.get("Exit"))}<br>
 Peak Price: {fmt_trade_price(trade.get("PeakPrice"))}<br>
 Hard Stop Price: {fmt_trade_price(trade.get("HardStopPrice"))}<br>
 Trailing Stop Price: {fmt_trade_price(trade.get("TrailingStopPrice"))}<br>
+Profit Lock Enabled: {escape_html(trade.get("ProfitLockEnabled", ""))}<br>
+Profit Lock Activated: {escape_html(trade.get("ProfitLockActivated", ""))}<br>
+Profit Lock Activation Price: {fmt_trade_price(trade.get("ProfitLockActivationPrice"))}<br>
+Minimum Profit Floor: {fmt_trade_price(trade.get("MinimumProfitFloor"))}<br>
+Percentage Trailing Stop: {fmt_trade_price(trade.get("PercentageTrailingStop"))}<br>
+Effective Trailing Stop: {fmt_trade_price(trade.get("EffectiveTrailingStop"))}<br>
+Stop Control Rule: {escape_html(trade.get("StopControlRule", ""))}<br>
 Max Drawdown From Peak: {fmt_percent(trade.get("MaxDrawdownFromPeakPercent"))}<br>
 PnL: <span class="{pnl_class}">{pnl_display} ({fmt_percent(pnl_percent)})</span><br>
 Hold Time: {escape_html(trade.get("HoldTime") or "N/A")}<br>
@@ -4436,6 +4701,13 @@ def get_position_pl_data(pos):
         "peak_price": stop_values["peak_price"],
         "trailing_stop_percent": stop_values["trailing_stop_percent"],
         "trailing_stop_price": stop_values["trailing_stop_price"],
+        "profit_lock_enabled": stop_values["profit_lock_enabled"],
+        "profit_lock_activated": stop_values["profit_lock_activated"],
+        "profit_lock_activation_price": stop_values["profit_lock_activation_price"],
+        "minimum_profit_floor": stop_values["minimum_profit_floor"],
+        "percentage_trailing_stop": stop_values["percentage_trailing_stop"],
+        "effective_trailing_stop": stop_values["effective_trailing_stop"],
+        "stop_control_rule": stop_values["stop_control_rule"],
         "drawdown_from_peak_percent": stop_values["drawdown_from_peak_percent"],
         "cost_basis": cost_basis,
         "current_value": current_value,
@@ -4490,6 +4762,13 @@ def get_bot_health_data(positions, bot_snapshot):
         "current_price": None,
         "peak_price": None,
         "trailing_stop_price": None,
+        "profit_lock_enabled": False,
+        "profit_lock_activated": False,
+        "profit_lock_activation_price": None,
+        "minimum_profit_floor": None,
+        "percentage_trailing_stop": None,
+        "effective_trailing_stop": None,
+        "stop_control_rule": "HARD STOP",
         "distance_to_stop_percent": None,
         "poll_interval_ms": clamp_int(
             (bot_snapshot.get("config_strategy") or {}).get("exit_poll_interval_ms", 1000),
@@ -4510,12 +4789,19 @@ def get_bot_health_data(positions, bot_snapshot):
             "current_price": pl.get("current_price"),
             "peak_price": pl.get("peak_price"),
             "trailing_stop_price": pl.get("trailing_stop_price"),
+            "profit_lock_enabled": pl.get("profit_lock_enabled"),
+            "profit_lock_activated": pl.get("profit_lock_activated"),
+            "profit_lock_activation_price": pl.get("profit_lock_activation_price"),
+            "minimum_profit_floor": pl.get("minimum_profit_floor"),
+            "percentage_trailing_stop": pl.get("percentage_trailing_stop"),
+            "effective_trailing_stop": pl.get("effective_trailing_stop"),
+            "stop_control_rule": pl.get("stop_control_rule"),
             "distance_to_stop_percent": (
-                ((pl.get("current_price") - pl.get("trailing_stop_price")) / pl.get("current_price")) * 100
-                if pl.get("current_price") and pl.get("trailing_stop_price") else None
+                ((pl.get("current_price") - pl.get("effective_trailing_stop")) / pl.get("current_price")) * 100
+                if pl.get("current_price") and pl.get("effective_trailing_stop") else None
             ),
             "trailing_stop_percent": pl.get("trailing_stop_percent"),
-            "stop_armed": bool(pl.get("trailing_stop_price") and pl.get("entry_price") and pl.get("trailing_stop_price") >= pl.get("entry_price")),
+            "stop_armed": bool(pl.get("effective_trailing_stop") and pl.get("entry_price") and pl.get("effective_trailing_stop") >= pl.get("entry_price")),
             "hold_time": pl.get("hold_time", "N/A")
         })
 
@@ -5009,6 +5295,13 @@ Max Trades Per Day: {e.get("max_trades_per_day")}
 <div class="item"><div class="label">Current</div><div class="value" id="exit-current">{fmt_money(bot_health["current_price"])}</div></div>
 <div class="item"><div class="label">Peak</div><div class="value" id="exit-peak">{fmt_money(bot_health["peak_price"])}</div></div>
 <div class="item"><div class="label">Trailing Stop</div><div class="value" id="exit-trailing-stop">{fmt_money(bot_health["trailing_stop_price"])}</div></div>
+<div class="item"><div class="label">Profit Lock Enabled</div><div class="value" id="exit-profit-lock-enabled">{ "YES" if bot_health["profit_lock_enabled"] else "NO" }</div></div>
+<div class="item"><div class="label">Profit Lock Activated</div><div class="value" id="exit-profit-lock-activated">{ "YES" if bot_health["profit_lock_activated"] else "NO" }</div></div>
+<div class="item"><div class="label">Activation Price</div><div class="value" id="exit-profit-lock-activation-price">{fmt_money(bot_health["profit_lock_activation_price"])}</div></div>
+<div class="item"><div class="label">Minimum Profit Floor</div><div class="value" id="exit-minimum-profit-floor">{fmt_money(bot_health["minimum_profit_floor"])}</div></div>
+<div class="item"><div class="label">Percentage Stop</div><div class="value" id="exit-percentage-trailing-stop">{fmt_money(bot_health["percentage_trailing_stop"])}</div></div>
+<div class="item"><div class="label">Effective Stop</div><div class="value" id="exit-effective-trailing-stop">{fmt_money(bot_health["effective_trailing_stop"])}</div></div>
+<div class="item"><div class="label">Stop Rule</div><div class="value" id="exit-stop-control-rule">{escape_html(bot_health["stop_control_rule"])}</div></div>
 <div class="item"><div class="label">Distance to Stop</div><div class="value" id="exit-distance-stop">{fmt_int(bot_health["distance_to_stop_percent"])}%</div></div>
 <div class="item"><div class="label">Poll Interval</div><div class="value" id="exit-poll-interval">{fmt_int(bot_health["poll_interval_ms"])} ms</div></div>
 <div class="item"><div class="label">Last Quote</div><div class="value" id="exit-last-quote-age">{fmt_int(bot_health["last_quote_age_ms"])} ms ago</div></div>
@@ -5059,6 +5352,13 @@ Hard Stop %: {pl["hard_stop_percent"]:.2f}%<br>
 Hard Stop Price: {fmt_money(pl["hard_stop_price"])}<br>
 Peak Price: {fmt_money(pl["peak_price"])}<br>
 Trailing Stop %: {pl["trailing_stop_percent"]:.2f}%<br>
+Profit Lock Enabled: {"YES" if pl.get("profit_lock_enabled") else "NO"}<br>
+Profit Lock Activated: {"YES" if pl.get("profit_lock_activated") else "NO"}<br>
+Profit Lock Activation Price: {fmt_money(pl.get("profit_lock_activation_price"))}<br>
+Minimum Profit Floor: {fmt_money(pl.get("minimum_profit_floor"))}<br>
+Percentage Trailing Stop: {fmt_money(pl.get("percentage_trailing_stop"))}<br>
+Effective Trailing Stop: {fmt_money(pl.get("effective_trailing_stop"))}<br>
+Stop Control Rule: {escape_html(pl.get("stop_control_rule"))}<br>
 Trailing Stop Price: {fmt_money(pl["trailing_stop_price"])}<br>
 Drawdown From Peak %: {pl["drawdown_from_peak_percent"]:.2f}%<br>
 <span style="color:{pnl_color}; font-weight:bold;">
@@ -5353,6 +5653,15 @@ Hard Stop %:
 Trailing Stop %:
 <input type="number" step="0.1" name="trailing_stop_percent" value="{s.get("trailing_stop_percent")}"><br>
 
+Enable Minimum Profit Lock:
+<input type="checkbox" name="enable_minimum_profit_lock" {checked(s.get("enable_minimum_profit_lock", True))}><br>
+
+Profit Lock Activation Gain:
+<input type="number" step="0.01" min="0" name="profit_lock_activation_gain" value="{s.get("profit_lock_activation_gain", 1.0)}"><br>
+
+Minimum Locked Profit:
+<input type="number" step="0.01" min="0" name="minimum_locked_profit" value="{s.get("minimum_locked_profit", 0.50)}"><br>
+
 <h3>Opening Direction</h3>
 
 Exit Poll Interval (ms):
@@ -5460,6 +5769,13 @@ Hard Stop %: ${{Number(pl.hard_stop_percent || 0).toFixed(2)}}%<br>
 Hard Stop Price: ${{fmtMoney(pl.hard_stop_price)}}<br>
 Peak Price: ${{fmtMoney(pl.peak_price)}}<br>
 Trailing Stop %: ${{Number(pl.trailing_stop_percent || 0).toFixed(2)}}%<br>
+Profit Lock Enabled: ${{pl.profit_lock_enabled ? "YES" : "NO"}}<br>
+Profit Lock Activated: ${{pl.profit_lock_activated ? "YES" : "NO"}}<br>
+Profit Lock Activation Price: ${{fmtMoney(pl.profit_lock_activation_price)}}<br>
+Minimum Profit Floor: ${{fmtMoney(pl.minimum_profit_floor)}}<br>
+Percentage Trailing Stop: ${{fmtMoney(pl.percentage_trailing_stop)}}<br>
+Effective Trailing Stop: ${{fmtMoney(pl.effective_trailing_stop)}}<br>
+Stop Control Rule: ${{escapeHtml(pl.stop_control_rule || "HARD STOP")}}<br>
 Trailing Stop Price: ${{fmtMoney(pl.trailing_stop_price)}}<br>
 Drawdown From Peak %: ${{Number(pl.drawdown_from_peak_percent || 0).toFixed(2)}}%<br>
 <span style="color:${{pnlColor}}; font-weight:bold;">
@@ -5677,6 +5993,13 @@ async function updateDeveloperDiagnostics() {{
     setText("exit-current", fmtMoney(position.current_price));
     setText("exit-peak", fmtMoney(position.peak_price));
     setText("exit-trailing-stop", fmtMoney(position.trailing_stop_price));
+    setText("exit-profit-lock-enabled", position.profit_lock_enabled ? "YES" : "NO");
+    setText("exit-profit-lock-activated", position.profit_lock_activated ? "YES" : "NO");
+    setText("exit-profit-lock-activation-price", fmtMoney(position.profit_lock_activation_price));
+    setText("exit-minimum-profit-floor", fmtMoney(position.minimum_profit_floor));
+    setText("exit-percentage-trailing-stop", fmtMoney(position.percentage_trailing_stop));
+    setText("exit-effective-trailing-stop", fmtMoney(position.effective_trailing_stop));
+    setText("exit-stop-control-rule", position.stop_control_rule || "HARD STOP");
     setText("exit-distance-stop", fmtPercent(position.distance_to_stop_percent));
     setText("exit-poll-interval", `${{fmtInt(position.poll_interval_ms)}} ms`);
     setText("exit-last-quote-age", `${{fmtInt(position.last_quote_age_ms)}} ms ago`);
