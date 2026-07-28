@@ -13,7 +13,16 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from logs.trade_logger import *
 from tournament.evaluator import evaluate_all_profiles
-from tournament.profiles import build_tournament_profiles
+from tournament.profiles import (
+    PROFILE_ORDER,
+    TOURNAMENT_PROFILES_FILE,
+    build_tournament_profiles,
+    copy_tournament_profile_settings,
+    load_tournament_profile_settings,
+    normalize_profile_settings,
+    reset_tournament_profile_settings,
+    save_tournament_profile_settings,
+)
 from tournament.snapshot import build_market_snapshot_from_signal
 from tournament.state import create_all_initial_states
 
@@ -184,7 +193,8 @@ BOT_STATE = {
     },
     "tournament_decisions": {},
     "tournament_last_snapshot": {},
-    "tournament_decisions_evaluated": 0
+    "tournament_decisions_evaluated": 0,
+    "tournament_decisions_evaluated_by_profile": {}
 }
 TOURNAMENT_RUNTIME_STATES = {}
 
@@ -279,6 +289,79 @@ def load_config():
 def save_config(config):
     with open("config.json", "w") as f:
         json.dump(config, f, indent=4)
+
+
+TOURNAMENT_BOOL_FIELDS = {
+    "enabled",
+    "option_momentum_confirmation_enabled",
+    "two_candle_or_confirmation_enabled",
+    "allow_calls",
+    "allow_puts",
+    "enable_profit_floor_trailing_stop",
+}
+TOURNAMENT_SETTING_FIELDS = [
+    "display_name",
+    "enabled",
+    "minimum_confidence",
+    "minimum_dominance_percent",
+    "minimum_signals",
+    "direction_threshold_percent",
+    "option_momentum_confirmation_enabled",
+    "option_momentum_percent",
+    "confirmation_timeout_seconds",
+    "pre_confirmation_max_drawdown_percent",
+    "pending_entry_retry_cooldown_seconds",
+    "two_candle_or_confirmation_enabled",
+    "required_breakout_candles",
+    "allow_calls",
+    "allow_puts",
+    "hard_stop_percent",
+    "trailing_stop_percent",
+    "enable_profit_floor_trailing_stop",
+    "locked_profit_amount",
+    "cooldown_minutes",
+    "max_trades_per_day",
+    "max_contract_price",
+    "contract_selection_mode",
+    "contracts",
+]
+
+
+def tournament_settings_response(settings=None):
+    return {
+        "profiles": settings or load_tournament_profile_settings(TOURNAMENT_PROFILES_FILE),
+        "profile_order": list(PROFILE_ORDER),
+    }
+
+
+def parse_tournament_settings_payload():
+    if request.is_json:
+        payload = request.get_json(silent=True) or {}
+        raw_profiles = payload.get("profiles", payload)
+        if not isinstance(raw_profiles, dict):
+            raise ValueError("profiles must be an object")
+        return raw_profiles
+
+    defaults = load_tournament_profile_settings(TOURNAMENT_PROFILES_FILE)
+    parsed = {}
+    for profile_id in PROFILE_ORDER:
+        row = dict(defaults.get(profile_id, {}))
+        for field in TOURNAMENT_SETTING_FIELDS:
+            key = f"tournament__{profile_id}__{field}"
+            if field in TOURNAMENT_BOOL_FIELDS:
+                row[field] = request.form.get(key) == "on"
+            elif key in request.form:
+                row[field] = request.form.get(key)
+        row["profile_id"] = profile_id
+        parsed[profile_id] = row
+    return parsed
+
+
+def tournament_api_or_redirect(payload, status=200):
+    wants_json = request.is_json or "application/json" in str(request.headers.get("Accept", ""))
+    if wants_json:
+        return jsonify(payload), status
+    return redirect("/")
 
 
 def grade_from_score(score):
@@ -2548,6 +2631,10 @@ def evaluate_tournament_decisions(config, signal):
             state.decisions_evaluated
             for state in states.values()
         )
+        BOT_STATE["tournament_decisions_evaluated_by_profile"] = {
+            profile_id: state.decisions_evaluated
+            for profile_id, state in states.items()
+        }
     print_tournament_decisions(decisions)
     return snapshot, decisions
 
@@ -3789,6 +3876,8 @@ def api_bot_state():
             "tournament_decisions": dict(BOT_STATE["tournament_decisions"]),
             "tournament_last_snapshot": dict(BOT_STATE["tournament_last_snapshot"]),
             "tournament_decisions_evaluated": BOT_STATE["tournament_decisions_evaluated"],
+            "tournament_decisions_evaluated_by_profile": dict(BOT_STATE["tournament_decisions_evaluated_by_profile"]),
+            "tournament_profile_settings": load_tournament_profile_settings(TOURNAMENT_PROFILES_FILE),
             "history_limits": {
                 "pending_entry_limit": pending_history_limit,
                 "bot_trades_limit": bot_trades_limit,
@@ -4086,6 +4175,45 @@ def clear_bot_audit_view_route():
 def restore_bot_audit_view_route():
     restore_bot_audit_view()
     return redirect("/")
+
+
+@app.route("/api/tournament/settings", methods=["GET"])
+def api_tournament_settings():
+    return jsonify(tournament_settings_response())
+
+
+@app.route("/api/tournament/settings", methods=["POST"])
+def api_save_tournament_settings():
+    try:
+        raw_settings = parse_tournament_settings_payload()
+        normalized, errors = normalize_profile_settings(raw_settings, strict=False)
+        if errors:
+            return tournament_api_or_redirect({"ok": False, "errors": errors}, 400)
+        saved = save_tournament_profile_settings(normalized, TOURNAMENT_PROFILES_FILE)
+        return tournament_api_or_redirect({"ok": True, **tournament_settings_response(saved)})
+    except Exception as error:
+        return tournament_api_or_redirect({"ok": False, "errors": [str(error)]}, 400)
+
+
+@app.route("/api/tournament/settings/reset", methods=["POST"])
+def api_reset_tournament_settings():
+    settings = reset_tournament_profile_settings(TOURNAMENT_PROFILES_FILE)
+    return tournament_api_or_redirect({"ok": True, **tournament_settings_response(settings)})
+
+
+@app.route("/api/tournament/settings/copy", methods=["POST"])
+def api_copy_tournament_settings():
+    source_profile_id = request.form.get("source_profile_id")
+    copy_mode = request.form.get("copy_mode", "SHARED_ONLY")
+    if request.is_json:
+        payload = request.get_json(silent=True) or {}
+        source_profile_id = payload.get("source_profile_id", source_profile_id)
+        copy_mode = payload.get("copy_mode", copy_mode)
+    try:
+        settings = copy_tournament_profile_settings(source_profile_id, copy_mode, TOURNAMENT_PROFILES_FILE)
+        return tournament_api_or_redirect({"ok": True, **tournament_settings_response(settings)})
+    except Exception as error:
+        return tournament_api_or_redirect({"ok": False, "errors": [str(error)]}, 400)
 
 
 @app.route("/save-settings", methods=["POST"])
@@ -4998,6 +5126,10 @@ def dashboard():
             "last_signal_ms": BOT_STATE["last_signal_ms"],
             "pending_entry": refresh_pending_time_remaining(dict(BOT_STATE.get("pending_entry") or default_pending_entry())),
             "pending_entry_history": pending_entry_history_snapshot(),
+            "tournament_decisions": dict(BOT_STATE["tournament_decisions"]),
+            "tournament_last_snapshot": dict(BOT_STATE["tournament_last_snapshot"]),
+            "tournament_decisions_evaluated": BOT_STATE["tournament_decisions_evaluated"],
+            "tournament_decisions_evaluated_by_profile": dict(BOT_STATE["tournament_decisions_evaluated_by_profile"]),
             "config_strategy": dict(config.get("strategy", {}))
         }
 
@@ -5052,6 +5184,88 @@ def dashboard():
 
     def selected(value, current):
         return "selected" if value == current else ""
+
+    tournament_settings = load_tournament_profile_settings(TOURNAMENT_PROFILES_FILE)
+
+    def tournament_input(profile_id, row, field, input_type="number", step=None, minimum=None, maximum=None):
+        attrs = []
+        if step is not None:
+            attrs.append(f'step="{step}"')
+        if minimum is not None:
+            attrs.append(f'min="{minimum}"')
+        if maximum is not None:
+            attrs.append(f'max="{maximum}"')
+        attr_text = " ".join(attrs)
+        return (
+            f'<input type="{input_type}" name="tournament__{profile_id}__{field}" '
+            f'value="{html_lib.escape(str(row.get(field, "")))}" {attr_text}>'
+        )
+
+    def tournament_checkbox(profile_id, row, field):
+        return f'<input type="checkbox" name="tournament__{profile_id}__{field}" {checked(row.get(field))}>'
+
+    def render_tournament_profile_settings():
+        cards = []
+        for profile_id in PROFILE_ORDER:
+            row = tournament_settings[profile_id]
+            mode = row.get("contract_selection_mode", "closest_within_budget")
+            cards.append(f"""
+<div class="item tournament-profile-card">
+<h3>{html_lib.escape(row.get("display_name", profile_id))}</h3>
+<input type="hidden" name="tournament__{profile_id}__display_name" value="{html_lib.escape(row.get("display_name", profile_id))}">
+Enabled: {tournament_checkbox(profile_id, row, "enabled")}<br>
+Minimum Confidence: {tournament_input(profile_id, row, "minimum_confidence", minimum=0)}<br>
+Minimum Dominance %: {tournament_input(profile_id, row, "minimum_dominance_percent", step="0.1", minimum=0, maximum=100)}<br>
+Minimum Signals: {tournament_input(profile_id, row, "minimum_signals", minimum=1)}<br>
+Direction Threshold %: {tournament_input(profile_id, row, "direction_threshold_percent", step="0.1", minimum=0, maximum=100)}<br>
+Momentum Enabled: {tournament_checkbox(profile_id, row, "option_momentum_confirmation_enabled")}<br>
+Momentum Percent: {tournament_input(profile_id, row, "option_momentum_percent", step="0.1", minimum=0)}<br>
+Confirmation Timeout: {tournament_input(profile_id, row, "confirmation_timeout_seconds", minimum=1)}<br>
+Pre-Confirmation Max Drawdown %: {tournament_input(profile_id, row, "pre_confirmation_max_drawdown_percent", step="0.1", minimum=0, maximum=100)}<br>
+Retry Cooldown Seconds: {tournament_input(profile_id, row, "pending_entry_retry_cooldown_seconds", minimum=0)}<br>
+Two-Candle OR Enabled: {tournament_checkbox(profile_id, row, "two_candle_or_confirmation_enabled")}<br>
+Required Breakout Candles: {tournament_input(profile_id, row, "required_breakout_candles", minimum=1)}<br>
+Allow Calls: {tournament_checkbox(profile_id, row, "allow_calls")}<br>
+Allow Puts: {tournament_checkbox(profile_id, row, "allow_puts")}<br>
+Hard Stop %: {tournament_input(profile_id, row, "hard_stop_percent", step="0.1", minimum=0, maximum=100)}<br>
+Trailing Stop %: {tournament_input(profile_id, row, "trailing_stop_percent", step="0.1", minimum=0, maximum=100)}<br>
+Profit Floor Enabled: {tournament_checkbox(profile_id, row, "enable_profit_floor_trailing_stop")}<br>
+Locked Profit Amount: {tournament_input(profile_id, row, "locked_profit_amount", step="0.01", minimum=0)}<br>
+Cooldown Minutes: {tournament_input(profile_id, row, "cooldown_minutes", minimum=0)}<br>
+Max Trades Per Day: {tournament_input(profile_id, row, "max_trades_per_day", minimum=1)}<br>
+Max Contract Price: {tournament_input(profile_id, row, "max_contract_price", step="0.01", minimum=0)}<br>
+Contract Selection Mode:
+<select name="tournament__{profile_id}__contract_selection_mode">
+<option value="strict_atm" {selected("strict_atm", mode)}>Strict ATM</option>
+<option value="closest_within_budget" {selected("closest_within_budget", mode)}>Closest Within Budget</option>
+</select><br>
+Contracts: {tournament_input(profile_id, row, "contracts", minimum=1)}<br>
+</div>
+""")
+        return "\n".join(cards)
+
+    def render_tournament_decisions_table(decisions):
+        rows = []
+        decisions = decisions or {}
+        for profile_id in PROFILE_ORDER:
+            row = decisions.get(profile_id, {})
+            settings_row = tournament_settings.get(profile_id, {})
+            state = TOURNAMENT_RUNTIME_STATES.get(profile_id)
+            evaluated = state.decisions_evaluated if state else 0
+            rows.append(f"""
+<tr>
+<td>{html_lib.escape(settings_row.get("display_name", profile_id))}</td>
+<td>{settings_row.get("enabled", True)}</td>
+<td>{html_lib.escape(str(row.get("status", "N/A")))}</td>
+<td>{html_lib.escape(str(row.get("direction", "N/A")))}</td>
+<td>{row.get("accepted", False)}</td>
+<td>{html_lib.escape(str(row.get("rejection_reason") or ""))}</td>
+<td>{row.get("momentum_required", False)}</td>
+<td>{row.get("or_confirmation_required", False)}</td>
+<td>{evaluated}</td>
+</tr>
+""")
+        return "".join(rows)
 
     html = f"""
 <html>
@@ -5154,6 +5368,18 @@ button {{
 .performance-panel.bot {{ border: 1px solid #00b7ff; }}
 .performance-panel.human {{ border: 1px solid #ffd166; }}
 .trade-line {{ margin: 4px 0; }}
+.tournament-profile-card input[type="number"],
+.tournament-profile-card select {{ width: 140px; }}
+.decision-table {{
+    width: 100%;
+    border-collapse: collapse;
+}}
+.decision-table th,
+.decision-table td {{
+    border-bottom: 1px solid #444;
+    padding: 6px;
+    text-align: left;
+}}
 </style>
 </head>
 <body>
@@ -5202,6 +5428,28 @@ Last Updated: <span id="market-structure-last-updated">{market_context.get("mark
 <br>
 Bot Reason Log:<br>
 <div class="item" id="bot-reason-log">{reason_log_html}</div>
+</div>
+
+<div class="card">
+<h2>Tournament Decisions</h2>
+<table class="decision-table">
+<thead>
+<tr>
+<th>Profile</th>
+<th>Enabled</th>
+<th>Status</th>
+<th>Direction</th>
+<th>Accepted</th>
+<th>Rejection Reason</th>
+<th>Momentum Required</th>
+<th>OR Required</th>
+<th>Decisions Evaluated</th>
+</tr>
+</thead>
+<tbody id="tournament-decisions-body">
+{render_tournament_decisions_table(bot_snapshot.get("tournament_decisions"))}
+</tbody>
+</table>
 </div>
 
 <div class="card">
@@ -5747,6 +5995,25 @@ Direction Threshold %:
 Bot Scan Every Seconds:
 <input type="number" name="interval_seconds" value="{config.get("scanner", {}).get("interval_seconds", 60)}"><br><br>
 
+<h2>TOURNAMENT PROFILE SETTINGS</h2>
+<p>These settings are separate from the original live bot settings. Tournament profiles are decision-only and do not submit Tradier orders.</p>
+<div class="grid">
+{render_tournament_profile_settings()}
+</div>
+<br>
+Copy Mode:
+<select name="copy_mode">
+<option value="SHARED_ONLY">SHARED_ONLY - preserve experiment flags</option>
+<option value="EVERYTHING">EVERYTHING - copy all settings</option>
+</select><br>
+<button type="submit" formaction="/api/tournament/settings" formmethod="POST">Save Tournament Settings</button>
+<button type="submit" formaction="/api/tournament/settings/reset" formmethod="POST" class="yellow">Reset Tournament Profiles to Defaults</button><br>
+<button type="submit" formaction="/api/tournament/settings/copy" formmethod="POST" name="source_profile_id" value="BOT_A_BASELINE">Copy Bot A Settings to All</button>
+<button type="submit" formaction="/api/tournament/settings/copy" formmethod="POST" name="source_profile_id" value="BOT_B_MOMENTUM">Copy Bot B Settings to All</button>
+<button type="submit" formaction="/api/tournament/settings/copy" formmethod="POST" name="source_profile_id" value="BOT_C_TWO_CANDLE_OR">Copy Bot C Settings to All</button>
+<button type="submit" formaction="/api/tournament/settings/copy" formmethod="POST" name="source_profile_id" value="BOT_D_COMBINED">Copy Bot D Settings to All</button>
+<br><br>
+
 <button type="submit">Save Settings</button>
 
 </form>
@@ -5965,6 +6232,38 @@ ${{cancelLine}}
     }}).join("");
 }}
 
+const TOURNAMENT_PROFILES = [
+    ["BOT_A_BASELINE", "Bot A Baseline"],
+    ["BOT_B_MOMENTUM", "Bot B Momentum"],
+    ["BOT_C_TWO_CANDLE_OR", "Bot C Two-Candle OR"],
+    ["BOT_D_COMBINED", "Bot D Combined"]
+];
+
+function renderTournamentDecisions(decisions, evaluatedByProfile, settings) {{
+    const el = document.getElementById("tournament-decisions-body");
+    if (!el) return;
+
+    decisions = decisions || {{}};
+    evaluatedByProfile = evaluatedByProfile || {{}};
+    settings = settings || {{}};
+    el.innerHTML = TOURNAMENT_PROFILES.map(([profileId, label]) => {{
+        const row = decisions[profileId] || {{}};
+        const enabled = settings[profileId]?.enabled;
+        return `
+<tr>
+<td>${{escapeHtml(label)}}</td>
+<td>${{escapeHtml(enabled ?? "N/A")}}</td>
+<td>${{escapeHtml(row.status || "N/A")}}</td>
+<td>${{escapeHtml(row.direction || "N/A")}}</td>
+<td>${{escapeHtml(row.accepted ?? false)}}</td>
+<td>${{escapeHtml(row.rejection_reason || "")}}</td>
+<td>${{escapeHtml(row.momentum_required ?? false)}}</td>
+<td>${{escapeHtml(row.or_confirmation_required ?? false)}}</td>
+<td>${{escapeHtml(evaluatedByProfile[profileId] || 0)}}</td>
+</tr>`;
+    }}).join("");
+}}
+
 async function updateBotState() {{
     const data = await getJson("/api/bot-state");
     setText("bot-spent-today", fmtMoney(data.spent_today));
@@ -5985,6 +6284,7 @@ async function updateBotState() {{
     const pendingHistoryLimit = Number(data.history_limits?.pending_entry_limit || {DEFAULT_HISTORY_LIMIT});
     renderPendingEntry(data.pending_entry);
     renderPendingEntryHistory(data.pending_entry_history, pendingHistoryLimit);
+    renderTournamentDecisions(data.tournament_decisions, data.tournament_decisions_evaluated_by_profile, data.tournament_profile_settings);
     setText("bot-last-action", data.last_action);
     setText("bot-trades-today", data.trades_today);
     renderReasonLog(data.reason_log);
