@@ -7,10 +7,15 @@ import os
 import threading
 import time
 import html as html_lib
+from dataclasses import asdict
 from datetime import datetime, timedelta, time as datetime_time
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from logs.trade_logger import *
+from tournament.evaluator import evaluate_all_profiles
+from tournament.profiles import build_tournament_profiles
+from tournament.snapshot import build_market_snapshot_from_signal
+from tournament.state import create_all_initial_states
 
 load_dotenv()
 
@@ -176,8 +181,12 @@ BOT_STATE = {
             "last_processed_candle": "",
             "reason": ""
         }
-    }
+    },
+    "tournament_decisions": {},
+    "tournament_last_snapshot": {},
+    "tournament_decisions_evaluated": 0
 }
+TOURNAMENT_RUNTIME_STATES = {}
 
 
 def clamp_int(value, minimum, maximum, default):
@@ -2015,6 +2024,13 @@ def build_real_market_structure(symbol, quote, current_price, config=None):
         bar for bar in bars
         if bar["time"] >= now - timedelta(hours=1)
     ]
+    completed_close_bars = [
+        bar for bar in regular_bars
+        if (
+            opening_range_end <= bar["time"].time() <= datetime_time(16, 0)
+            and bar["time"] + timedelta(minutes=1) <= now
+        )
+    ]
 
     regular_high, regular_low = high_low_from_bars(regular_bars)
     premarket_high, premarket_low = high_low_from_bars(premarket_bars)
@@ -2074,7 +2090,8 @@ def build_real_market_structure(symbol, quote, current_price, config=None):
         "levels": levels,
         "data_source": "Tradier daily/intraday bars",
         "market_date": today.isoformat(),
-        "last_updated": now.strftime("%Y-%m-%d %H:%M:%S")
+        "last_updated": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "completed_closes": tuple(bar["close"] for bar in completed_close_bars)
     }
 
 
@@ -2107,6 +2124,7 @@ def empty_market_context(price=None):
         "market_structure_source": "Tradier daily/intraday bars",
         "market_date": market_now().date().isoformat(),
         "market_structure_last_updated": "",
+        "completed_closes": (),
         "level_distances": {key: None for key in levels},
         "current_pl": 0,
         "distance_to_trailing_stop": None,
@@ -2395,6 +2413,7 @@ def build_market_context(config, positions=None):
         "market_structure_source": structure["data_source"],
         "market_date": structure["market_date"],
         "market_structure_last_updated": structure["last_updated"],
+        "completed_closes": structure.get("completed_closes", ()),
         "level_distances": level_distances,
         "current_pl": current_pl,
         "distance_to_trailing_stop": distance_to_trailing_stop,
@@ -2478,6 +2497,59 @@ def calculate_surfer_signal(config, positions=None):
     market_context["decision"] = decision
     market_context["decision_reasons"] = decision_reasons
     return normalize_signal(market_context)
+
+
+def ensure_tournament_runtime_states(profiles):
+    global TOURNAMENT_RUNTIME_STATES
+    existing = TOURNAMENT_RUNTIME_STATES if isinstance(TOURNAMENT_RUNTIME_STATES, dict) else {}
+    missing_profiles = {
+        profile_id: profile
+        for profile_id, profile in profiles.items()
+        if profile_id not in existing
+    }
+    if missing_profiles:
+        existing.update(create_all_initial_states(missing_profiles))
+    TOURNAMENT_RUNTIME_STATES = {
+        profile_id: existing[profile_id]
+        for profile_id in profiles
+    }
+    return TOURNAMENT_RUNTIME_STATES
+
+
+def print_tournament_decisions(decisions):
+    print("TOURNAMENT DECISIONS")
+    for profile_id in ["BOT_A_BASELINE", "BOT_B_MOMENTUM", "BOT_C_TWO_CANDLE_OR", "BOT_D_COMBINED"]:
+        decision = decisions.get(profile_id)
+        if not decision:
+            continue
+        print(f"{profile_id}:")
+        print("accepted:", decision.accepted)
+        print("status:", decision.status)
+        print("direction:", decision.direction)
+        print("reason:", decision.rejection_reason)
+
+
+def evaluate_tournament_decisions(config, signal):
+    profiles = build_tournament_profiles(config)
+    states = ensure_tournament_runtime_states(profiles)
+    snapshot = build_market_snapshot_from_signal(
+        signal,
+        config.get("symbol", "SPY"),
+        market_now().isoformat(),
+    )
+    decisions = evaluate_all_profiles(profiles, states, snapshot)
+    with BOT_LOCK:
+        BOT_STATE["tournament_last_snapshot"] = asdict(snapshot)
+        BOT_STATE["tournament_decisions"] = {
+            profile_id: asdict(decision)
+            for profile_id, decision in decisions.items()
+        }
+        BOT_STATE["tournament_decisions_evaluated"] = sum(
+            state.decisions_evaluated
+            for state in states.values()
+        )
+    print_tournament_decisions(decisions)
+    return snapshot, decisions
 
 
 def normalize_signal(signal):
@@ -3476,6 +3548,10 @@ def surfer_bot_tick(allow_entry=True):
     signal_started_at = time.perf_counter()
     signal = normalize_signal(signal)
     update_bot_signal_state(signal, call_cost, put_cost)
+    try:
+        evaluate_tournament_decisions(config, signal)
+    except Exception as error:
+        print("TOURNAMENT ERROR:", error)
     signal_ms = int((time.perf_counter() - signal_started_at) * 1000)
     with BOT_LOCK:
         BOT_STATE["last_market_scan_ms"] = market_scan_ms
@@ -3710,6 +3786,9 @@ def api_bot_state():
             "last_signal_ms": BOT_STATE["last_signal_ms"],
             "pending_entry": pending_entry,
             "pending_entry_history": pending_entry_history_snapshot(pending_history_limit),
+            "tournament_decisions": dict(BOT_STATE["tournament_decisions"]),
+            "tournament_last_snapshot": dict(BOT_STATE["tournament_last_snapshot"]),
+            "tournament_decisions_evaluated": BOT_STATE["tournament_decisions_evaluated"],
             "history_limits": {
                 "pending_entry_limit": pending_history_limit,
                 "bot_trades_limit": bot_trades_limit,
