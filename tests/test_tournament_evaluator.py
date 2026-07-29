@@ -9,7 +9,7 @@ from unittest.mock import patch
 from tournament.evaluator import evaluate_all_profiles, evaluate_profile
 from tournament.models import ProfileDecision
 from tournament.profiles import build_tournament_profiles
-from tournament.snapshot import MarketSnapshot
+from tournament.snapshot import MarketSnapshot, build_market_snapshot_from_signal
 from tournament.state import create_all_initial_states, load_tournament_state
 
 
@@ -97,12 +97,53 @@ class TournamentEvaluatorTest(unittest.TestCase):
         self.assertTrue(decision.accepted)
         self.assertEqual(decision.status, "ACCEPTED")
         self.assertEqual(decision.direction, "CALL")
+        self.assertEqual(decision.final_direction, "CALL")
+
+    def test_strong_bearish_snapshot_produces_put(self):
+        decision = evaluate_profile(
+            self.profiles["BOT_A_BASELINE"],
+            self.states["BOT_A_BASELINE"],
+            self.snapshot(bullish_score=0, bearish_score=5, suggested_direction="CALL", signal="CALL", market_state="BEARISH", completed_closes=(496.0, 495.0)),
+        )
+        self.assertTrue(decision.accepted)
+        self.assertEqual(decision.direction, "PUT")
+        self.assertEqual(decision.final_direction, "PUT")
+
+    def test_balanced_signals_produce_none(self):
+        decision = evaluate_profile(
+            self.profiles["BOT_A_BASELINE"],
+            self.states["BOT_A_BASELINE"],
+            self.snapshot(bullish_score=2, bearish_score=2, confidence=0, dominance_percent=50.0),
+        )
+        self.assertFalse(decision.accepted)
+        self.assertIsNone(decision.direction)
+        self.assertEqual(decision.preliminary_direction, None)
+        self.assertEqual(decision.rejection_reason, "NO_DOMINANT_DIRECTION")
+
+    def test_direction_threshold_blocks_weak_wave(self):
+        for profile in self.profiles.values():
+            profile.config["strategy"]["direction_threshold_percent"] = 75
+            profile.config["minimum_dominance_percent"] = 50
+        decision = evaluate_profile(
+            self.profiles["BOT_A_BASELINE"],
+            self.states["BOT_A_BASELINE"],
+            self.snapshot(bullish_score=4, bearish_score=2, confidence=4, dominance_percent=66.7),
+        )
+        self.assertFalse(decision.accepted)
+        self.assertEqual(decision.rejection_reason, "DIRECTION_THRESHOLD_NOT_MET")
 
     def test_momentum_profile_waits_for_momentum(self):
         decision = evaluate_profile(self.profiles["BOT_B_MOMENTUM"], self.states["BOT_B_MOMENTUM"], self.snapshot())
         self.assertFalse(decision.accepted)
         self.assertEqual(decision.status, "WAITING_MOMENTUM")
         self.assertEqual(decision.rejection_reason, "MOMENTUM_CONFIRMATION_REQUIRED")
+        self.assertFalse(decision.momentum_passed)
+
+    def test_momentum_profile_accepts_when_momentum_passes(self):
+        decision = evaluate_profile(self.profiles["BOT_B_MOMENTUM"], self.states["BOT_B_MOMENTUM"], self.snapshot(momentum_confirmed=True))
+        self.assertTrue(decision.accepted)
+        self.assertEqual(decision.momentum_status, "PASS")
+        self.assertTrue(decision.momentum_passed)
 
     def test_or_profile_accepts_call_when_required_closes_above_or_high(self):
         decision = evaluate_profile(self.profiles["BOT_C_TWO_CANDLE_OR"], self.states["BOT_C_TWO_CANDLE_OR"], self.snapshot(completed_closes=(500.0, 501.0)))
@@ -140,6 +181,50 @@ class TournamentEvaluatorTest(unittest.TestCase):
         self.assertFalse(decision.accepted)
         self.assertEqual(decision.status, "WAITING_MOMENTUM")
         self.assertEqual(decision.or_confirmation_status, "PASS")
+
+    def test_combined_profile_requires_both_confirmations(self):
+        waiting_or = evaluate_profile(self.profiles["BOT_D_COMBINED"], self.states["BOT_D_COMBINED"], self.snapshot(momentum_confirmed=True, completed_closes=(500.0, 499.0)))
+        accepted = evaluate_profile(self.profiles["BOT_D_COMBINED"], self.states["BOT_D_COMBINED"], self.snapshot(momentum_confirmed=True, completed_closes=(500.0, 501.0)))
+        self.assertEqual(waiting_or.rejection_reason, "TWO_CANDLE_OR_NOT_CONFIRMED")
+        self.assertTrue(accepted.accepted)
+
+    def test_previous_call_does_not_force_next_put_decision(self):
+        call_decision = evaluate_profile(self.profiles["BOT_A_BASELINE"], self.states["BOT_A_BASELINE"], self.snapshot())
+        put_decision = evaluate_profile(self.profiles["BOT_A_BASELINE"], self.states["BOT_A_BASELINE"], self.snapshot(bullish_score=0, bearish_score=5, suggested_direction="CALL", signal="CALL", market_state="BEARISH", completed_closes=(496.0, 495.0)))
+        self.assertEqual(call_decision.direction, "CALL")
+        self.assertEqual(put_decision.direction, "PUT")
+
+    def test_previous_put_does_not_force_next_call_decision(self):
+        put_decision = evaluate_profile(self.profiles["BOT_A_BASELINE"], self.states["BOT_A_BASELINE"], self.snapshot(bullish_score=0, bearish_score=5, suggested_direction="PUT", signal="PUT", market_state="BEARISH", completed_closes=(496.0, 495.0)))
+        call_decision = evaluate_profile(self.profiles["BOT_A_BASELINE"], self.states["BOT_A_BASELINE"], self.snapshot(suggested_direction="PUT", signal="PUT"))
+        self.assertEqual(put_decision.direction, "PUT")
+        self.assertEqual(call_decision.direction, "CALL")
+
+    def test_direction_trace_explains_final_direction(self):
+        decision = evaluate_profile(self.profiles["BOT_A_BASELINE"], self.states["BOT_A_BASELINE"], self.snapshot(bullish_score=4, bearish_score=1, confidence=4, dominance_percent=80.0))
+        self.assertEqual(decision.total_signals, 5)
+        self.assertEqual(decision.bullish_dominance_percent, 80.0)
+        self.assertEqual(decision.bearish_dominance_percent, 20.0)
+        self.assertEqual(decision.preliminary_direction, "CALL")
+        self.assertEqual(decision.final_direction, "CALL")
+
+    def test_dashboard_current_signal_does_not_control_tournament_direction(self):
+        snapshot = build_market_snapshot_from_signal(
+            {
+                "current_signal": "PUT",
+                "decision": "BUY PUT",
+                "bullish_score": 5,
+                "bearish_score": 0,
+                "confidence": 5,
+                "dominance_percent": 100.0,
+                "levels": {"opening_range_high": 499, "opening_range_low": 497},
+            },
+            "SPY",
+            "2026-07-28T09:35:00-04:00",
+        )
+        decision = evaluate_profile(self.profiles["BOT_A_BASELINE"], self.states["BOT_A_BASELINE"], snapshot)
+        self.assertEqual(snapshot.suggested_direction, None)
+        self.assertEqual(decision.direction, "CALL")
 
     def test_confidence_below_four_rejects_all_profiles(self):
         snapshot = self.snapshot(bullish_score=5, bearish_score=2, confidence=3, dominance_percent=71.4)

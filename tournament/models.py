@@ -19,6 +19,17 @@ class ProfileDecision:
     momentum_status: str
     or_confirmation_required: bool
     or_confirmation_status: str
+    total_signals: int = 0
+    bullish_dominance_percent: float = 0.0
+    bearish_dominance_percent: float = 0.0
+    direction_threshold: float = 0.0
+    minimum_dominance: float = 0.0
+    preliminary_direction: str | None = None
+    momentum_passed: bool = False
+    two_candle_or_passed: bool = False
+    final_direction: str | None = None
+    entry_status: str = "NOT_ATTEMPTED"
+    entry_block_reason: str | None = None
 
 
 @dataclass

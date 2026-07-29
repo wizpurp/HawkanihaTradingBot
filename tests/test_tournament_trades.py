@@ -1,4 +1,5 @@
 import os
+import pathlib
 import tempfile
 import unittest
 from dataclasses import asdict
@@ -175,15 +176,17 @@ class TournamentTradesTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = self.temp_path(directory)
             with patch.object(dashboard, "TOURNAMENT_TRADES_FILE", path):
+                dashboard.BOT_STATE["tournament_decisions"] = {"BOT_A_BASELINE": {"final_direction": "CALL"}}
                 response = dashboard.app.test_client().post(
                     "/api/tournament/trades/test-record",
-                    json={"profile_id": "BOT_A_BASELINE", "direction": "CALL", "entry_price": 1.0},
+                    json={"profile_id": "BOT_A_BASELINE", "direction": "PUT", "entry_price": 1.0},
                 )
 
         data = response.get_json()
         self.assertTrue(data["ok"])
         self.assertEqual(data["trade"]["signal"], "TEST_RECORD")
         self.assertEqual(data["trade"]["status"], "OPEN")
+        self.assertEqual(data["trade"]["direction"], "CALL")
 
     def test_test_record_endpoint_never_calls_tradier(self):
         import dashboard
@@ -191,14 +194,36 @@ class TournamentTradesTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = self.temp_path(directory)
             with patch.object(dashboard, "TOURNAMENT_TRADES_FILE", path), patch.object(dashboard.requests, "post") as post_mock, patch.object(dashboard.requests, "get") as get_mock:
+                dashboard.BOT_STATE["tournament_decisions"] = {"BOT_A_BASELINE": {"final_direction": "CALL"}}
                 response = dashboard.app.test_client().post(
                     "/api/tournament/trades/test-record",
-                    json={"profile_id": "BOT_A_BASELINE", "direction": "CALL", "entry_price": 1.0},
+                    json={"profile_id": "BOT_A_BASELINE", "direction": "PUT", "entry_price": 1.0},
                 )
 
         self.assertEqual(response.status_code, 200)
         post_mock.assert_not_called()
         get_mock.assert_not_called()
+
+    def test_synthetic_test_payload_direction_cannot_override_automatic_direction(self):
+        import dashboard
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.temp_path(directory)
+            with patch.object(dashboard, "TOURNAMENT_TRADES_FILE", path):
+                dashboard.BOT_STATE["tournament_decisions"] = {"BOT_A_BASELINE": {"final_direction": "PUT"}}
+                response = dashboard.app.test_client().post(
+                    "/api/tournament/trades/test-record",
+                    json={"profile_id": "BOT_A_BASELINE", "direction": "CALL", "entry_price": 1.0},
+                )
+
+        data = response.get_json()
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["trade"]["direction"], "PUT")
+
+    def test_tournament_direction_dropdown_is_not_rendered(self):
+        source = pathlib.Path(__file__).resolve().parents[1].joinpath("dashboard.py").read_text(encoding="utf-8")
+        self.assertNotIn('id="tournament-test-direction"', source)
+        self.assertIn("Manual broker tools do not control tournament direction.", source)
 
     def test_tournament_trades_do_not_appear_in_original_bot_trade_history(self):
         import dashboard

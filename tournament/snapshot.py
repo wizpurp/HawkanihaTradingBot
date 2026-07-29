@@ -32,6 +32,17 @@ class MarketSnapshot:
     option_last: float | None = None
     option_midpoint: float | None = None
     option_quote_timestamp: str | None = None
+    call_option_symbol: str | None = None
+    call_option_bid: float | None = None
+    call_option_ask: float | None = None
+    call_option_last: float | None = None
+    call_option_midpoint: float | None = None
+    put_option_symbol: str | None = None
+    put_option_bid: float | None = None
+    put_option_ask: float | None = None
+    put_option_last: float | None = None
+    put_option_midpoint: float | None = None
+    momentum_confirmed: bool = False
 
 
 def _float_or_none(value):
@@ -57,7 +68,6 @@ def build_market_snapshot_from_signal(signal: dict, symbol: str, timestamp: str)
     signal = dict(signal or {})
     levels = dict(signal.get("levels") or {})
     current_signal = signal.get("current_signal") or signal.get("signal")
-    suggested_direction = _direction_from_signal(current_signal or signal.get("decision"))
     completed_closes = tuple(
         close for close in (_float_or_none(value) for value in signal.get("completed_closes", ()))
         if close is not None
@@ -77,7 +87,7 @@ def build_market_snapshot_from_signal(signal: dict, symbol: str, timestamp: str)
         confidence=int(signal.get("confidence") or 0),
         dominance_percent=float(signal.get("dominance_percent") or 0),
         market_state=signal.get("market_state"),
-        suggested_direction=suggested_direction,
+        suggested_direction=None,
         signal=current_signal,
         ema_bullish=bool(signal.get("ema_bullish") or signal.get("ema_state") == "BULLISH"),
         ema_bearish=bool(signal.get("ema_bearish") or signal.get("ema_state") == "BEARISH"),
@@ -96,4 +106,15 @@ def build_market_snapshot_from_signal(signal: dict, symbol: str, timestamp: str)
         option_last=_float_or_none(signal.get("option_last")),
         option_midpoint=_float_or_none(signal.get("option_midpoint")),
         option_quote_timestamp=signal.get("option_quote_timestamp"),
+        call_option_symbol=signal.get("call_option_symbol"),
+        call_option_bid=_float_or_none(signal.get("call_option_bid")),
+        call_option_ask=_float_or_none(signal.get("call_option_ask")),
+        call_option_last=_float_or_none(signal.get("call_option_last")),
+        call_option_midpoint=_float_or_none(signal.get("call_option_midpoint")),
+        put_option_symbol=signal.get("put_option_symbol"),
+        put_option_bid=_float_or_none(signal.get("put_option_bid")),
+        put_option_ask=_float_or_none(signal.get("put_option_ask")),
+        put_option_last=_float_or_none(signal.get("put_option_last")),
+        put_option_midpoint=_float_or_none(signal.get("put_option_midpoint")),
+        momentum_confirmed=bool(signal.get("momentum_confirmed") or signal.get("option_momentum_confirmed")),
     )

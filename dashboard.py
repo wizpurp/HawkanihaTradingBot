@@ -2797,22 +2797,23 @@ def initialize_tournament_recovery():
 
 def add_snapshot_option_fields(signal, call_contract=None, put_contract=None):
     signal = dict(signal or {})
-    selected_contract = None
-    if signal.get("current_signal") == "CALL":
-        selected_contract = call_contract
-    elif signal.get("current_signal") == "PUT":
-        selected_contract = put_contract
 
-    if selected_contract:
-        bid = safe_float(selected_contract.get("bid"), None)
-        ask = safe_float(selected_contract.get("ask"), None)
-        last = safe_float(selected_contract.get("last"), None)
+    def add_contract(prefix, contract):
+        if not contract:
+            return
+        bid = safe_float(contract.get("bid"), None)
+        ask = safe_float(contract.get("ask"), None)
+        last = safe_float(contract.get("last"), None)
         midpoint = ((bid + ask) / 2) if bid is not None and ask is not None and bid > 0 and ask > 0 else None
-        signal["option_symbol"] = selected_contract.get("symbol")
-        signal["option_bid"] = bid
-        signal["option_ask"] = ask
-        signal["option_last"] = last
-        signal["option_midpoint"] = midpoint
+        signal[f"{prefix}_option_symbol"] = contract.get("symbol")
+        signal[f"{prefix}_option_bid"] = bid
+        signal[f"{prefix}_option_ask"] = ask
+        signal[f"{prefix}_option_last"] = last
+        signal[f"{prefix}_option_midpoint"] = midpoint
+
+    add_contract("call", call_contract)
+    add_contract("put", put_contract)
+    if call_contract or put_contract:
         signal["option_quote_timestamp"] = market_now().isoformat()
     return signal
 
@@ -4662,10 +4663,16 @@ def api_create_test_tournament_trade():
     payload = request.get_json(silent=True) if request.is_json else request.form
     payload = payload or {}
     try:
+        profile_id = payload.get("profile_id")
+        with BOT_LOCK:
+            latest_decision = dict(BOT_STATE.get("tournament_decisions", {}).get(profile_id, {}))
+        direction = latest_decision.get("final_direction") or latest_decision.get("direction")
+        if direction not in {"CALL", "PUT"}:
+            return jsonify({"ok": False, "errors": ["latest profile decision has no automatic CALL/PUT direction"]}), 400
         entry_price = safe_float(payload.get("entry_price", 1.0), 1.0)
         trade = create_synthetic_tournament_trade(
-            profile_id=payload.get("profile_id"),
-            direction=payload.get("direction"),
+            profile_id=profile_id,
+            direction=direction,
             entry_price=entry_price,
             option_symbol=payload.get("option_symbol") or None,
             symbol=payload.get("symbol") or load_config().get("symbol", "SPY"),
@@ -5861,11 +5868,19 @@ Contracts: {tournament_input(profile_id, row, "contracts", minimum=1)}<br>
 <td>{html_lib.escape(settings_row.get("display_name", profile_id))}</td>
 <td>{settings_row.get("enabled", True)}</td>
 <td>{html_lib.escape(str(row.get("status", "N/A")))}</td>
-<td>{html_lib.escape(str(row.get("direction", "N/A")))}</td>
+<td>{row.get("bullish_score", 0)}</td>
+<td>{row.get("bearish_score", 0)}</td>
+<td>{html_lib.escape(str(row.get("preliminary_direction") or "NONE"))}</td>
+<td>{safe_float(row.get("bullish_dominance_percent")):.1f}% / {safe_float(row.get("bearish_dominance_percent")):.1f}%</td>
+<td>{safe_float(row.get("direction_threshold")):.1f}%</td>
+<td>{safe_float(row.get("minimum_dominance")):.1f}%</td>
+<td>{html_lib.escape(str(row.get("momentum_status", "N/A")))}</td>
+<td>{html_lib.escape(str(row.get("or_confirmation_status", "N/A")))}</td>
+<td>{html_lib.escape(str(row.get("final_direction") or row.get("direction") or "NONE"))}</td>
 <td>{row.get("accepted", False)}</td>
 <td>{html_lib.escape(str(row.get("rejection_reason") or ""))}</td>
-<td>{row.get("momentum_required", False)}</td>
-<td>{row.get("or_confirmation_required", False)}</td>
+<td>{html_lib.escape(str(row.get("entry_status") or ""))}</td>
+<td>{html_lib.escape(str(row.get("entry_block_reason") or ""))}</td>
 <td>{evaluated}</td>
 <td>{escape_html(position.status if position else "NONE")}</td>
 <td>{escape_html(position.option_symbol if position else "")}</td>
@@ -6092,11 +6107,19 @@ Bot Reason Log:<br>
 <th>Profile</th>
 <th>Enabled</th>
 <th>Status</th>
-<th>Direction</th>
+<th>Bullish Score</th>
+<th>Bearish Score</th>
+<th>Dominant Side</th>
+<th>Dominance %</th>
+<th>Direction Threshold</th>
+<th>Minimum Dominance</th>
+<th>Momentum Result</th>
+<th>OR Result</th>
+<th>Final Direction</th>
 <th>Accepted</th>
 <th>Rejection Reason</th>
-<th>Momentum Required</th>
-<th>OR Required</th>
+<th>Entry Status</th>
+<th>Entry Block Reason</th>
 <th>Decisions Evaluated</th>
 <th>Position Status</th>
 <th>Option</th>
@@ -6118,7 +6141,9 @@ Bot Reason Log:<br>
 
 <div class="card">
 <h2>TOURNAMENT TRADES</h2>
-<div class="item">
+<details class="item">
+<summary><strong>DEVELOPER TEST TOOLS</strong></summary>
+<br>
 <label>Test Profile:</label>
 <select id="tournament-test-profile">
 <option value="BOT_A_BASELINE">Bot A Baseline</option>
@@ -6126,15 +6151,10 @@ Bot Reason Log:<br>
 <option value="BOT_C_TWO_CANDLE_OR">Bot C Two-Candle OR</option>
 <option value="BOT_D_COMBINED">Bot D Combined</option>
 </select>
-<label>Direction:</label>
-<select id="tournament-test-direction">
-<option value="CALL">CALL</option>
-<option value="PUT">PUT</option>
-</select>
 <button type="button" onclick="createTestTournamentTrade()">Create Test Tournament Trade</button>
 <button type="button" class="yellow" onclick="closeLatestTestTournamentTrade()">Close Latest Test Trade</button>
-<br><small>Developer-only synthetic records. These buttons never call Tradier and never touch the original bot trade history.</small>
-</div>
+<br><small>Developer-only synthetic records. Direction is derived from the latest automatic ProfileDecision. These records are not proof that automatic direction selection works.</small>
+</details>
 <br>
 <div class="history-panel tournament-trades-panel">
 <table class="decision-table">
@@ -6164,7 +6184,9 @@ Bot Reason Log:<br>
 </div>
 
 <div class="card">
-<h2>Manual Contract Picker</h2>
+<h2>MANUAL BROKER TOOLS</h2>
+<p>Manual broker tools do not control tournament direction.</p>
+<h3>Manual Contract Picker</h3>
 
 <form method="POST" action="/manual-buy-selected">
 
@@ -6967,11 +6989,19 @@ function renderTournamentDecisions(decisions, evaluatedByProfile, settings, stat
 <td>${{escapeHtml(label)}}</td>
 <td>${{escapeHtml(enabled ?? "N/A")}}</td>
 <td>${{escapeHtml(row.status || "N/A")}}</td>
-<td>${{escapeHtml(row.direction || "N/A")}}</td>
+<td>${{escapeHtml(row.bullish_score ?? 0)}}</td>
+<td>${{escapeHtml(row.bearish_score ?? 0)}}</td>
+<td>${{escapeHtml(row.preliminary_direction || "NONE")}}</td>
+<td>${{Number(row.bullish_dominance_percent || 0).toFixed(1)}}% / ${{Number(row.bearish_dominance_percent || 0).toFixed(1)}}%</td>
+<td>${{Number(row.direction_threshold || 0).toFixed(1)}}%</td>
+<td>${{Number(row.minimum_dominance || 0).toFixed(1)}}%</td>
+<td>${{escapeHtml(row.momentum_status || "N/A")}}</td>
+<td>${{escapeHtml(row.or_confirmation_status || "N/A")}}</td>
+<td>${{escapeHtml(row.final_direction || row.direction || "NONE")}}</td>
 <td>${{escapeHtml(row.accepted ?? false)}}</td>
 <td>${{escapeHtml(row.rejection_reason || "")}}</td>
-<td>${{escapeHtml(row.momentum_required ?? false)}}</td>
-<td>${{escapeHtml(row.or_confirmation_required ?? false)}}</td>
+<td>${{escapeHtml(row.entry_status || "")}}</td>
+<td>${{escapeHtml(row.entry_block_reason || "")}}</td>
 <td>${{escapeHtml(evaluatedByProfile[profileId] || 0)}}</td>
 <td>${{escapeHtml(position?.status || "NONE")}}</td>
 <td>${{escapeHtml(position?.option_symbol || "")}}</td>
@@ -7057,11 +7087,10 @@ async function updateTournamentTrades() {{
 
 async function createTestTournamentTrade() {{
     const profileId = document.getElementById("tournament-test-profile")?.value || "BOT_A_BASELINE";
-    const direction = document.getElementById("tournament-test-direction")?.value || "CALL";
     await fetch("/api/tournament/trades/test-record", {{
         method: "POST",
         headers: {{ "Content-Type": "application/json" }},
-        body: JSON.stringify({{ profile_id: profileId, direction, entry_price: 1.0 }})
+        body: JSON.stringify({{ profile_id: profileId, entry_price: 1.0 }})
     }});
     await updateTournamentTrades();
 }}

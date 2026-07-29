@@ -2,6 +2,7 @@ import os
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from unittest.mock import patch
 
 from tournament.execution import try_open_virtual_position
@@ -199,6 +200,51 @@ class TournamentVirtualEntriesTest(unittest.TestCase):
         trade = self.open_position()
         position = self.states["BOT_A_BASELINE"].virtual_position
         self.assertEqual(trade.trade_id, position.trade_id)
+
+    def test_call_decision_opens_only_call_contract(self):
+        snap = replace(
+            snapshot(),
+            call_option_symbol="SPYTESTCALL",
+            call_option_ask=1.1,
+            put_option_symbol="SPYTESTPUT",
+            put_option_ask=0.9,
+        )
+        trade = self.open_position(direction="CALL", snap=snap)
+        self.assertEqual(trade.option_symbol, "SPYTESTCALL")
+        self.assertEqual(trade.direction, "CALL")
+
+    def test_put_decision_opens_only_put_contract(self):
+        snap = replace(
+            snapshot(direction="PUT", option_symbol=None),
+            call_option_symbol="SPYTESTCALL",
+            call_option_ask=1.1,
+            put_option_symbol="SPYTESTPUT",
+            put_option_ask=0.9,
+        )
+        trade = self.open_position(direction="PUT", snap=snap)
+        self.assertEqual(trade.option_symbol, "SPYTESTPUT")
+        self.assertEqual(trade.direction, "PUT")
+
+    def test_none_decision_never_opens_position(self):
+        decision = accepted_decision("BOT_A_BASELINE", None)
+        decision.accepted = False
+        decision.direction = None
+        trade = try_open_virtual_position(
+            self.profiles["BOT_A_BASELINE"],
+            self.states["BOT_A_BASELINE"],
+            decision,
+            snapshot(),
+            1000.0,
+        )
+        self.assertIsNone(trade)
+        self.assertIsNone(self.states["BOT_A_BASELINE"].virtual_position)
+
+    def test_call_decision_cannot_open_put_contract(self):
+        snap = replace(snapshot(option_symbol="SPYTESTPUT"), call_option_symbol="SPYTESTPUT", call_option_ask=1.0)
+        decision = accepted_decision("BOT_A_BASELINE", "CALL", snap.timestamp)
+        trade = try_open_virtual_position(self.profiles["BOT_A_BASELINE"], self.states["BOT_A_BASELINE"], decision, snap, 1000.0)
+        self.assertIsNone(trade)
+        self.assertEqual(decision.entry_block_reason, "OPTION_DIRECTION_MISMATCH")
 
     def test_risk_settings_are_captured_at_entry(self):
         self.profiles["BOT_A_BASELINE"].config["strategy"]["hard_stop_percent"] = 9
