@@ -7,12 +7,16 @@ import os
 import threading
 import time
 import html as html_lib
+import traceback
+import atexit
 from dataclasses import asdict
 from datetime import datetime, timedelta, time as datetime_time
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from logs.trade_logger import *
 from tournament.evaluator import evaluate_all_profiles
+from tournament.execution import try_open_virtual_position
+from tournament.exits import evaluate_virtual_exit, process_virtual_exits, stop_snapshot, update_virtual_position_price, valid_bid
 from tournament.profiles import (
     PROFILE_ORDER,
     TOURNAMENT_PROFILES_FILE,
@@ -23,8 +27,24 @@ from tournament.profiles import (
     reset_tournament_profile_settings,
     save_tournament_profile_settings,
 )
+from tournament.recovery import (
+    apply_daily_resets,
+    quote_is_fresh,
+    reconcile_tournament_state,
+    tournament_market_is_open,
+)
 from tournament.snapshot import build_market_snapshot_from_signal
-from tournament.state import create_all_initial_states
+from tournament import state as tournament_state_module
+from tournament import trades as tournament_trades_module
+from tournament.state import TOURNAMENT_STATE_FILE, create_all_initial_states, load_tournament_state, save_tournament_state
+from tournament.trades import (
+    TOURNAMENT_TRADES_FILE,
+    append_tournament_trade,
+    create_synthetic_tournament_trade,
+    get_tournament_trade,
+    list_tournament_trades,
+    update_tournament_trade,
+)
 
 load_dotenv()
 
@@ -82,6 +102,7 @@ BOT_AUDIT_COLUMNS = [
     "stop_control_rule"
 ]
 BOT_LOCK = threading.Lock()
+TOURNAMENT_LOCK = threading.RLock()
 BOT_STATE = {
     "samples": [],
     "bullish_score": 0,
@@ -194,9 +215,31 @@ BOT_STATE = {
     "tournament_decisions": {},
     "tournament_last_snapshot": {},
     "tournament_decisions_evaluated": 0,
-    "tournament_decisions_evaluated_by_profile": {}
+    "tournament_decisions_evaluated_by_profile": {},
+    "tournament_virtual_positions": [],
+    "tournament_state_by_profile": {},
+    "tournament_health": {}
 }
 TOURNAMENT_RUNTIME_STATES = {}
+TOURNAMENT_RUNTIME_STATES_LOADED = False
+TOURNAMENT_STATE_DIRTY = False
+TOURNAMENT_EXIT_THREAD = None
+TOURNAMENT_WATCHDOG_THREAD = None
+TOURNAMENT_HEALTH = {
+    "tournament_entry_loop_alive": False,
+    "tournament_exit_loop_alive": False,
+    "tournament_last_entry_cycle": None,
+    "tournament_last_exit_poll": None,
+    "tournament_last_successful_quote": None,
+    "tournament_last_state_save": None,
+    "tournament_last_error": None,
+    "tournament_recovery_complete": False,
+    "tournament_recovery_status": "NOT_RUN",
+    "state_source": "EMPTY",
+    "trades_source": "EMPTY",
+    "state_save_failed": False,
+    "stopping": False,
+}
 
 
 def clamp_int(value, minimum, maximum, default):
@@ -362,6 +405,19 @@ def tournament_api_or_redirect(payload, status=200):
     if wants_json:
         return jsonify(payload), status
     return redirect("/")
+
+
+def tournament_trade_to_dict(trade):
+    return asdict(trade)
+
+
+def tournament_trades_response(trades):
+    rows = [tournament_trade_to_dict(trade) for trade in trades]
+    return {
+        "ok": True,
+        "count": len(rows),
+        "trades": rows,
+    }
 
 
 def grade_from_score(score):
@@ -1109,7 +1165,12 @@ def get_market_quote(symbol):
         quote = data["quote"]
         record_api_diagnostic("quote", started_at, "OK")
         if isinstance(quote, list):
-            return quote[0]
+            quote = quote[0]
+        if isinstance(quote, dict):
+            quote["_fetched_at"] = market_now().isoformat()
+            TOURNAMENT_HEALTH["tournament_last_successful_quote"] = quote["_fetched_at"]
+            with BOT_LOCK:
+                BOT_STATE["tournament_health"] = dict(TOURNAMENT_HEALTH)
         return quote
     except Exception as exc:
         record_api_diagnostic("quote", started_at, f"ERROR {exc}")
@@ -2583,8 +2644,12 @@ def calculate_surfer_signal(config, positions=None):
 
 
 def ensure_tournament_runtime_states(profiles):
-    global TOURNAMENT_RUNTIME_STATES
-    existing = TOURNAMENT_RUNTIME_STATES if isinstance(TOURNAMENT_RUNTIME_STATES, dict) else {}
+    global TOURNAMENT_RUNTIME_STATES, TOURNAMENT_RUNTIME_STATES_LOADED
+    if not TOURNAMENT_RUNTIME_STATES_LOADED:
+        existing = load_tournament_state(TOURNAMENT_STATE_FILE, profiles)
+        TOURNAMENT_RUNTIME_STATES_LOADED = True
+    else:
+        existing = TOURNAMENT_RUNTIME_STATES if isinstance(TOURNAMENT_RUNTIME_STATES, dict) else {}
     missing_profiles = {
         profile_id: profile
         for profile_id, profile in profiles.items()
@@ -2597,6 +2662,159 @@ def ensure_tournament_runtime_states(profiles):
         for profile_id in profiles
     }
     return TOURNAMENT_RUNTIME_STATES
+
+
+def mark_tournament_dirty():
+    global TOURNAMENT_STATE_DIRTY
+    TOURNAMENT_STATE_DIRTY = True
+
+
+def mark_tournament_saved():
+    global TOURNAMENT_STATE_DIRTY
+    TOURNAMENT_STATE_DIRTY = False
+    now_iso = market_now().isoformat()
+    TOURNAMENT_HEALTH["tournament_last_state_save"] = now_iso
+    TOURNAMENT_HEALTH["state_save_failed"] = False
+    with BOT_LOCK:
+        BOT_STATE["tournament_health"] = dict(TOURNAMENT_HEALTH)
+
+
+def save_tournament_state_safe(states):
+    try:
+        save_tournament_state(TOURNAMENT_STATE_FILE, states)
+        mark_tournament_saved()
+        return True
+    except Exception as error:
+        TOURNAMENT_HEALTH["state_save_failed"] = True
+        TOURNAMENT_HEALTH["tournament_last_error"] = str(error)
+        with BOT_LOCK:
+            BOT_STATE["tournament_health"] = dict(TOURNAMENT_HEALTH)
+        print("TOURNAMENT STATE SAVE ERROR:", error)
+        return False
+
+
+def seconds_since_iso(value):
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=MARKET_TZ)
+        return max(0, int((market_now() - parsed.astimezone(MARKET_TZ)).total_seconds()))
+    except Exception:
+        return None
+
+
+def tournament_health_snapshot():
+    with TOURNAMENT_LOCK:
+        profiles = build_tournament_profiles(load_config())
+        states = ensure_tournament_runtime_states(profiles)
+        open_positions = len(get_unique_tournament_option_symbols(states))
+    entry_age = seconds_since_iso(TOURNAMENT_HEALTH.get("tournament_last_entry_cycle"))
+    exit_age = seconds_since_iso(TOURNAMENT_HEALTH.get("tournament_last_exit_poll"))
+    quote_age = seconds_since_iso(TOURNAMENT_HEALTH.get("tournament_last_successful_quote"))
+    save_age = seconds_since_iso(TOURNAMENT_HEALTH.get("tournament_last_state_save"))
+    exit_alive = bool(TOURNAMENT_EXIT_THREAD and TOURNAMENT_EXIT_THREAD.is_alive())
+    entry_alive = bool(BOT_STATE.get("thread_alive")) or TOURNAMENT_HEALTH.get("tournament_entry_loop_alive")
+    recovery_complete = bool(TOURNAMENT_HEALTH.get("tournament_recovery_complete"))
+    last_error = TOURNAMENT_HEALTH.get("tournament_last_error")
+    status = "HEALTHY"
+    warnings = []
+    if not recovery_complete:
+        status = "FAILED"
+        warnings.append("recovery incomplete")
+    if not exit_alive:
+        status = "FAILED"
+        warnings.append("exit monitor is not alive")
+    if TOURNAMENT_HEALTH.get("state_save_failed"):
+        status = "FAILED"
+        warnings.append("state save failed")
+    if quote_age is not None and quote_age > 30:
+        status = "DEGRADED" if status == "HEALTHY" else status
+        warnings.append("quote is stale")
+    if TOURNAMENT_HEALTH.get("state_source") == "BACKUP" or TOURNAMENT_HEALTH.get("trades_source") == "BACKUP":
+        status = "DEGRADED" if status == "HEALTHY" else status
+        warnings.append("backup recovery used")
+    if exit_age is not None and exit_age > 30:
+        status = "DEGRADED" if status == "HEALTHY" else status
+        warnings.append("exit loop delayed")
+    if last_error and last_error not in {"None", ""}:
+        status = "DEGRADED" if status == "HEALTHY" else status
+
+    return {
+        "overall_status": status,
+        "profile_count": len(profiles),
+        "open_position_count": open_positions,
+        "entry_loop_alive": bool(entry_alive),
+        "exit_loop_alive": exit_alive,
+        "seconds_since_last_entry_cycle": entry_age,
+        "seconds_since_last_exit_poll": exit_age,
+        "seconds_since_last_successful_quote": quote_age,
+        "state_save_age": save_age,
+        "recovery_status": TOURNAMENT_HEALTH.get("tournament_recovery_status"),
+        "recovery_complete": recovery_complete,
+        "last_error": last_error or "None",
+        "warnings": warnings,
+        **dict(TOURNAMENT_HEALTH),
+    }
+
+
+def initialize_tournament_recovery():
+    global TOURNAMENT_RUNTIME_STATES, TOURNAMENT_RUNTIME_STATES_LOADED
+    config = load_config()
+    profiles = build_tournament_profiles(config)
+    with TOURNAMENT_LOCK:
+        states = load_tournament_state(TOURNAMENT_STATE_FILE, profiles)
+        trades = list_tournament_trades(path=TOURNAMENT_TRADES_FILE)
+        states, trades, summary = reconcile_tournament_state(profiles, states, trades)
+        daily_reset_changed = apply_daily_resets(profiles, states, time.time())
+        TOURNAMENT_RUNTIME_STATES = states
+        TOURNAMENT_RUNTIME_STATES_LOADED = True
+        if summary.get("changed") or daily_reset_changed:
+            tournament_trades_module.save_tournament_trades(trades, TOURNAMENT_TRADES_FILE)
+            save_tournament_state_safe(states)
+        positions = serialize_tournament_positions(states)
+        state_by_profile = refresh_tournament_state_snapshot(states)
+
+    TOURNAMENT_HEALTH["tournament_recovery_complete"] = True
+    TOURNAMENT_HEALTH["tournament_recovery_status"] = "COMPLETE"
+    TOURNAMENT_HEALTH["state_source"] = tournament_state_module.LAST_STATE_LOAD_SOURCE
+    TOURNAMENT_HEALTH["trades_source"] = tournament_trades_module.LAST_TRADES_LOAD_SOURCE
+    with BOT_LOCK:
+        BOT_STATE["tournament_virtual_positions"] = positions
+        BOT_STATE["tournament_state_by_profile"] = state_by_profile
+        BOT_STATE["tournament_health"] = dict(TOURNAMENT_HEALTH)
+
+    print("TOURNAMENT RECOVERY COMPLETE")
+    print("profiles:", summary.get("profiles", 0))
+    print("open_positions:", summary.get("open_positions", 0))
+    print("recovered_positions:", summary.get("recovered_positions", 0))
+    print("cancelled_invalid:", summary.get("cancelled_invalid", 0))
+    print("duplicates_cleaned:", summary.get("duplicates_cleaned", 0))
+    print("state_source:", TOURNAMENT_HEALTH["state_source"])
+    return summary
+
+
+def add_snapshot_option_fields(signal, call_contract=None, put_contract=None):
+    signal = dict(signal or {})
+    selected_contract = None
+    if signal.get("current_signal") == "CALL":
+        selected_contract = call_contract
+    elif signal.get("current_signal") == "PUT":
+        selected_contract = put_contract
+
+    if selected_contract:
+        bid = safe_float(selected_contract.get("bid"), None)
+        ask = safe_float(selected_contract.get("ask"), None)
+        last = safe_float(selected_contract.get("last"), None)
+        midpoint = ((bid + ask) / 2) if bid is not None and ask is not None and bid > 0 and ask > 0 else None
+        signal["option_symbol"] = selected_contract.get("symbol")
+        signal["option_bid"] = bid
+        signal["option_ask"] = ask
+        signal["option_last"] = last
+        signal["option_midpoint"] = midpoint
+        signal["option_quote_timestamp"] = market_now().isoformat()
+    return signal
 
 
 def print_tournament_decisions(decisions):
@@ -2612,31 +2830,224 @@ def print_tournament_decisions(decisions):
         print("reason:", decision.rejection_reason)
 
 
-def evaluate_tournament_decisions(config, signal):
+def serialize_tournament_positions(states):
+    rows = []
+    now_epoch = time.time()
+    for profile_id, state in states.items():
+        position = state.virtual_position
+        if position and position.status == "OPEN":
+            row = asdict(position)
+            row.update(stop_snapshot(position))
+            cooldown_until = state.virtual_entry_cooldown_until_epoch
+            row["virtual_trades_today"] = state.virtual_trades_today
+            row["cooldown_remaining_seconds"] = max(0, int(cooldown_until - now_epoch)) if cooldown_until else 0
+            row["last_entry_fingerprint"] = state.last_entry_fingerprint
+            rows.append(row)
+    return rows
+
+
+def evaluate_tournament_decisions(config, signal, call_contract=None, put_contract=None):
     profiles = build_tournament_profiles(config)
-    states = ensure_tournament_runtime_states(profiles)
+    signal = add_snapshot_option_fields(signal, call_contract, put_contract)
     snapshot = build_market_snapshot_from_signal(
         signal,
         config.get("symbol", "SPY"),
         market_now().isoformat(),
     )
-    decisions = evaluate_all_profiles(profiles, states, snapshot)
-    with BOT_LOCK:
-        BOT_STATE["tournament_last_snapshot"] = asdict(snapshot)
-        BOT_STATE["tournament_decisions"] = {
+    with TOURNAMENT_LOCK:
+        states = ensure_tournament_runtime_states(profiles)
+        daily_reset_changed = apply_daily_resets(profiles, states, time.time())
+        decisions = evaluate_all_profiles(profiles, states, snapshot)
+        opened_trades = []
+        now_epoch = time.time()
+        for profile_id, profile in profiles.items():
+            trade = try_open_virtual_position(
+                profile,
+                states[profile_id],
+                decisions[profile_id],
+                snapshot,
+                now_epoch,
+            )
+            if trade:
+                opened_trades.append(trade)
+                print("TOURNAMENT VIRTUAL ENTRY")
+                print("profile:", trade.profile_id)
+                print("trade_id:", trade.trade_id)
+                print("direction:", trade.direction)
+                print("option_symbol:", trade.option_symbol)
+                print("entry_price:", trade.entry_price)
+                print("contracts:", trade.contracts)
+                print("entry_cost:", trade.entry_cost)
+        if opened_trades or daily_reset_changed:
+            save_tournament_state_safe(states)
+        state_by_profile = {
+            profile_id: {
+                "virtual_position": dict(asdict(state.virtual_position), **stop_snapshot(state.virtual_position)) if state.virtual_position else None,
+                "virtual_trades_today": state.virtual_trades_today,
+                "cooldown_remaining_seconds": max(0, int(state.virtual_entry_cooldown_until_epoch - now_epoch)) if state.virtual_entry_cooldown_until_epoch else 0,
+                "last_entry_fingerprint": state.last_entry_fingerprint,
+            }
+            for profile_id, state in states.items()
+        }
+        positions = serialize_tournament_positions(states)
+        decisions_payload = {
             profile_id: asdict(decision)
             for profile_id, decision in decisions.items()
         }
-        BOT_STATE["tournament_decisions_evaluated"] = sum(
-            state.decisions_evaluated
-            for state in states.values()
-        )
-        BOT_STATE["tournament_decisions_evaluated_by_profile"] = {
+        decisions_evaluated = sum(state.decisions_evaluated for state in states.values())
+        decisions_evaluated_by_profile = {
             profile_id: state.decisions_evaluated
             for profile_id, state in states.items()
         }
+    with BOT_LOCK:
+        BOT_STATE["tournament_last_snapshot"] = asdict(snapshot)
+        BOT_STATE["tournament_decisions"] = decisions_payload
+        BOT_STATE["tournament_decisions_evaluated"] = decisions_evaluated
+        BOT_STATE["tournament_decisions_evaluated_by_profile"] = decisions_evaluated_by_profile
+        BOT_STATE["tournament_virtual_positions"] = positions
+        BOT_STATE["tournament_state_by_profile"] = state_by_profile
+        TOURNAMENT_HEALTH["tournament_entry_loop_alive"] = True
+        TOURNAMENT_HEALTH["tournament_last_entry_cycle"] = market_now().isoformat()
+        BOT_STATE["tournament_health"] = dict(TOURNAMENT_HEALTH)
     print_tournament_decisions(decisions)
     return snapshot, decisions
+
+
+def refresh_tournament_state_snapshot(states):
+    now_epoch = time.time()
+    return {
+        profile_id: {
+            "virtual_position": dict(asdict(state.virtual_position), **stop_snapshot(state.virtual_position)) if state.virtual_position else None,
+            "virtual_trades_today": state.virtual_trades_today,
+            "cooldown_remaining_seconds": max(0, int(state.virtual_entry_cooldown_until_epoch - now_epoch)) if state.virtual_entry_cooldown_until_epoch else 0,
+            "last_entry_fingerprint": state.last_entry_fingerprint,
+        }
+        for profile_id, state in states.items()
+    }
+
+
+def get_unique_tournament_option_symbols(states):
+    return sorted({
+        state.virtual_position.option_symbol
+        for state in states.values()
+        if state.virtual_position and state.virtual_position.status == "OPEN" and state.virtual_position.option_symbol
+    })
+
+
+def process_tournament_virtual_exit_poll():
+    config = load_config()
+    profiles = build_tournament_profiles(config)
+    now_iso = market_now().isoformat()
+    TOURNAMENT_HEALTH["tournament_last_exit_poll"] = now_iso
+    TOURNAMENT_HEALTH["tournament_exit_loop_alive"] = True
+    with TOURNAMENT_LOCK:
+        states = ensure_tournament_runtime_states(profiles)
+        daily_reset_changed = apply_daily_resets(profiles, states, time.time())
+        symbols = get_unique_tournament_option_symbols(states)
+        if daily_reset_changed:
+            save_tournament_state_safe(states)
+
+    if not symbols:
+        with BOT_LOCK:
+            BOT_STATE["tournament_health"] = dict(TOURNAMENT_HEALTH)
+        return
+
+    option_quotes = {
+        symbol: get_market_quote(symbol)
+        for symbol in symbols
+    }
+    now_epoch = time.time()
+    with TOURNAMENT_LOCK:
+        closed_trades = process_virtual_exits(profiles, states, option_quotes, now_epoch)
+        save_tournament_state_safe(states)
+        positions = serialize_tournament_positions(states)
+        state_by_profile = refresh_tournament_state_snapshot(states)
+
+    with BOT_LOCK:
+        BOT_STATE["tournament_virtual_positions"] = positions
+        BOT_STATE["tournament_state_by_profile"] = state_by_profile
+        BOT_STATE["tournament_health"] = dict(TOURNAMENT_HEALTH)
+
+    for trade in closed_trades:
+        print("TOURNAMENT VIRTUAL EXIT")
+        print("profile:", trade.profile_id)
+        print("trade_id:", trade.trade_id)
+        print("option_symbol:", trade.option_symbol)
+        print("entry_price:", trade.entry_price)
+        print("exit_price:", trade.exit_price)
+        print("exit_reason:", trade.exit_reason)
+        print("pnl_dollars:", trade.pnl_dollars)
+        print("pnl_percent:", trade.pnl_percent)
+
+
+def tournament_virtual_exit_loop():
+    traceback_logged = False
+    while not TOURNAMENT_HEALTH.get("stopping"):
+        try:
+            process_tournament_virtual_exit_poll()
+            config = load_config()
+            interval_ms = max(500, int(config.get("strategy", {}).get("exit_poll_interval_ms", 1000) or 1000))
+            traceback_logged = False
+        except Exception as error:
+            print("TOURNAMENT EXIT ERROR:", error)
+            TOURNAMENT_HEALTH["tournament_last_error"] = str(error)
+            TOURNAMENT_HEALTH["tournament_exit_loop_alive"] = False
+            with BOT_LOCK:
+                BOT_STATE["tournament_health"] = dict(TOURNAMENT_HEALTH)
+            if not traceback_logged:
+                traceback.print_exc()
+                traceback_logged = True
+            interval_ms = 1000
+        time.sleep(interval_ms / 1000)
+
+
+def tournament_watchdog_loop():
+    global TOURNAMENT_EXIT_THREAD
+    while not TOURNAMENT_HEALTH.get("stopping"):
+        try:
+            if TOURNAMENT_EXIT_THREAD is None or not TOURNAMENT_EXIT_THREAD.is_alive():
+                TOURNAMENT_HEALTH["tournament_exit_loop_alive"] = False
+                start_tournament_exit_monitor()
+            if TOURNAMENT_STATE_DIRTY and seconds_since_iso(TOURNAMENT_HEALTH.get("tournament_last_state_save")) not in (None,) and seconds_since_iso(TOURNAMENT_HEALTH.get("tournament_last_state_save")) >= 30:
+                profiles = build_tournament_profiles(load_config())
+                with TOURNAMENT_LOCK:
+                    states = ensure_tournament_runtime_states(profiles)
+                    save_tournament_state_safe(states)
+            with BOT_LOCK:
+                BOT_STATE["tournament_health"] = dict(TOURNAMENT_HEALTH)
+        except Exception as error:
+            TOURNAMENT_HEALTH["tournament_last_error"] = str(error)
+            traceback.print_exc()
+        time.sleep(10)
+
+
+def start_tournament_exit_monitor():
+    global TOURNAMENT_EXIT_THREAD
+    if TOURNAMENT_EXIT_THREAD and TOURNAMENT_EXIT_THREAD.is_alive():
+        return TOURNAMENT_EXIT_THREAD
+    TOURNAMENT_EXIT_THREAD = threading.Thread(target=tournament_virtual_exit_loop, daemon=True)
+    TOURNAMENT_EXIT_THREAD.start()
+    return TOURNAMENT_EXIT_THREAD
+
+
+def start_tournament_watchdog():
+    global TOURNAMENT_WATCHDOG_THREAD
+    if TOURNAMENT_WATCHDOG_THREAD and TOURNAMENT_WATCHDOG_THREAD.is_alive():
+        return TOURNAMENT_WATCHDOG_THREAD
+    TOURNAMENT_WATCHDOG_THREAD = threading.Thread(target=tournament_watchdog_loop, daemon=True)
+    TOURNAMENT_WATCHDOG_THREAD.start()
+    return TOURNAMENT_WATCHDOG_THREAD
+
+
+def shutdown_tournament_monitors():
+    TOURNAMENT_HEALTH["stopping"] = True
+    try:
+        profiles = build_tournament_profiles(load_config())
+        with TOURNAMENT_LOCK:
+            states = ensure_tournament_runtime_states(profiles)
+            save_tournament_state_safe(states)
+    except Exception as error:
+        print("TOURNAMENT SHUTDOWN SAVE ERROR:", error)
 
 
 def normalize_signal(signal):
@@ -3636,7 +4047,7 @@ def surfer_bot_tick(allow_entry=True):
     signal = normalize_signal(signal)
     update_bot_signal_state(signal, call_cost, put_cost)
     try:
-        evaluate_tournament_decisions(config, signal)
+        evaluate_tournament_decisions(config, signal, call, put)
     except Exception as error:
         print("TOURNAMENT ERROR:", error)
     signal_ms = int((time.perf_counter() - signal_started_at) * 1000)
@@ -3827,6 +4238,7 @@ def api_bot_state():
     bot_trades_limit = history_limit(config, "bot_trades_limit")
     trade_history_limit = history_limit(config, "trade_history_limit")
     bot_audit_limit = history_limit(config, "bot_audit_limit")
+    tournament_health = tournament_health_snapshot()
 
     with BOT_LOCK:
         pending_entry = refresh_pending_time_remaining(dict(BOT_STATE.get("pending_entry") or default_pending_entry()))
@@ -3878,6 +4290,9 @@ def api_bot_state():
             "tournament_decisions_evaluated": BOT_STATE["tournament_decisions_evaluated"],
             "tournament_decisions_evaluated_by_profile": dict(BOT_STATE["tournament_decisions_evaluated_by_profile"]),
             "tournament_profile_settings": load_tournament_profile_settings(TOURNAMENT_PROFILES_FILE),
+            "tournament_virtual_positions": list(BOT_STATE["tournament_virtual_positions"]),
+            "tournament_state_by_profile": dict(BOT_STATE["tournament_state_by_profile"]),
+            "tournament_health": tournament_health,
             "history_limits": {
                 "pending_entry_limit": pending_history_limit,
                 "bot_trades_limit": bot_trades_limit,
@@ -4214,6 +4629,169 @@ def api_copy_tournament_settings():
         return tournament_api_or_redirect({"ok": True, **tournament_settings_response(settings)})
     except Exception as error:
         return tournament_api_or_redirect({"ok": False, "errors": [str(error)]}, 400)
+
+
+@app.route("/api/tournament/trades", methods=["GET"])
+def api_tournament_trades():
+    profile_id = request.args.get("profile_id") or None
+    status = request.args.get("status") or None
+    limit_value = request.args.get("limit")
+    limit = None
+    if limit_value not in (None, ""):
+        try:
+            limit = int(limit_value)
+        except:
+            return jsonify({"ok": False, "errors": ["limit must be an integer"]}), 400
+    try:
+        trades = list_tournament_trades(profile_id=profile_id, status=status, limit=limit, path=TOURNAMENT_TRADES_FILE)
+        return jsonify(tournament_trades_response(trades))
+    except Exception as error:
+        return jsonify({"ok": False, "errors": [str(error)]}), 400
+
+
+@app.route("/api/tournament/trades/<trade_id>", methods=["GET"])
+def api_tournament_trade_detail(trade_id):
+    trade = get_tournament_trade(trade_id, TOURNAMENT_TRADES_FILE)
+    if not trade:
+        return jsonify({"ok": False, "errors": ["trade not found"]}), 404
+    return jsonify({"ok": True, "trade": tournament_trade_to_dict(trade)})
+
+
+@app.route("/api/tournament/trades/test-record", methods=["POST"])
+def api_create_test_tournament_trade():
+    payload = request.get_json(silent=True) if request.is_json else request.form
+    payload = payload or {}
+    try:
+        entry_price = safe_float(payload.get("entry_price", 1.0), 1.0)
+        trade = create_synthetic_tournament_trade(
+            profile_id=payload.get("profile_id"),
+            direction=payload.get("direction"),
+            entry_price=entry_price,
+            option_symbol=payload.get("option_symbol") or None,
+            symbol=payload.get("symbol") or load_config().get("symbol", "SPY"),
+        )
+        append_tournament_trade(trade, TOURNAMENT_TRADES_FILE)
+        return jsonify({"ok": True, "trade": tournament_trade_to_dict(trade)})
+    except Exception as error:
+        return jsonify({"ok": False, "errors": [str(error)]}), 400
+
+
+@app.route("/api/tournament/trades/test-close", methods=["POST"])
+def api_close_latest_test_tournament_trade():
+    payload = request.get_json(silent=True) if request.is_json else request.form
+    payload = payload or {}
+    open_test_trades = [
+        trade for trade in list_tournament_trades(status="OPEN", path=TOURNAMENT_TRADES_FILE)
+        if trade.signal == "TEST_RECORD"
+    ]
+    if not open_test_trades:
+        return jsonify({"ok": False, "errors": ["no open synthetic tournament trade"]}), 404
+
+    trade = open_test_trades[0]
+    exit_price = safe_float(payload.get("exit_price", trade.entry_price + 0.01), trade.entry_price + 0.01)
+    exit_value = exit_price * 100 * trade.contracts
+    pnl_dollars = exit_value - trade.entry_cost
+    pnl_percent = (pnl_dollars / trade.entry_cost * 100) if trade.entry_cost else 0
+    now_text = market_now().isoformat()
+    updated = update_tournament_trade(
+        trade.trade_id,
+        {
+            "status": "CLOSED",
+            "exit_time": now_text,
+            "exit_epoch": time.time(),
+            "exit_price": exit_price,
+            "exit_price_source": "SYNTHETIC",
+            "exit_value": exit_value,
+            "exit_reason": "TEST_RECORD_CLOSE",
+            "pnl_dollars": pnl_dollars,
+            "pnl_percent": pnl_percent,
+            "peak_price": max(trade.peak_price or trade.entry_price, exit_price),
+            "lowest_price": min(trade.lowest_price or trade.entry_price, exit_price),
+            "max_profit_dollars": max(0, pnl_dollars),
+            "max_drawdown_dollars": min(0, pnl_dollars),
+            "updated_at": now_text,
+        },
+        TOURNAMENT_TRADES_FILE,
+    )
+    return jsonify({"ok": True, "trade": tournament_trade_to_dict(updated)})
+
+
+@app.route("/api/tournament/positions", methods=["GET"])
+def api_tournament_positions():
+    with BOT_LOCK:
+        positions = list(BOT_STATE.get("tournament_virtual_positions", []))
+    return jsonify({
+        "ok": True,
+        "count": len(positions),
+        "positions": positions,
+    })
+
+
+@app.route("/api/tournament/health", methods=["GET"])
+def api_tournament_health():
+    return jsonify({"ok": True, **tournament_health_snapshot()})
+
+
+@app.route("/api/tournament/recovery/run", methods=["POST"])
+def api_tournament_recovery_run():
+    with TOURNAMENT_LOCK:
+        summary = initialize_tournament_recovery()
+    return jsonify({"ok": True, "summary": summary, "health": tournament_health_snapshot()})
+
+
+@app.route("/api/tournament/state/save", methods=["POST"])
+def api_tournament_state_save():
+    config = load_config()
+    profiles = build_tournament_profiles(config)
+    with TOURNAMENT_LOCK:
+        states = ensure_tournament_runtime_states(profiles)
+        saved = save_tournament_state_safe(states)
+    return jsonify({"ok": saved, "last_save": TOURNAMENT_HEALTH.get("tournament_last_state_save")})
+
+
+@app.route("/api/tournament/positions/test-price", methods=["POST"])
+def api_tournament_position_test_price():
+    payload = request.get_json(silent=True) if request.is_json else request.form
+    payload = payload or {}
+    profile_id = payload.get("profile_id")
+    bid_price = safe_float(payload.get("bid_price"), None)
+    if not profile_id or not valid_bid(bid_price):
+        return jsonify({"ok": False, "errors": ["profile_id and valid bid_price are required"]}), 400
+
+    config = load_config()
+    profiles = build_tournament_profiles(config)
+    with TOURNAMENT_LOCK:
+        states = ensure_tournament_runtime_states(profiles)
+        if profile_id not in states or not states[profile_id].virtual_position:
+            return jsonify({"ok": False, "errors": ["open virtual position not found"]}), 404
+
+        state = states[profile_id]
+        position = update_virtual_position_price(state.virtual_position, bid_price, time.time())
+        state.virtual_position = position
+        exit_reason = evaluate_virtual_exit(position, bid_price, time.time())
+        if exit_reason:
+            trade = process_virtual_exits(
+                {profile_id: profiles[profile_id]},
+                {profile_id: state},
+                {position.option_symbol: {"bid": bid_price, "_fetched_at": market_now().isoformat()}},
+                time.time(),
+            )[0]
+            save_tournament_state_safe(states)
+            positions = serialize_tournament_positions(states)
+            state_by_profile = refresh_tournament_state_snapshot(states)
+            with BOT_LOCK:
+                BOT_STATE["tournament_virtual_positions"] = positions
+                BOT_STATE["tournament_state_by_profile"] = state_by_profile
+            return jsonify({"ok": True, "closed": True, "trade": tournament_trade_to_dict(trade)})
+
+        save_tournament_state_safe(states)
+        position_payload = dict(asdict(position), **stop_snapshot(position))
+        positions = serialize_tournament_positions(states)
+        state_by_profile = refresh_tournament_state_snapshot(states)
+        with BOT_LOCK:
+            BOT_STATE["tournament_virtual_positions"] = positions
+            BOT_STATE["tournament_state_by_profile"] = state_by_profile
+        return jsonify({"ok": True, "closed": False, "position": position_payload})
 
 
 @app.route("/save-settings", methods=["POST"])
@@ -5079,6 +5657,7 @@ def dashboard():
     call = select_atm_contract(symbol, "CALL")
     put = select_atm_contract(symbol, "PUT")
     sync_trade_limits_from_file(config)
+    tournament_health = tournament_health_snapshot()
 
     with BOT_LOCK:
         bot_snapshot = {
@@ -5130,6 +5709,9 @@ def dashboard():
             "tournament_last_snapshot": dict(BOT_STATE["tournament_last_snapshot"]),
             "tournament_decisions_evaluated": BOT_STATE["tournament_decisions_evaluated"],
             "tournament_decisions_evaluated_by_profile": dict(BOT_STATE["tournament_decisions_evaluated_by_profile"]),
+            "tournament_virtual_positions": list(BOT_STATE["tournament_virtual_positions"]),
+            "tournament_state_by_profile": dict(BOT_STATE["tournament_state_by_profile"]),
+            "tournament_health": tournament_health,
             "config_strategy": dict(config.get("strategy", {}))
         }
 
@@ -5155,6 +5737,7 @@ def dashboard():
     bot_audit_limit = history_limit(config, "bot_audit_limit")
     bot_trades_limit = history_limit(config, "bot_trades_limit")
     bot_audit_rows = load_bot_audit_rows(bot_audit_limit)
+    tournament_trade_rows = [tournament_trade_to_dict(trade) for trade in list_tournament_trades(limit=50, path=TOURNAMENT_TRADES_FILE)]
     levels = market_context.get("levels", {})
     distances = market_context.get("level_distances", {})
 
@@ -5225,6 +5808,7 @@ Pre-Confirmation Max Drawdown %: {tournament_input(profile_id, row, "pre_confirm
 Retry Cooldown Seconds: {tournament_input(profile_id, row, "pending_entry_retry_cooldown_seconds", minimum=0)}<br>
 Two-Candle OR Enabled: {tournament_checkbox(profile_id, row, "two_candle_or_confirmation_enabled")}<br>
 Required Breakout Candles: {tournament_input(profile_id, row, "required_breakout_candles", minimum=1)}<br>
+Max Quote Age Seconds: {tournament_input(profile_id, row, "max_quote_age_seconds", minimum=1)}<br>
 Allow Calls: {tournament_checkbox(profile_id, row, "allow_calls")}<br>
 Allow Puts: {tournament_checkbox(profile_id, row, "allow_puts")}<br>
 Hard Stop %: {tournament_input(profile_id, row, "hard_stop_percent", step="0.1", minimum=0, maximum=100)}<br>
@@ -5244,6 +5828,24 @@ Contracts: {tournament_input(profile_id, row, "contracts", minimum=1)}<br>
 """)
         return "\n".join(cards)
 
+    def render_tournament_health_panel(health):
+        health = health or {}
+        warnings = health.get("warnings") or []
+        warning_html = "<br>".join(escape_html(warning) for warning in warnings) or "None"
+        return f"""
+<div class="grid" id="tournament-health-grid">
+<div class="item"><div class="label">Health</div><div class="value">{escape_html(health.get("overall_status", "UNKNOWN"))}</div></div>
+<div class="item"><div class="label">Entry Loop</div><div class="value">{"YES" if health.get("entry_loop_alive") else "NO"}</div></div>
+<div class="item"><div class="label">Exit Loop</div><div class="value">{"YES" if health.get("exit_loop_alive") else "NO"}</div></div>
+<div class="item"><div class="label">Open Positions</div><div class="value">{health.get("open_position_count", 0)}</div></div>
+<div class="item"><div class="label">Last Quote Age</div><div class="value">{health.get("seconds_since_last_successful_quote")}</div></div>
+<div class="item"><div class="label">Last Save Age</div><div class="value">{health.get("state_save_age")}</div></div>
+<div class="item"><div class="label">Recovery</div><div class="value">{escape_html(health.get("recovery_status", "UNKNOWN"))}</div></div>
+<div class="item"><div class="label">Last Error</div><div class="value">{escape_html(health.get("last_error", "None"))}</div></div>
+</div>
+<div class="item warning">Warnings:<br>{warning_html}</div>
+"""
+
     def render_tournament_decisions_table(decisions):
         rows = []
         decisions = decisions or {}
@@ -5252,6 +5854,8 @@ Contracts: {tournament_input(profile_id, row, "contracts", minimum=1)}<br>
             settings_row = tournament_settings.get(profile_id, {})
             state = TOURNAMENT_RUNTIME_STATES.get(profile_id)
             evaluated = state.decisions_evaluated if state else 0
+            position = state.virtual_position if state else None
+            stops = stop_snapshot(position) if position else {}
             rows.append(f"""
 <tr>
 <td>{html_lib.escape(settings_row.get("display_name", profile_id))}</td>
@@ -5263,6 +5867,51 @@ Contracts: {tournament_input(profile_id, row, "contracts", minimum=1)}<br>
 <td>{row.get("momentum_required", False)}</td>
 <td>{row.get("or_confirmation_required", False)}</td>
 <td>{evaluated}</td>
+<td>{escape_html(position.status if position else "NONE")}</td>
+<td>{escape_html(position.option_symbol if position else "")}</td>
+<td>{fmt_trade_price(position.entry_price if position else "")}</td>
+<td>{fmt_trade_price(position.current_price if position else "")}</td>
+<td>{fmt_money(position.unrealized_pnl_dollars) if position else ""}</td>
+<td>{fmt_percent(position.unrealized_pnl_percent) if position else ""}</td>
+<td>{fmt_trade_price(position.peak_price if position else "")}</td>
+<td>{fmt_trade_price(stops.get("hard_stop_price")) if position else ""}</td>
+<td>{fmt_trade_price(stops.get("trailing_stop_price")) if position else ""}</td>
+<td>{fmt_trade_price(stops.get("profit_floor_price")) if position else ""}</td>
+</tr>
+""")
+        return "".join(rows)
+
+    def render_tournament_trades_table_rows(trades):
+        if not trades:
+            return '<tr><td colspan="14">No tournament trades yet.</td></tr>'
+        rows = []
+        for trade in trades:
+            pnl = trade.get("pnl_dollars")
+            pnl_percent = trade.get("pnl_percent")
+            pnl_text = "" if pnl in (None, "") else fmt_money(pnl)
+            if pnl is not None and safe_float(pnl) > 0:
+                pnl_text = "+" + pnl_text
+            percent_text = "" if pnl_percent in (None, "") else f"{safe_float(pnl_percent):+.2f}%"
+            profile_label = f"""
+<strong>{escape_html(trade.get("profile_display_name"))}</strong><br>
+<small>{escape_html(trade.get("profile_id"))}</small>
+"""
+            rows.append(f"""
+<tr>
+<td>{escape_html(trade.get("entry_time"))}</td>
+<td title="{escape_html(trade.get("profile_id"))}">{profile_label}</td>
+<td>{escape_html(trade.get("direction"))}</td>
+<td>{escape_html(trade.get("option_symbol"))}</td>
+<td>{escape_html(trade.get("contracts"))}</td>
+<td>{fmt_trade_price(trade.get("entry_price"))}</td>
+<td>{"" if trade.get("exit_price") in (None, "") else fmt_trade_price(trade.get("exit_price"))}</td>
+<td>{escape_html(trade.get("status"))}</td>
+<td>{escape_html(trade.get("exit_reason") or "")}</td>
+<td>{pnl_text}</td>
+<td>{percent_text}</td>
+<td>{escape_html(trade.get("confidence"))}</td>
+<td>{safe_float(trade.get("dominance_percent")):.2f}%</td>
+<td>{escape_html(trade.get("market_state"))}</td>
 </tr>
 """)
         return "".join(rows)
@@ -5431,6 +6080,11 @@ Bot Reason Log:<br>
 </div>
 
 <div class="card">
+<h2>Tournament Health</h2>
+{render_tournament_health_panel(bot_snapshot.get("tournament_health"))}
+</div>
+
+<div class="card">
 <h2>Tournament Decisions</h2>
 <table class="decision-table">
 <thead>
@@ -5444,12 +6098,69 @@ Bot Reason Log:<br>
 <th>Momentum Required</th>
 <th>OR Required</th>
 <th>Decisions Evaluated</th>
+<th>Position Status</th>
+<th>Option</th>
+<th>Entry Price</th>
+<th>Current Bid</th>
+<th>Unrealized P/L</th>
+<th>Unrealized P/L %</th>
+<th>Peak</th>
+<th>Hard Stop</th>
+<th>Trailing Stop</th>
+<th>Profit Floor</th>
 </tr>
 </thead>
 <tbody id="tournament-decisions-body">
 {render_tournament_decisions_table(bot_snapshot.get("tournament_decisions"))}
 </tbody>
 </table>
+</div>
+
+<div class="card">
+<h2>TOURNAMENT TRADES</h2>
+<div class="item">
+<label>Test Profile:</label>
+<select id="tournament-test-profile">
+<option value="BOT_A_BASELINE">Bot A Baseline</option>
+<option value="BOT_B_MOMENTUM">Bot B Momentum</option>
+<option value="BOT_C_TWO_CANDLE_OR">Bot C Two-Candle OR</option>
+<option value="BOT_D_COMBINED">Bot D Combined</option>
+</select>
+<label>Direction:</label>
+<select id="tournament-test-direction">
+<option value="CALL">CALL</option>
+<option value="PUT">PUT</option>
+</select>
+<button type="button" onclick="createTestTournamentTrade()">Create Test Tournament Trade</button>
+<button type="button" class="yellow" onclick="closeLatestTestTournamentTrade()">Close Latest Test Trade</button>
+<br><small>Developer-only synthetic records. These buttons never call Tradier and never touch the original bot trade history.</small>
+</div>
+<br>
+<div class="history-panel tournament-trades-panel">
+<table class="decision-table">
+<thead>
+<tr>
+<th>Time</th>
+<th>Profile</th>
+<th>Direction</th>
+<th>Option</th>
+<th>Contracts</th>
+<th>Entry</th>
+<th>Exit</th>
+<th>Status</th>
+<th>Exit Reason</th>
+<th>P/L $</th>
+<th>P/L %</th>
+<th>Confidence</th>
+<th>Dominance</th>
+<th>Market State</th>
+</tr>
+</thead>
+<tbody id="tournament-trades-body">
+{render_tournament_trades_table_rows(tournament_trade_rows)}
+</tbody>
+</table>
+</div>
 </div>
 
 <div class="card">
@@ -6239,16 +6950,18 @@ const TOURNAMENT_PROFILES = [
     ["BOT_D_COMBINED", "Bot D Combined"]
 ];
 
-function renderTournamentDecisions(decisions, evaluatedByProfile, settings) {{
+function renderTournamentDecisions(decisions, evaluatedByProfile, settings, stateByProfile) {{
     const el = document.getElementById("tournament-decisions-body");
     if (!el) return;
 
     decisions = decisions || {{}};
     evaluatedByProfile = evaluatedByProfile || {{}};
     settings = settings || {{}};
+    stateByProfile = stateByProfile || {{}};
     el.innerHTML = TOURNAMENT_PROFILES.map(([profileId, label]) => {{
         const row = decisions[profileId] || {{}};
         const enabled = settings[profileId]?.enabled;
+        const position = stateByProfile[profileId]?.virtual_position || null;
         return `
 <tr>
 <td>${{escapeHtml(label)}}</td>
@@ -6260,8 +6973,106 @@ function renderTournamentDecisions(decisions, evaluatedByProfile, settings) {{
 <td>${{escapeHtml(row.momentum_required ?? false)}}</td>
 <td>${{escapeHtml(row.or_confirmation_required ?? false)}}</td>
 <td>${{escapeHtml(evaluatedByProfile[profileId] || 0)}}</td>
+<td>${{escapeHtml(position?.status || "NONE")}}</td>
+<td>${{escapeHtml(position?.option_symbol || "")}}</td>
+<td>${{position ? fmtMoney(position.entry_price) : ""}}</td>
+<td>${{position ? fmtMoney(position.current_price) : ""}}</td>
+<td>${{position ? fmtSignedMoney(position.unrealized_pnl_dollars) : ""}}</td>
+<td>${{position ? fmtSignedPercent(position.unrealized_pnl_percent) : ""}}</td>
+<td>${{position ? fmtMoney(position.peak_price) : ""}}</td>
+<td>${{position ? fmtMoney(position.hard_stop_price) : ""}}</td>
+<td>${{position ? fmtMoney(position.trailing_stop_price) : ""}}</td>
+<td>${{position ? fmtMoney(position.profit_floor_price) : ""}}</td>
 </tr>`;
     }}).join("");
+}}
+
+function fmtSignedMoney(value) {{
+    if (value === null || value === undefined || value === "") return "";
+    const num = Number(value);
+    if (Number.isNaN(num)) return "";
+    const prefix = num > 0 ? "+" : "";
+    return `${{prefix}}${{fmtMoney(num)}}`;
+}}
+
+function fmtSignedPercent(value) {{
+    if (value === null || value === undefined || value === "") return "";
+    const num = Number(value);
+    if (Number.isNaN(num)) return "";
+    const prefix = num > 0 ? "+" : "";
+    return `${{prefix}}${{num.toFixed(2)}}%`;
+}}
+
+function renderTournamentTrades(trades) {{
+    const el = document.getElementById("tournament-trades-body");
+    if (!el) return;
+    trades = trades || [];
+    if (!trades.length) {{
+        el.innerHTML = '<tr><td colspan="14">No tournament trades yet.</td></tr>';
+        return;
+    }}
+    el.innerHTML = trades.map((trade) => `
+<tr>
+<td>${{escapeHtml(trade.entry_time || "")}}</td>
+<td title="${{escapeHtml(trade.profile_id || "")}}"><strong>${{escapeHtml(trade.profile_display_name || "")}}</strong><br><small>${{escapeHtml(trade.profile_id || "")}}</small></td>
+<td>${{escapeHtml(trade.direction || "")}}</td>
+<td>${{escapeHtml(trade.option_symbol || "")}}</td>
+<td>${{escapeHtml(trade.contracts ?? "")}}</td>
+<td>${{fmtMoney(trade.entry_price)}}</td>
+<td>${{trade.exit_price === null || trade.exit_price === undefined ? "" : fmtMoney(trade.exit_price)}}</td>
+<td>${{escapeHtml(trade.status || "")}}</td>
+<td>${{escapeHtml(trade.exit_reason || "")}}</td>
+<td>${{fmtSignedMoney(trade.pnl_dollars)}}</td>
+<td>${{fmtSignedPercent(trade.pnl_percent)}}</td>
+<td>${{escapeHtml(trade.confidence ?? "")}}</td>
+<td>${{Number(trade.dominance_percent || 0).toFixed(2)}}%</td>
+<td>${{escapeHtml(trade.market_state || "")}}</td>
+</tr>`).join("");
+}}
+
+function renderTournamentHealth(health) {{
+    const el = document.getElementById("tournament-health-grid");
+    if (!el) return;
+    health = health || {{}};
+    el.innerHTML = `
+<div class="item"><div class="label">Health</div><div class="value">${{escapeHtml(health.overall_status || "UNKNOWN")}}</div></div>
+<div class="item"><div class="label">Entry Loop</div><div class="value">${{health.entry_loop_alive ? "YES" : "NO"}}</div></div>
+<div class="item"><div class="label">Exit Loop</div><div class="value">${{health.exit_loop_alive ? "YES" : "NO"}}</div></div>
+<div class="item"><div class="label">Open Positions</div><div class="value">${{escapeHtml(health.open_position_count ?? 0)}}</div></div>
+<div class="item"><div class="label">Last Quote Age</div><div class="value">${{escapeHtml(health.seconds_since_last_successful_quote ?? "N/A")}}</div></div>
+<div class="item"><div class="label">Last Save Age</div><div class="value">${{escapeHtml(health.state_save_age ?? "N/A")}}</div></div>
+<div class="item"><div class="label">Recovery</div><div class="value">${{escapeHtml(health.recovery_status || "UNKNOWN")}}</div></div>
+<div class="item"><div class="label">Last Error</div><div class="value">${{escapeHtml(health.last_error || "None")}}</div></div>`;
+    const warningEl = el.nextElementSibling;
+    if (warningEl) {{
+        const warnings = health.warnings || [];
+        warningEl.innerHTML = `Warnings:<br>${{warnings.length ? warnings.map(escapeHtml).join("<br>") : "None"}}`;
+    }}
+}}
+
+async function updateTournamentTrades() {{
+    const data = await getJson("/api/tournament/trades?limit=50");
+    renderTournamentTrades(data.trades || []);
+}}
+
+async function createTestTournamentTrade() {{
+    const profileId = document.getElementById("tournament-test-profile")?.value || "BOT_A_BASELINE";
+    const direction = document.getElementById("tournament-test-direction")?.value || "CALL";
+    await fetch("/api/tournament/trades/test-record", {{
+        method: "POST",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify({{ profile_id: profileId, direction, entry_price: 1.0 }})
+    }});
+    await updateTournamentTrades();
+}}
+
+async function closeLatestTestTournamentTrade() {{
+    await fetch("/api/tournament/trades/test-close", {{
+        method: "POST",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify({{}})
+    }});
+    await updateTournamentTrades();
 }}
 
 async function updateBotState() {{
@@ -6284,7 +7095,8 @@ async function updateBotState() {{
     const pendingHistoryLimit = Number(data.history_limits?.pending_entry_limit || {DEFAULT_HISTORY_LIMIT});
     renderPendingEntry(data.pending_entry);
     renderPendingEntryHistory(data.pending_entry_history, pendingHistoryLimit);
-    renderTournamentDecisions(data.tournament_decisions, data.tournament_decisions_evaluated_by_profile, data.tournament_profile_settings);
+    renderTournamentDecisions(data.tournament_decisions, data.tournament_decisions_evaluated_by_profile, data.tournament_profile_settings, data.tournament_state_by_profile);
+    renderTournamentHealth(data.tournament_health);
     setText("bot-last-action", data.last_action);
     setText("bot-trades-today", data.trades_today);
     renderReasonLog(data.reason_log);
@@ -6408,6 +7220,7 @@ async function refreshLiveDashboard() {{
 }}
 
 setInterval(refreshLiveDashboard, 1000);
+setInterval(updateTournamentTrades, 5000);
 
 async function loadExpirations() {{
     const res = await fetch(`/api/expirations?symbol=${{CURRENT_SYMBOL}}`);
@@ -6483,6 +7296,10 @@ document.addEventListener("DOMContentLoaded", async () => {{
 
 if __name__ == "__main__":
     initialize_pending_entry_history()
+    initialize_tournament_recovery()
+    atexit.register(shutdown_tournament_monitors)
     threading.Thread(target=surfer_bot_loop, daemon=True).start()
+    start_tournament_exit_monitor()
+    start_tournament_watchdog()
     app.run(host="127.0.0.1", port=5000)
 

@@ -22,6 +22,84 @@ class ProfileDecision:
 
 
 @dataclass
+class VirtualTournamentPosition:
+    profile_id: str
+    profile_display_name: str
+    trade_id: str
+    symbol: str
+    option_symbol: str
+    direction: str
+    contracts: int
+    status: str
+    entry_time: str
+    entry_epoch: float
+    entry_price: float
+    entry_price_source: str
+    entry_cost: float
+    current_price: float
+    current_price_source: str
+    current_value: float
+    unrealized_pnl_dollars: float
+    unrealized_pnl_percent: float
+    peak_price: float
+    lowest_price: float
+    hard_stop_percent: float
+    trailing_stop_percent: float
+    enable_profit_floor_trailing_stop: bool
+    locked_profit_amount: float
+    confidence: int
+    dominance_percent: float
+    bullish_score: int
+    bearish_score: int
+    market_state: str | None
+    momentum_required: bool
+    or_confirmation_required: bool
+    created_at: str
+    updated_at: str
+    max_profit_dollars: float = 0.0
+    max_drawdown_dollars: float = 0.0
+
+
+@dataclass
+class TournamentTrade:
+    trade_id: str
+    profile_id: str
+    profile_display_name: str
+    symbol: str
+    option_symbol: str
+    direction: str
+    contracts: int
+    status: str
+    entry_time: str
+    entry_epoch: float | None
+    entry_price: float
+    entry_price_source: str
+    entry_cost: float
+    exit_time: str | None = None
+    exit_epoch: float | None = None
+    exit_price: float | None = None
+    exit_price_source: str | None = None
+    exit_value: float | None = None
+    exit_reason: str | None = None
+    pnl_dollars: float | None = None
+    pnl_percent: float | None = None
+    peak_price: float | None = None
+    lowest_price: float | None = None
+    max_profit_dollars: float | None = None
+    max_drawdown_dollars: float | None = None
+    signal: str = ""
+    confidence: int = 0
+    dominance_percent: float = 0.0
+    bullish_score: int = 0
+    bearish_score: int = 0
+    market_state: str | None = None
+    momentum_required: bool = False
+    or_confirmation_required: bool = False
+    created_at: str = ""
+    updated_at: str = ""
+
+
+@dataclass
 class BotProfile:
     profile_id: str
     display_name: str
@@ -83,3 +161,13 @@ class BotRuntimeState:
     enabled: bool = True
     last_decision: ProfileDecision | None = None
     decisions_evaluated: int = 0
+    virtual_position: VirtualTournamentPosition | None = None
+    last_virtual_entry_epoch: float | None = None
+    virtual_trades_today: int = 0
+    virtual_entry_cooldown_until_epoch: float | None = None
+    last_entry_fingerprint: str | None = None
+    virtual_trading_date: str | None = None
+    last_recovery_time: str | None = None
+    recovery_count: int = 0
+    recovery_status: str | None = None
+    recovered_trade_id: str | None = None

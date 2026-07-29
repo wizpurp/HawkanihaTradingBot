@@ -54,6 +54,7 @@ DEFAULT_SHARED_SETTINGS = {
     "pre_confirmation_max_drawdown_percent": 5.0,
     "pending_entry_retry_cooldown_seconds": 60,
     "required_breakout_candles": 2,
+    "max_quote_age_seconds": 10,
 }
 
 
@@ -178,6 +179,7 @@ def normalize_profile_settings(raw_settings: dict | None, *, strict: bool = Fals
             "max_trades_per_day": ("int", 1, None, defaults[profile_id]["max_trades_per_day"]),
             "max_contract_price": ("float", 0, None, defaults[profile_id]["max_contract_price"]),
             "contracts": ("int", 1, None, defaults[profile_id]["contracts"]),
+            "max_quote_age_seconds": ("int", 1, None, defaults[profile_id]["max_quote_age_seconds"]),
         }
         for key, (kind, minimum, maximum, default) in numeric_rules.items():
             value = _int(base.get(key), default) if kind == "int" else _float(base.get(key), default)
@@ -280,6 +282,7 @@ def _apply_profile_settings(config: dict, settings: dict) -> dict:
     config["pending_entry_retry_cooldown_seconds"] = settings["pending_entry_retry_cooldown_seconds"]
     config["two_candle_or_confirmation_enabled"] = settings["two_candle_or_confirmation_enabled"]
     config["required_breakout_candles"] = settings["required_breakout_candles"]
+    config["max_quote_age_seconds"] = settings["max_quote_age_seconds"]
 
     entry_rules = config.setdefault("entry_rules", {})
     entry_rules["minimum_signals"] = settings["minimum_signals"]
@@ -313,6 +316,7 @@ def _settings_from_runtime(runtime_config: dict | None) -> dict[str, dict]:
         "pre_confirmation_max_drawdown_percent": runtime_config,
         "pending_entry_retry_cooldown_seconds": runtime_config,
         "required_breakout_candles": runtime_config,
+        "max_quote_age_seconds": runtime_config,
         "minimum_signals": entry_rules,
         "allow_calls": entry_rules,
         "allow_puts": entry_rules,
