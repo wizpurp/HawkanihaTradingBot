@@ -182,8 +182,12 @@ BOT_STATE = {
         "required_confirmation_percent": 0,
         "confirmation_price": None,
         "current_option_price": None,
+        "highest_option_price": None,
+        "lowest_option_price": None,
         "current_momentum_gain_percent": 0,
         "current_pre_confirmation_drawdown_percent": 0,
+        "momentum_confirmed": False,
+        "breakout_confirmed": False,
         "maximum_allowed_drawdown_percent": 0,
         "momentum_timeout_seconds": 0,
         "elapsed_time_seconds": 0,
@@ -193,6 +197,7 @@ BOT_STATE = {
         "status": "NONE",
         "reason": "",
         "started_epoch": None,
+        "updated_at": "",
         "expires_epoch": None,
         "contracts": 0,
         "contract": {},
@@ -1541,15 +1546,20 @@ def pending_history_record(pending, final_status=None, cancellation_reason=None,
         "breakout_level": pending.get("breakout_level"),
         "starting_option_price": pending.get("starting_option_price"),
         "current_option_price": pending.get("current_option_price"),
+        "highest_option_price": pending.get("highest_option_price"),
+        "lowest_option_price": pending.get("lowest_option_price"),
         "confirmation_price": pending.get("confirmation_price"),
         "confirmation_price_source": pending.get("confirmation_price_source", ""),
         "current_momentum_gain_percent": pending.get("current_momentum_gain_percent", 0),
         "current_pre_confirmation_drawdown_percent": pending.get("current_pre_confirmation_drawdown_percent", 0),
+        "momentum_confirmed": bool(pending.get("momentum_confirmed", pending.get("momentum_status") == "PASS")),
+        "breakout_confirmed": bool(pending.get("breakout_confirmed", pending.get("breakout_status") == "PASS")),
         "maximum_allowed_drawdown_percent": pending.get("maximum_allowed_drawdown_percent", 0),
         "momentum_timeout_seconds": pending.get("momentum_timeout_seconds", 0),
         "elapsed_time_seconds": pending.get("elapsed_time_seconds", 0),
         "retry_cooldown_remaining_seconds": pending.get("retry_cooldown_remaining_seconds", 0),
         "final_cancellation_trigger": pending.get("final_cancellation_trigger", ""),
+        "updated_at": pending.get("updated_at", ""),
         "updated_epoch": now_epoch,
         "completed_epoch": now_epoch if status in ["CANCELLED", "BUY SUBMITTED", "CONFIRMED"] else None,
         "final_status": status,
@@ -1685,8 +1695,12 @@ def create_pending_entry(config, decision, side, contract, contracts, start_pric
         "required_confirmation_percent": momentum_percent,
         "confirmation_price": confirmation_price,
         "current_option_price": start_price,
+        "highest_option_price": start_price,
+        "lowest_option_price": start_price,
         "current_momentum_gain_percent": 0,
         "current_pre_confirmation_drawdown_percent": 0,
+        "momentum_confirmed": momentum_status == "PASS",
+        "breakout_confirmed": breakout_status == "PASS",
         "maximum_allowed_drawdown_percent": max_drawdown_percent,
         "momentum_timeout_seconds": timeout_seconds,
         "elapsed_time_seconds": 0,
@@ -1696,6 +1710,7 @@ def create_pending_entry(config, decision, side, contract, contracts, start_pric
         "status": status,
         "reason": breakout.get("reason", ""),
         "started_epoch": started_epoch,
+        "updated_at": market_now().isoformat(),
         "expires_epoch": started_epoch + timeout_seconds,
         "contracts": contracts,
         "contract": dict(contract),
@@ -1718,6 +1733,47 @@ def create_pending_entry(config, decision, side, contract, contracts, start_pric
         current_price=start_price,
         skip_reason="waiting for entry confirmation"
     )
+
+
+def update_pending_confirmation_calculations(pending, current_price, current_price_source, breakout):
+    pending["current_option_price"] = current_price
+    pending["confirmation_price_source"] = current_price_source
+    pending["elapsed_time_seconds"] = int(time.time() - float(pending.get("started_epoch") or time.time()))
+    pending["updated_at"] = market_now().isoformat()
+    pending["breakout_status"] = breakout.get("status", "WAITING")
+    pending["current_breakout_candle"] = breakout.get("count", 0)
+    pending["required_breakout_candles"] = breakout.get("required", 0)
+    pending["breakout_level"] = breakout.get("level")
+    pending["breakout_confirmed"] = pending["breakout_status"] == "PASS"
+    refresh_pending_time_remaining(pending)
+
+    start_price = safe_float(pending.get("starting_option_price"))
+    if current_price is None or not start_price:
+        pending["momentum_confirmed"] = pending.get("momentum_status") == "PASS"
+        return pending
+
+    current_price = float(current_price)
+    previous_high = pending.get("highest_option_price")
+    previous_low = pending.get("lowest_option_price")
+    highest_price = max(
+        current_price,
+        safe_float(previous_high, current_price) if previous_high not in [None, ""] else current_price,
+        start_price,
+    )
+    lowest_price = min(
+        current_price,
+        safe_float(previous_low, current_price) if previous_low not in [None, ""] else current_price,
+        start_price,
+    )
+    gain_percent = ((current_price - start_price) / start_price) * 100
+    drawdown_percent = max(0, ((start_price - lowest_price) / start_price) * 100)
+
+    pending["highest_option_price"] = highest_price
+    pending["lowest_option_price"] = lowest_price
+    pending["current_momentum_gain_percent"] = gain_percent
+    pending["current_pre_confirmation_drawdown_percent"] = drawdown_percent
+    pending["momentum_confirmed"] = pending.get("momentum_status") == "PASS"
+    return pending
 
 
 def pending_entry_snapshot():
@@ -3517,9 +3573,6 @@ def process_pending_entry(config):
 
     quote = get_market_quote(option_symbol)
     current_price, current_price_source = get_option_confirmation_price(quote)
-    pending["current_option_price"] = current_price
-    pending["confirmation_price_source"] = current_price_source
-    pending["elapsed_time_seconds"] = int(time.time() - float(pending.get("started_epoch") or time.time()))
     pending["momentum_timeout_seconds"] = int(pending.get("momentum_timeout_seconds") or config.get("confirmation_timeout_seconds", 60))
     pending["maximum_allowed_drawdown_percent"] = max(0.0, min(50.0, safe_float(
         pending.get("maximum_allowed_drawdown_percent", config.get("pre_confirmation_max_drawdown_percent", 5.0)),
@@ -3532,32 +3585,25 @@ def process_pending_entry(config):
         "level": None,
         "reason": "two-candle opening-range confirmation disabled"
     }
-    pending["breakout_status"] = breakout.get("status", "WAITING")
-    pending["current_breakout_candle"] = breakout.get("count", 0)
-    pending["required_breakout_candles"] = breakout.get("required", 0)
-    pending["breakout_level"] = breakout.get("level")
-    refresh_pending_time_remaining(pending)
-
-    if time.time() >= float(pending.get("expires_epoch") or 0):
-        pending["active"] = False
-        pending["status"] = "CANCELLED"
-        if pending.get("momentum_status") == "PASS" and pending.get("breakout_status") != "PASS":
-            pending["reason"] = "breakout confirmation failed"
-            pending["final_cancellation_trigger"] = "breakout confirmation failed"
-        else:
-            pending["reason"] = "momentum confirmation timeout expired"
-            pending["final_cancellation_trigger"] = "momentum confirmation timeout expired"
-        if pending.get("momentum_status") != "PASS":
-            pending["momentum_status"] = "FAIL"
-        if pending.get("breakout_status") != "PASS":
-            pending["breakout_status"] = "FAIL"
-        set_pending_entry(pending)
-        upsert_pending_history(pending, final_status="CANCELLED", cancellation_reason=pending["reason"])
-        add_bot_reason("PENDING BUY cancelled: confirmation timeout expired")
-        log_bot_audit("SKIP", decision, config.get("symbol", ""), market_context, config, option_symbol=option_symbol, current_price=current_price, skip_reason="pending entry cancelled: confirmation timeout expired")
-        return True
+    pending = update_pending_confirmation_calculations(pending, current_price, current_price_source, breakout)
 
     if current_price is None:
+        if time.time() >= float(pending.get("expires_epoch") or 0):
+            pending["active"] = False
+            pending["status"] = "CANCELLED"
+            pending["reason"] = "momentum confirmation timeout expired"
+            pending["final_cancellation_trigger"] = "momentum confirmation timeout expired"
+            if pending.get("momentum_status") != "PASS":
+                pending["momentum_status"] = "FAIL"
+                pending["momentum_confirmed"] = False
+            if pending.get("breakout_status") != "PASS":
+                pending["breakout_status"] = "FAIL"
+                pending["breakout_confirmed"] = False
+            set_pending_entry(pending)
+            upsert_pending_history(pending, final_status="CANCELLED", cancellation_reason=pending["reason"])
+            add_bot_reason("PENDING BUY cancelled: momentum confirmation timeout expired with no option quote")
+            log_bot_audit("SKIP", decision, config.get("symbol", ""), market_context, config, option_symbol=option_symbol, current_price=current_price, skip_reason="pending entry cancelled: momentum confirmation timeout expired")
+            return True
         pending["status"] = "WAITING FOR MOMENTUM" if pending.get("momentum_status") != "PASS" else "WAITING FOR BREAKOUT"
         pending["reason"] = "option quote unavailable"
         set_pending_entry(pending)
@@ -3567,10 +3613,6 @@ def process_pending_entry(config):
         print("reason:", pending["reason"])
         return True
 
-    if start_price:
-        pending["current_momentum_gain_percent"] = ((current_price - start_price) / start_price) * 100
-        pending["current_pre_confirmation_drawdown_percent"] = max(0, ((start_price - current_price) / start_price) * 100)
-
     print("PENDING ENTRY")
     print("option_symbol:", option_symbol)
     print("direction:", side)
@@ -3578,6 +3620,8 @@ def process_pending_entry(config):
     print("required_confirmation_percent:", pending.get("required_confirmation_percent"))
     print("confirmation_price:", confirmation_price)
     print("current_option_price:", current_price)
+    print("highest_option_price:", pending.get("highest_option_price"))
+    print("lowest_option_price:", pending.get("lowest_option_price"))
     print("confirmation_price_source:", pending.get("confirmation_price_source"))
     print("current_momentum_gain_percent:", pending.get("current_momentum_gain_percent"))
     print("current_pre_confirmation_drawdown_percent:", pending.get("current_pre_confirmation_drawdown_percent"))
@@ -3613,9 +3657,17 @@ def process_pending_entry(config):
         pending["momentum_status"] = "PASS"
     elif current_price >= confirmation_price:
         pending["momentum_status"] = "PASS"
+        print("MOMENTUM CONFIRMED")
+        print("Starting Price:", start_price)
+        print("Current Price:", current_price)
+        print("Gain %:", pending.get("current_momentum_gain_percent"))
+        print("Required %:", pending.get("required_confirmation_percent"))
+        print("Target Price:", confirmation_price)
 
     momentum_passed = pending.get("momentum_status") == "PASS"
+    pending["momentum_confirmed"] = momentum_passed
     breakout_passed = pending.get("breakout_status") == "PASS"
+    pending["breakout_confirmed"] = breakout_passed
 
     if momentum_passed and breakout_passed:
         pending["status"] = "CONFIRMED"
@@ -3632,6 +3684,30 @@ def process_pending_entry(config):
             final_status="BUY SUBMITTED" if buy_submitted else "CONFIRMED",
             buy_submitted=buy_submitted
         )
+        return True
+
+    if time.time() >= float(pending.get("expires_epoch") or 0):
+        pending["active"] = False
+        pending["status"] = "CANCELLED"
+        if momentum_passed and not breakout_passed:
+            pending["reason"] = "breakout confirmation failed"
+            pending["final_cancellation_trigger"] = "breakout confirmation failed"
+        else:
+            pending["reason"] = "momentum confirmation timeout expired"
+            pending["final_cancellation_trigger"] = "momentum confirmation timeout expired"
+        if not momentum_passed:
+            pending["momentum_status"] = "FAIL"
+            pending["momentum_confirmed"] = False
+        if not breakout_passed:
+            pending["breakout_status"] = "FAIL"
+            pending["breakout_confirmed"] = False
+        set_pending_entry(pending)
+        upsert_pending_history(pending, final_status="CANCELLED", cancellation_reason=pending["reason"])
+        add_bot_reason(
+            f"PENDING BUY cancelled: {pending['reason']} "
+            f"(gain {pending.get('current_momentum_gain_percent', 0):.2f}% / required {safe_float(pending.get('required_confirmation_percent'), 0):.2f}%)"
+        )
+        log_bot_audit("SKIP", decision, config.get("symbol", ""), market_context, config, option_symbol=option_symbol, current_price=current_price, skip_reason=f"pending entry cancelled: {pending['reason']}")
         return True
 
     if not momentum_passed:
@@ -5361,12 +5437,16 @@ Breakout Confirmation: {escape_html(pending.get("breakout_status") or "PASS")}<b
 <br>
 Starting Option Price: {fmt_premium(pending.get("starting_option_price"))}<br>
 Current Option Price: {fmt_premium(pending.get("current_option_price"))}<br>
+Highest Option Price: {fmt_premium(pending.get("highest_option_price"))}<br>
+Lowest Option Price: {fmt_premium(pending.get("lowest_option_price"))}<br>
 Confirmation Target Price: {fmt_premium(pending.get("confirmation_price"))}<br>
 Confirmation Price Source: {escape_html(pending.get("confirmation_price_source") or "N/A")}<br>
 Required Momentum %: {fmt_percent(pending.get("required_confirmation_percent"))}<br>
 Current Momentum Gain %: {fmt_percent(pending.get("current_momentum_gain_percent"))}<br>
 Current Pre-Confirmation Drawdown %: {fmt_percent(pending.get("current_pre_confirmation_drawdown_percent"))}<br>
 Maximum Allowed Drawdown %: {fmt_percent(pending.get("maximum_allowed_drawdown_percent"))}<br>
+Momentum Confirmed: {"YES" if pending.get("momentum_confirmed") else "NO"}<br>
+Breakout Confirmed: {"YES" if pending.get("breakout_confirmed") else "NO"}<br>
 Momentum Timeout: {escape_html(pending.get("momentum_timeout_seconds", 0))} sec<br>
 Elapsed Time: {escape_html(pending.get("elapsed_time_seconds", 0))} sec<br>
 Retry Cooldown Remaining: {escape_html(pending.get("retry_cooldown_remaining_seconds", 0))} sec<br>
@@ -5402,11 +5482,15 @@ Momentum: {escape_html(row.get("momentum_status", "WAITING"))}<br>
 Breakout: {escape_html(row.get("breakout_status", "PASS"))} {escape_html(breakout_progress)}<br>
 Starting Option Price: {fmt_premium(row.get("starting_option_price"))}<br>
 Current Option Price: {fmt_premium(row.get("current_option_price"))}<br>
+Highest Option Price: {fmt_premium(row.get("highest_option_price"))}<br>
+Lowest Option Price: {fmt_premium(row.get("lowest_option_price"))}<br>
 Confirmation Target Price: {fmt_premium(row.get("confirmation_price"))}<br>
 Confirmation Price Source: {escape_html(row.get("confirmation_price_source", "N/A"))}<br>
 Current Momentum Gain %: {fmt_percent(row.get("current_momentum_gain_percent"))}<br>
 Current Pre-Confirmation Drawdown %: {fmt_percent(row.get("current_pre_confirmation_drawdown_percent"))}<br>
 Maximum Allowed Drawdown %: {fmt_percent(row.get("maximum_allowed_drawdown_percent"))}<br>
+Momentum Confirmed: {"YES" if row.get("momentum_confirmed") else "NO"}<br>
+Breakout Confirmed: {"YES" if row.get("breakout_confirmed") else "NO"}<br>
 Momentum Timeout: {escape_html(row.get("momentum_timeout_seconds", 0))} sec<br>
 Elapsed Time: {escape_html(row.get("elapsed_time_seconds", 0))} sec<br>
 Retry Cooldown Remaining: {escape_html(row.get("retry_cooldown_remaining_seconds", 0))} sec<br>
@@ -7040,12 +7124,16 @@ Breakout Confirmation: ${{escapeHtml(pending.breakout_status || "PASS")}}<br>
 <br>
 Starting Option Price: ${{fmtMoney(pending.starting_option_price)}}<br>
 Current Option Price: ${{fmtMoney(pending.current_option_price)}}<br>
+Highest Option Price: ${{fmtMoney(pending.highest_option_price)}}<br>
+Lowest Option Price: ${{fmtMoney(pending.lowest_option_price)}}<br>
 Confirmation Target Price: ${{fmtMoney(pending.confirmation_price)}}<br>
 Confirmation Price Source: ${{escapeHtml(pending.confirmation_price_source || "N/A")}}<br>
 Required Momentum %: ${{fmtPercent(pending.required_confirmation_percent)}}<br>
 Current Momentum Gain %: ${{fmtPercent(pending.current_momentum_gain_percent)}}<br>
 Current Pre-Confirmation Drawdown %: ${{fmtPercent(pending.current_pre_confirmation_drawdown_percent)}}<br>
 Maximum Allowed Drawdown %: ${{fmtPercent(pending.maximum_allowed_drawdown_percent)}}<br>
+Momentum Confirmed: ${{pending.momentum_confirmed ? "YES" : "NO"}}<br>
+Breakout Confirmed: ${{pending.breakout_confirmed ? "YES" : "NO"}}<br>
 Momentum Timeout: ${{escapeHtml(pending.momentum_timeout_seconds ?? 0)}} sec<br>
 Elapsed Time: ${{escapeHtml(pending.elapsed_time_seconds ?? 0)}} sec<br>
 Retry Cooldown Remaining: ${{escapeHtml(pending.retry_cooldown_remaining_seconds ?? 0)}} sec<br>
@@ -7083,11 +7171,15 @@ Momentum: ${{escapeHtml(row.momentum_status || "WAITING")}}<br>
 Breakout: ${{escapeHtml(row.breakout_status || "PASS")}} ${{escapeHtml(breakoutProgress)}}<br>
 Starting Option Price: ${{fmtMoney(row.starting_option_price)}}<br>
 Current Option Price: ${{fmtMoney(row.current_option_price)}}<br>
+Highest Option Price: ${{fmtMoney(row.highest_option_price)}}<br>
+Lowest Option Price: ${{fmtMoney(row.lowest_option_price)}}<br>
 Confirmation Target Price: ${{fmtMoney(row.confirmation_price)}}<br>
 Confirmation Price Source: ${{escapeHtml(row.confirmation_price_source || "N/A")}}<br>
 Current Momentum Gain %: ${{fmtPercent(row.current_momentum_gain_percent)}}<br>
 Current Pre-Confirmation Drawdown %: ${{fmtPercent(row.current_pre_confirmation_drawdown_percent)}}<br>
 Maximum Allowed Drawdown %: ${{fmtPercent(row.maximum_allowed_drawdown_percent)}}<br>
+Momentum Confirmed: ${{row.momentum_confirmed ? "YES" : "NO"}}<br>
+Breakout Confirmed: ${{row.breakout_confirmed ? "YES" : "NO"}}<br>
 Momentum Timeout: ${{escapeHtml(row.momentum_timeout_seconds ?? 0)}} sec<br>
 Elapsed Time: ${{escapeHtml(row.elapsed_time_seconds ?? 0)}} sec<br>
 Retry Cooldown Remaining: ${{escapeHtml(row.retry_cooldown_remaining_seconds ?? 0)}} sec<br>
