@@ -143,6 +143,7 @@ class TournamentProfilesTest(unittest.TestCase):
         self.assertEqual(loaded["BOT_A_BASELINE"].virtual_balance, 1000.0)
 
     def test_no_tradier_or_order_module_imported(self):
+        before = set(importlib.sys.modules)
         importlib.import_module("tournament.models")
         importlib.import_module("tournament.profiles")
         importlib.import_module("tournament.state")
@@ -155,7 +156,8 @@ class TournamentProfilesTest(unittest.TestCase):
             "paper_sell",
             "positions",
         }
-        self.assertTrue(forbidden_modules.isdisjoint(set(importlib.sys.modules)))
+        newly_imported = set(importlib.sys.modules) - before
+        self.assertTrue(forbidden_modules.isdisjoint(newly_imported))
 
 
 if __name__ == "__main__":

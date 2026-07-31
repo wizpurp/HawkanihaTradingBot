@@ -4,6 +4,7 @@ import requests
 import json
 import csv
 import os
+import shutil
 import threading
 import time
 import html as html_lib
@@ -52,6 +53,7 @@ load_dotenv()
 
 app = Flask(__name__)
 MARKET_TZ = ZoneInfo("America/New_York")
+CONFIG_SCHEMA_VERSION = 2
 
 
 def market_now():
@@ -97,7 +99,8 @@ BOT_AUDIT_COLUMNS = [
     "calculated_stop_price", "stop_armed", "no_sell_reason",
     "sell_trigger_reason", "trailing_drawdown_percent",
     "entry_price_source", "estimated_entry_price",
-    "profit_floor_enabled", "locked_profit_amount",
+    "profit_floor_enabled", "locked_profit_amount", "locked_profit_dollars",
+    "required_premium_movement",
     "profit_floor_price", "profit_floor_activated",
     "percentage_trailing_stop", "effective_trailing_stop",
     "stop_control_rule"
@@ -267,9 +270,56 @@ def history_limit(config, key):
     return history["global_limit"] if history.get("use_global_limit", True) else history.get(key, history["global_limit"])
 
 
+def backup_config_file(path="config.json"):
+    if not os.path.exists(path):
+        return
+    backup_path = path[:-5] + ".backup.json" if path.endswith(".json") else path + ".backup"
+    try:
+        shutil.copy2(path, backup_path)
+    except OSError:
+        pass
+
+
+def migrate_original_money_config(config):
+    schema_version = int(config.get("config_schema_version", 1) or 1)
+    migrated = schema_version < CONFIG_SCHEMA_VERSION
+    strategy = config.setdefault("strategy", {})
+
+    if "maximum_position_cost_dollars" not in config:
+        if "max_contract_price" in config:
+            contracts = max(1, int(config.get("contracts", 1) or 1))
+            config["maximum_position_cost_dollars"] = safe_float(config.get("max_contract_price", 1.0), 1.0) * 100 * contracts
+            migrated = True
+        else:
+            config["maximum_position_cost_dollars"] = 100.0
+
+    if "locked_profit_dollars" not in strategy:
+        if "locked_profit_amount" in strategy:
+            contracts = max(1, int(config.get("contracts", 1) or 1))
+            strategy["locked_profit_dollars"] = safe_float(strategy.get("locked_profit_amount", 0.0), 0.0) * 100 * contracts
+            migrated = True
+        else:
+            strategy["locked_profit_dollars"] = 0.0
+
+    config.pop("max_contract_price", None)
+    strategy.pop("locked_profit_amount", None)
+    config["config_schema_version"] = CONFIG_SCHEMA_VERSION
+    return migrated
+
+
+def option_position_cost(option_premium, contracts):
+    return float(option_premium) * 100 * int(contracts or 1)
+
+
+def locked_profit_premium_increment(locked_profit_dollars, contracts):
+    contracts = max(1, int(contracts or 1))
+    return float(locked_profit_dollars or 0.0) / (100 * contracts)
+
+
 def load_config():
     with open("config.json", "r") as f:
         config = json.load(f)
+    migrated = migrate_original_money_config(config)
 
     config.setdefault("entry_rules", {
         "ema_alignment": True,
@@ -293,7 +343,7 @@ def load_config():
     config.setdefault("human_daily_trading_budget", 500)
     config.setdefault("bot_starting_account_balance", 500)
     config.setdefault("human_starting_account_balance", 500)
-    config.setdefault("max_contract_price", 1.00)
+    config["maximum_position_cost_dollars"] = max(0.0, safe_float(config.get("maximum_position_cost_dollars", 100.0), 100.0))
     config["max_open_contracts"] = clamp_int(config.get("max_open_contracts", 1), 1, 5, 1)
     config.setdefault("contract_selection_mode", "strict_atm")
     config["option_momentum_confirmation_enabled"] = bool(config.get("option_momentum_confirmation_enabled", True))
@@ -318,7 +368,7 @@ def load_config():
     config["strategy"].setdefault("hard_stop_percent", 20)
     config["strategy"].setdefault("trailing_stop_percent", 15)
     config["strategy"]["enable_profit_floor_trailing_stop"] = bool(config["strategy"].get("enable_profit_floor_trailing_stop", True))
-    config["strategy"]["locked_profit_amount"] = max(0.0, min(2.0, safe_float(config["strategy"].get("locked_profit_amount", 0.0), 0.0)))
+    config["strategy"]["locked_profit_dollars"] = max(0.0, safe_float(config["strategy"].get("locked_profit_dollars", 0.0), 0.0))
     config["strategy"]["exit_poll_interval_ms"] = clamp_int(
         config["strategy"].get("exit_poll_interval_ms", 1000),
         100,
@@ -326,6 +376,10 @@ def load_config():
         1000
     )
     config["strategy"].setdefault("direction_threshold_percent", 60)
+    if migrated:
+        print(f"ORIGINAL CONFIG MIGRATION: upgraded config.json to schema {CONFIG_SCHEMA_VERSION}")
+        backup_config_file("config.json")
+        save_config(config)
 
     return config
 
@@ -611,7 +665,9 @@ def calculate_stop_state(symbol, entry_price, current_price, config=None, update
     hard_stop_percent = float(strategy.get("hard_stop_percent", 20))
     trailing_stop_percent = float(strategy.get("trailing_stop_percent", 15))
     profit_floor_enabled = bool(strategy.get("enable_profit_floor_trailing_stop", True))
-    locked_profit_amount = max(0.0, min(2.0, safe_float(strategy.get("locked_profit_amount", 0.0), 0.0)))
+    contracts = max(1, int(config.get("contracts", 1) or 1))
+    locked_profit_dollars = max(0.0, safe_float(strategy.get("locked_profit_dollars", 0.0), 0.0))
+    required_premium_movement = locked_profit_premium_increment(locked_profit_dollars, contracts)
 
     with BOT_LOCK:
         peak_price = BOT_STATE["position_peaks"].get(symbol, entry_price)
@@ -623,7 +679,7 @@ def calculate_stop_state(symbol, entry_price, current_price, config=None, update
 
     hard_stop_price = entry_price * (1 - hard_stop_percent / 100) if entry_price is not None else None
     percentage_trailing_stop = peak_price * (1 - trailing_stop_percent / 100) if peak_price is not None else None
-    profit_floor_price = entry_price + locked_profit_amount if profit_floor_enabled and entry_price is not None else None
+    profit_floor_price = entry_price + required_premium_movement if profit_floor_enabled and entry_price is not None else None
     profit_floor_activated = (
         profit_floor_enabled
         and (
@@ -670,7 +726,9 @@ def calculate_stop_state(symbol, entry_price, current_price, config=None, update
         "stop_armed": stop_armed,
         "drawdown_from_peak_percent": drawdown_from_peak_percent,
         "profit_floor_enabled": profit_floor_enabled,
-        "locked_profit_amount": locked_profit_amount,
+        "locked_profit_dollars": locked_profit_dollars,
+        "locked_profit_amount": locked_profit_dollars,
+        "required_premium_movement": required_premium_movement,
         "profit_floor_activated": profit_floor_activated,
         "profit_floor_price": profit_floor_price,
         "stop_control_rule": stop_control_rule
@@ -945,6 +1003,8 @@ def log_bot_audit(action, decision, symbol, market_context, config, **extra):
         "estimated_entry_price": extra.get("estimated_entry_price", ""),
         "profit_floor_enabled": extra.get("profit_floor_enabled", ""),
         "locked_profit_amount": extra.get("locked_profit_amount", ""),
+        "locked_profit_dollars": extra.get("locked_profit_dollars", extra.get("locked_profit_amount", "")),
+        "required_premium_movement": extra.get("required_premium_movement", ""),
         "profit_floor_price": extra.get("profit_floor_price", ""),
         "profit_floor_activated": extra.get("profit_floor_activated", ""),
         "percentage_trailing_stop": extra.get("percentage_trailing_stop", ""),
@@ -1261,7 +1321,7 @@ def select_atm_contract(symbol, side):
     return selected
 
 
-def select_closest_contract_within_budget(symbol, side, max_contract_price):
+def select_closest_contract_within_budget(symbol, side, maximum_position_cost_dollars, contracts):
     quote = get_market_quote(symbol)
     if not quote or quote.get("last") is None:
         return None
@@ -1279,7 +1339,7 @@ def select_closest_contract_within_budget(symbol, side, max_contract_price):
 
     for contract in matching:
         ask = get_option_trade_price(contract)
-        if ask is not None and ask <= max_contract_price:
+        if ask is not None and option_position_cost(ask, contracts) <= maximum_position_cost_dollars:
             contract["expiration"] = expiration
             contract["underlying_price"] = price
             return contract
@@ -1296,12 +1356,13 @@ def select_entry_contract(config, decision, strict_call, strict_put):
     if config.get("contract_selection_mode", "strict_atm") != "closest_within_budget":
         return strict_contract
 
-    max_contract_price = float(config.get("max_contract_price", 1))
+    contracts = int(config.get("contracts", 1) or 1)
+    maximum_position_cost_dollars = float(config.get("maximum_position_cost_dollars", 100) or 100)
     strict_ask = get_option_trade_price(strict_contract)
-    if strict_contract and strict_ask is not None and strict_ask <= max_contract_price:
+    if strict_contract and strict_ask is not None and option_position_cost(strict_ask, contracts) <= maximum_position_cost_dollars:
         return strict_contract
 
-    return select_closest_contract_within_budget(config.get("symbol", "SPY"), side, max_contract_price)
+    return select_closest_contract_within_budget(config.get("symbol", "SPY"), side, maximum_position_cost_dollars, contracts)
 
 
 def submit_option_order(option_symbol, qty, action="buy_to_open"):
@@ -3321,7 +3382,7 @@ def try_surfer_entry(config, positions, market_context, call, put):
 
     contracts = int(config.get("contracts", 1))
     bot_budget = float(config.get("bot_budget", 100))
-    max_contract_price = float(config.get("max_contract_price", 1))
+    maximum_position_cost_dollars = float(config.get("maximum_position_cost_dollars", 100))
     decision = market_context.get("decision", "DO NOTHING")
 
     if decision == "BUY CALL" and not config["entry_rules"].get("allow_calls", True):
@@ -3354,12 +3415,13 @@ def try_surfer_entry(config, positions, market_context, call, put):
     print("ask:", ask)
     print("contracts:", contracts)
     print("real_cost:", real_cost)
+    print("maximum_position_cost_dollars:", maximum_position_cost_dollars)
     print("bot_budget:", bot_budget)
     print("spent_today:", spent_today)
 
-    if ask > max_contract_price:
-        add_bot_reason(f"BUDGET CHECK skipped {side}: ask {ask} > max_contract_price {max_contract_price}")
-        log_bot_audit("SKIP", decision, config.get("symbol", ""), market_context, config, option_symbol=contract.get("symbol", ""), skip_reason="contract price above max")
+    if real_cost > maximum_position_cost_dollars:
+        add_bot_reason(f"BUDGET CHECK skipped {side}: cost {real_cost:.2f} > maximum_position_cost_dollars {maximum_position_cost_dollars:.2f}")
+        log_bot_audit("SKIP", decision, config.get("symbol", ""), market_context, config, option_symbol=contract.get("symbol", ""), skip_reason="maximum position cost exceeded")
         return
 
     if real_cost > bot_budget or spent_today + real_cost > bot_budget:
@@ -3713,6 +3775,8 @@ def fast_exit_audit_fields(
         "trailing_drawdown_percent": trailing_drawdown,
         "profit_floor_enabled": stop_values.get("profit_floor_enabled", ""),
         "locked_profit_amount": stop_values.get("locked_profit_amount", ""),
+        "locked_profit_dollars": stop_values.get("locked_profit_dollars", ""),
+        "required_premium_movement": stop_values.get("required_premium_movement", ""),
         "profit_floor_price": stop_values.get("profit_floor_price", ""),
         "profit_floor_activated": stop_values.get("profit_floor_activated", ""),
         "percentage_trailing_stop": stop_values.get("percentage_trailing_stop", ""),
@@ -3835,7 +3899,8 @@ def fast_exit_poll(config, positions):
     print("hard_stop_price:", hard_stop_price)
     print("trailing_stop_percent:", trailing_stop_percent)
     print("profit_floor_enabled:", stop_values.get("profit_floor_enabled"))
-    print("locked_profit_amount:", stop_values.get("locked_profit_amount"))
+    print("locked_profit_dollars:", stop_values.get("locked_profit_dollars"))
+    print("required_premium_movement:", stop_values.get("required_premium_movement"))
     print("profit_floor_price:", stop_values.get("profit_floor_price"))
     print("profit_floor_activated:", stop_values.get("profit_floor_activated"))
     print("percentage_trailing_stop:", percentage_trailing_stop)
@@ -4843,7 +4908,7 @@ def save_settings():
     config["human_daily_trading_budget"] = float(request.form.get("human_daily_trading_budget", 500))
     config["bot_starting_account_balance"] = float(request.form.get("bot_starting_account_balance", 500))
     config["human_starting_account_balance"] = float(request.form.get("human_starting_account_balance", 500))
-    config["max_contract_price"] = float(request.form.get("max_contract_price", 1))
+    config["maximum_position_cost_dollars"] = max(0.0, safe_float(request.form.get("maximum_position_cost_dollars", 100), 100))
     config["max_open_contracts"] = clamp_int(request.form.get("max_open_contracts", 1), 1, 5, 1)
     config["contract_selection_mode"] = request.form.get("contract_selection_mode", "strict_atm")
     config["option_momentum_confirmation_enabled"] = request.form.get("option_momentum_confirmation_enabled") == "on"
@@ -4876,7 +4941,7 @@ def save_settings():
     s["hard_stop_percent"] = float(request.form.get("hard_stop_percent", 20))
     s["trailing_stop_percent"] = float(request.form.get("trailing_stop_percent", 15))
     s["enable_profit_floor_trailing_stop"] = request.form.get("enable_profit_floor_trailing_stop") == "on"
-    s["locked_profit_amount"] = max(0.0, min(2.0, safe_float(request.form.get("locked_profit_amount", 0.0), 0.0)))
+    s["locked_profit_dollars"] = max(0.0, safe_float(request.form.get("locked_profit_dollars", 0.0), 0.0))
     s["exit_poll_interval_ms"] = clamp_int(request.form.get("exit_poll_interval_ms", 1000), 100, 5000, 1000)
     s["direction_threshold_percent"] = float(request.form.get("direction_threshold_percent", 60))
 
@@ -5200,7 +5265,8 @@ Peak Price: {fmt_trade_price(trade.get("PeakPrice"))}<br>
 Hard Stop Price: {fmt_trade_price(trade.get("HardStopPrice"))}<br>
 Trailing Stop Price: {fmt_trade_price(trade.get("TrailingStopPrice"))}<br>
 Profit Floor Enabled: {escape_html(trade.get("ProfitFloorEnabled", ""))}<br>
-Locked Profit Amount: {fmt_trade_price(trade.get("LockedProfitAmount"))}<br>
+Locked Profit Target: {fmt_money(trade.get("LockedProfitDollars") or trade.get("LockedProfitAmount"))}<br>
+Required Premium Movement: {fmt_trade_price(trade.get("RequiredPremiumMovement"))}<br>
 Profit Floor Price: {fmt_trade_price(trade.get("ProfitFloorPrice"))}<br>
 Profit Floor Activated: {escape_html(trade.get("ProfitFloorActivated", ""))}<br>
 Percentage Trailing Stop: {fmt_trade_price(trade.get("PercentageTrailingStop"))}<br>
@@ -5248,7 +5314,8 @@ Peak Price: {fmt_trade_price(trade.get("PeakPrice"))}<br>
 Hard Stop Price: {fmt_trade_price(trade.get("HardStopPrice"))}<br>
 Trailing Stop Price: {fmt_trade_price(trade.get("TrailingStopPrice"))}<br>
 Profit Floor Enabled: {escape_html(trade.get("ProfitFloorEnabled", ""))}<br>
-Locked Profit Amount: {fmt_trade_price(trade.get("LockedProfitAmount"))}<br>
+Locked Profit Target: {fmt_money(trade.get("LockedProfitDollars") or trade.get("LockedProfitAmount"))}<br>
+Required Premium Movement: {fmt_trade_price(trade.get("RequiredPremiumMovement"))}<br>
 Profit Floor Price: {fmt_trade_price(trade.get("ProfitFloorPrice"))}<br>
 Profit Floor Activated: {escape_html(trade.get("ProfitFloorActivated", ""))}<br>
 Percentage Trailing Stop: {fmt_trade_price(trade.get("PercentageTrailingStop"))}<br>
@@ -5516,7 +5583,9 @@ def get_position_pl_data(pos):
         "trailing_stop_percent": stop_values["trailing_stop_percent"],
         "trailing_stop_price": stop_values["trailing_stop_price"],
         "profit_floor_enabled": stop_values["profit_floor_enabled"],
+        "locked_profit_dollars": stop_values["locked_profit_dollars"],
         "locked_profit_amount": stop_values["locked_profit_amount"],
+        "required_premium_movement": stop_values["required_premium_movement"],
         "profit_floor_price": stop_values["profit_floor_price"],
         "profit_floor_activated": stop_values["profit_floor_activated"],
         "percentage_trailing_stop": stop_values["percentage_trailing_stop"],
@@ -5577,7 +5646,9 @@ def get_bot_health_data(positions, bot_snapshot):
         "peak_price": None,
         "trailing_stop_price": None,
         "profit_floor_enabled": False,
+        "locked_profit_dollars": None,
         "locked_profit_amount": None,
+        "required_premium_movement": None,
         "profit_floor_price": None,
         "profit_floor_activated": False,
         "percentage_trailing_stop": None,
@@ -5604,7 +5675,9 @@ def get_bot_health_data(positions, bot_snapshot):
             "peak_price": pl.get("peak_price"),
             "trailing_stop_price": pl.get("trailing_stop_price"),
             "profit_floor_enabled": pl.get("profit_floor_enabled"),
+            "locked_profit_dollars": pl.get("locked_profit_dollars"),
             "locked_profit_amount": pl.get("locked_profit_amount"),
+            "required_premium_movement": pl.get("required_premium_movement"),
             "profit_floor_price": pl.get("profit_floor_price"),
             "profit_floor_activated": pl.get("profit_floor_activated"),
             "percentage_trailing_stop": pl.get("percentage_trailing_stop"),
@@ -6324,6 +6397,8 @@ Open Interest: <span id="open_interest">N/A</span>
             spread = None
             if opt.get("ask") is not None and opt.get("bid") is not None:
                 spread = float(opt.get("ask")) - float(opt.get("bid"))
+            option_premium = get_option_trade_price(opt)
+            option_total_cost = option_position_cost(option_premium, config.get("contracts", 1)) if option_premium is not None else None
 
             html += f"""
 <div class="item">
@@ -6334,6 +6409,10 @@ Exp: {opt.get("expiration")}<br>
 Bid: {fmt_money(opt.get("bid"))}<br>
 Ask: {fmt_money(opt.get("ask"))}<br>
 Last: {fmt_money(opt.get("last"))}<br>
+Option Premium: {fmt_money(option_premium)}<br>
+Contracts: {config.get("contracts", 1)}<br>
+Total Position Cost: {fmt_money(option_total_cost)}<br>
+Maximum Position Cost: {fmt_money(config.get("maximum_position_cost_dollars", 0))}<br>
 Spread: {fmt_money(spread)}<br>
 Volume: {fmt_int(opt.get("volume"))}<br>
 Open Interest: {fmt_int(opt.get("open_interest"))}
@@ -6407,7 +6486,8 @@ Max Trades Per Day: {e.get("max_trades_per_day")}
 <div class="item"><div class="label">Peak</div><div class="value" id="exit-peak">{fmt_money(bot_health["peak_price"])}</div></div>
 <div class="item"><div class="label">Trailing Stop</div><div class="value" id="exit-trailing-stop">{fmt_money(bot_health["trailing_stop_price"])}</div></div>
 <div class="item"><div class="label">Profit Floor Enabled</div><div class="value" id="exit-profit-floor-enabled">{ "YES" if bot_health["profit_floor_enabled"] else "NO" }</div></div>
-<div class="item"><div class="label">Locked Profit Amount</div><div class="value" id="exit-locked-profit-amount">{fmt_money(bot_health["locked_profit_amount"])}</div></div>
+<div class="item"><div class="label">Locked Profit Target</div><div class="value" id="exit-locked-profit-amount">{fmt_money(bot_health["locked_profit_dollars"])}</div></div>
+<div class="item"><div class="label">Required Premium Movement</div><div class="value" id="exit-required-premium-movement">{fmt_money(bot_health["required_premium_movement"])}</div></div>
 <div class="item"><div class="label">Profit Floor Price</div><div class="value" id="exit-profit-floor-price">{fmt_money(bot_health["profit_floor_price"])}</div></div>
 <div class="item"><div class="label">Profit Floor Activated</div><div class="value" id="exit-profit-floor-activated">{ "YES" if bot_health["profit_floor_activated"] else "NO" }</div></div>
 <div class="item"><div class="label">Percentage Stop</div><div class="value" id="exit-percentage-trailing-stop">{fmt_money(bot_health["percentage_trailing_stop"])}</div></div>
@@ -6464,7 +6544,8 @@ Hard Stop Price: {fmt_money(pl["hard_stop_price"])}<br>
 Peak Price: {fmt_money(pl["peak_price"])}<br>
 Trailing Stop %: {pl["trailing_stop_percent"]:.2f}%<br>
 Profit Floor Enabled: {"YES" if pl.get("profit_floor_enabled") else "NO"}<br>
-Locked Profit Amount: {fmt_money(pl.get("locked_profit_amount"))}<br>
+Locked Profit Target: {fmt_money(pl.get("locked_profit_dollars"))}<br>
+Required Premium Movement: {fmt_money(pl.get("required_premium_movement"))}<br>
 Profit Floor Price: {fmt_money(pl.get("profit_floor_price"))}<br>
 Profit Floor Activated: {"YES" if pl.get("profit_floor_activated") else "NO"}<br>
 Percentage Trailing Stop: {fmt_money(pl.get("percentage_trailing_stop"))}<br>
@@ -6611,8 +6692,8 @@ Today's Bot Trading Budget $:
 Today's Human Trading Budget $:
 <input type="number" step="0.01" name="human_daily_trading_budget" value="{config.get("human_daily_trading_budget", 500)}"><br>
 
-Max Contract Price:
-<input type="number" step="0.01" name="max_contract_price" value="{config.get("max_contract_price", 1)}"><br>
+Maximum Position Cost ($):
+<input type="number" step="0.01" min="0" name="maximum_position_cost_dollars" value="{config.get("maximum_position_cost_dollars", 100)}"><br>
 
 Contract Selection Mode:
 <select name="contract_selection_mode">
@@ -6767,8 +6848,8 @@ Trailing Stop %:
 Profit Floor Trailing Stop:
 <input type="checkbox" name="enable_profit_floor_trailing_stop" {checked(s.get("enable_profit_floor_trailing_stop", True))}><br>
 
-Locked Profit Amount:
-<input type="number" step="0.01" min="0" max="2" name="locked_profit_amount" value="{s.get("locked_profit_amount", 0.0)}"><br>
+Locked Profit ($):
+<input type="number" step="0.01" min="0" name="locked_profit_dollars" value="{s.get("locked_profit_dollars", 0.0)}"><br>
 
 <h3>Opening Direction</h3>
 
@@ -6897,7 +6978,8 @@ Hard Stop Price: ${{fmtMoney(pl.hard_stop_price)}}<br>
 Peak Price: ${{fmtMoney(pl.peak_price)}}<br>
 Trailing Stop %: ${{Number(pl.trailing_stop_percent || 0).toFixed(2)}}%<br>
 Profit Floor Enabled: ${{pl.profit_floor_enabled ? "YES" : "NO"}}<br>
-Locked Profit Amount: ${{fmtMoney(pl.locked_profit_amount)}}<br>
+Locked Profit Target: ${{fmtMoney(pl.locked_profit_dollars)}}<br>
+Required Premium Movement: ${{fmtMoney(pl.required_premium_movement)}}<br>
 Profit Floor Price: ${{fmtMoney(pl.profit_floor_price)}}<br>
 Profit Floor Activated: ${{pl.profit_floor_activated ? "YES" : "NO"}}<br>
 Percentage Trailing Stop: ${{fmtMoney(pl.percentage_trailing_stop)}}<br>
@@ -7275,7 +7357,8 @@ async function updateDeveloperDiagnostics() {{
     setText("exit-peak", fmtMoney(position.peak_price));
     setText("exit-trailing-stop", fmtMoney(position.trailing_stop_price));
     setText("exit-profit-floor-enabled", position.profit_floor_enabled ? "YES" : "NO");
-    setText("exit-locked-profit-amount", fmtMoney(position.locked_profit_amount));
+    setText("exit-locked-profit-amount", fmtMoney(position.locked_profit_dollars));
+    setText("exit-required-premium-movement", fmtMoney(position.required_premium_movement));
     setText("exit-profit-floor-price", fmtMoney(position.profit_floor_price));
     setText("exit-profit-floor-activated", position.profit_floor_activated ? "YES" : "NO");
     setText("exit-percentage-trailing-stop", fmtMoney(position.percentage_trailing_stop));
