@@ -8,7 +8,7 @@ from dataclasses import asdict, fields, is_dataclass
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from .models import BotMetrics, BotProfile, BotRuntimeState, PendingEntryState, ProfileDecision, VirtualPosition, VirtualTournamentPosition
+from .models import BotMetrics, BotProfile, BotRuntimeState, PendingEntryState, ProfileDecision, TournamentMomentumCandidate, VirtualPosition, VirtualTournamentPosition
 
 
 MARKET_TZ = ZoneInfo("America/New_York")
@@ -106,6 +106,9 @@ def _coerce_dataclass(model_type, value):
         return value
     if not isinstance(value, dict):
         value = {}
+    if model_type is VirtualTournamentPosition and "locked_profit_dollars" not in value and "locked_profit_amount" in value:
+        value = dict(value)
+        value["locked_profit_dollars"] = value.get("locked_profit_amount")
     allowed_fields = {field.name for field in fields(model_type)}
     return model_type(**{key: value.get(key) for key in allowed_fields if key in value})
 
@@ -154,6 +157,9 @@ def _state_from_dict(profile_id: str, value: dict, profile: BotProfile) -> BotRu
     virtual_position = None
     if isinstance(value.get("virtual_position"), dict):
         virtual_position = _coerce_dataclass(VirtualTournamentPosition, value.get("virtual_position"))
+    momentum_candidate = None
+    if isinstance(value.get("momentum_candidate"), dict):
+        momentum_candidate = _coerce_dataclass(TournamentMomentumCandidate, value.get("momentum_candidate"))
     starting_balance = float(value.get("starting_balance", 0.0) or 0.0)
 
     return BotRuntimeState(
@@ -178,6 +184,7 @@ def _state_from_dict(profile_id: str, value: dict, profile: BotProfile) -> BotRu
         recovery_count=int(value.get("recovery_count", 0) or 0),
         recovery_status=value.get("recovery_status"),
         recovered_trade_id=value.get("recovered_trade_id"),
+        momentum_candidate=momentum_candidate,
     )
 
 

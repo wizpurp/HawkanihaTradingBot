@@ -30,6 +30,34 @@ class ProfileDecision:
     final_direction: str | None = None
     entry_status: str = "NOT_ATTEMPTED"
     entry_block_reason: str | None = None
+    momentum_candidate_direction: str | None = None
+    momentum_candidate_option_symbol: str | None = None
+    momentum_starting_price: float | None = None
+    momentum_current_price: float | None = None
+    momentum_observed_percent: float = 0.0
+    momentum_required_percent: float = 0.0
+    momentum_candidate_age_seconds: float = 0.0
+    momentum_time_remaining_seconds: float = 0.0
+    momentum_block_reason: str | None = None
+
+
+@dataclass
+class TournamentMomentumCandidate:
+    direction: str
+    option_symbol: str
+    starting_underlying_price: float | None
+    starting_option_price: float
+    started_epoch: float
+    deadline_epoch: float
+    highest_candidate_price: float
+    lowest_candidate_price: float
+    observed_movement_percent: float
+    required_movement_percent: float
+    status: str
+    current_option_price: float | None = None
+    block_reason: str | None = None
+    cancelled_epoch: float | None = None
+    retry_until_epoch: float | None = None
 
 
 @dataclass
@@ -57,7 +85,7 @@ class VirtualTournamentPosition:
     hard_stop_percent: float
     trailing_stop_percent: float
     enable_profit_floor_trailing_stop: bool
-    locked_profit_amount: float
+    locked_profit_dollars: float
     confidence: int
     dominance_percent: float
     bullish_score: int
@@ -182,3 +210,4 @@ class BotRuntimeState:
     recovery_count: int = 0
     recovery_status: str | None = None
     recovered_trade_id: str | None = None
+    momentum_candidate: TournamentMomentumCandidate | None = None

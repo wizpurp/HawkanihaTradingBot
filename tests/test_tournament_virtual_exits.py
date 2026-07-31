@@ -25,19 +25,19 @@ from tournament.state import create_all_initial_states, load_tournament_state
 from tournament.trades import list_tournament_trades
 
 
-def runtime_config(contracts=1, locked_profit_amount=5.0):
+def runtime_config(contracts=1, locked_profit_dollars=5.0):
     return {
         "symbol": "SPY",
         "bot_enabled": True,
         "minimum_confidence": 1,
         "minimum_dominance_percent": 50,
-        "max_contract_price": 10.0,
+        "maximum_position_cost_dollars": 1000.0,
         "contracts": contracts,
         "strategy": {
             "hard_stop_percent": 20,
             "trailing_stop_percent": 10,
             "enable_profit_floor_trailing_stop": True,
-            "locked_profit_amount": locked_profit_amount,
+            "locked_profit_dollars": locked_profit_dollars,
         },
         "entry_rules": {
             "minimum_signals": 1,
@@ -116,11 +116,11 @@ class TournamentVirtualExitsTest(unittest.TestCase):
         self.trade_path_patch.stop()
         self.tempdir.cleanup()
 
-    def open_position(self, profile_id="BOT_A_BASELINE", ask=1.0, symbol="SPYEXIT", contracts=None, locked_profit_amount=None):
-        if contracts is not None or locked_profit_amount is not None:
+    def open_position(self, profile_id="BOT_A_BASELINE", ask=1.0, symbol="SPYEXIT", contracts=None, locked_profit_dollars=None):
+        if contracts is not None or locked_profit_dollars is not None:
             config = runtime_config(
                 contracts=contracts or 1,
-                locked_profit_amount=locked_profit_amount if locked_profit_amount is not None else 5.0,
+                locked_profit_dollars=locked_profit_dollars if locked_profit_dollars is not None else 5.0,
             )
             self.profiles = build_tournament_profiles(config, settings_path=os.path.join(self.tempdir.name, "missing_profiles_2.json"))
             self.states = create_all_initial_states(self.profiles)
@@ -170,7 +170,7 @@ class TournamentVirtualExitsTest(unittest.TestCase):
         self.assertIsNone(evaluate_virtual_exit(position, 0.91, 1001.0))
 
     def test_standard_trailing_stop_closes_after_retracement(self):
-        _, position = self.open_position(locked_profit_amount=100.0)
+        _, position = self.open_position(locked_profit_dollars=100.0)
         position = update_virtual_position_price(position, 1.20, 1001.0)
         self.assertEqual(evaluate_virtual_exit(position, 1.08, 1002.0), EXIT_TRAILING_STOP)
 
@@ -179,26 +179,30 @@ class TournamentVirtualExitsTest(unittest.TestCase):
         self.assertIsNone(evaluate_virtual_exit(position, 0.95, 1001.0))
 
     def test_profit_floor_activates_at_correct_price(self):
-        _, position = self.open_position(locked_profit_amount=5.0)
+        _, position = self.open_position(locked_profit_dollars=5.0)
         self.assertEqual(profit_floor_price(position), 1.05)
         position = update_virtual_position_price(position, 1.05, 1001.0)
         self.assertTrue(profit_floor_activated(position))
 
     def test_profit_floor_calculation_for_one_contract(self):
-        _, position = self.open_position(contracts=1, locked_profit_amount=5.0)
+        _, position = self.open_position(contracts=1, locked_profit_dollars=5.0)
         self.assertEqual(profit_floor_price(position), 1.05)
 
     def test_profit_floor_calculation_for_multiple_contracts(self):
-        _, position = self.open_position(contracts=2, locked_profit_amount=5.0)
+        _, position = self.open_position(contracts=2, locked_profit_dollars=5.0)
         self.assertEqual(profit_floor_price(position), 1.025)
 
+    def test_ui_locked_profit_10_creates_correct_one_contract_floor(self):
+        _, position = self.open_position(contracts=1, ask=1.20, locked_profit_dollars=10.0)
+        self.assertEqual(profit_floor_price(position), 1.30)
+
     def test_profit_floor_prevents_normal_retracement_below_locked_profit_when_possible(self):
-        _, position = self.open_position(locked_profit_amount=5.0)
+        _, position = self.open_position(locked_profit_dollars=5.0)
         position = update_virtual_position_price(position, 1.06, 1001.0)
         self.assertEqual(evaluate_virtual_exit(position, 1.05, 1002.0), EXIT_PROFIT_FLOOR_STOP)
 
     def test_market_gap_below_floor_exits_at_actual_bid(self):
-        _, position = self.open_position(locked_profit_amount=5.0)
+        _, position = self.open_position(locked_profit_dollars=5.0)
         position = update_virtual_position_price(position, 1.06, 1001.0)
         state = self.states["BOT_A_BASELINE"]
         state.virtual_position = position
@@ -206,7 +210,7 @@ class TournamentVirtualExitsTest(unittest.TestCase):
         self.assertEqual(trade.exit_price, 0.90)
 
     def test_exit_precedence_is_deterministic(self):
-        _, position = self.open_position(locked_profit_amount=0.0)
+        _, position = self.open_position(locked_profit_dollars=0.0)
         position = update_virtual_position_price(position, 1.20, 1001.0)
         self.assertEqual(evaluate_virtual_exit(position, 0.70, 1002.0), EXIT_HARD_STOP)
 

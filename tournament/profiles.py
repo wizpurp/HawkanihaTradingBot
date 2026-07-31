@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import tempfile
 from copy import deepcopy
 
@@ -13,6 +14,7 @@ TOURNAMENT_PROFILES_FILE = os.path.join(
     "data",
     "tournament_profiles.json",
 )
+TOURNAMENT_PROFILE_SCHEMA_VERSION = 2
 
 EXPERIMENT_KEYS = {
     "option_momentum_confirmation_enabled",
@@ -43,10 +45,10 @@ DEFAULT_SHARED_SETTINGS = {
     "hard_stop_percent": 12,
     "trailing_stop_percent": 12,
     "enable_profit_floor_trailing_stop": True,
-    "locked_profit_amount": 0.05,
+    "locked_profit_dollars": 5.00,
     "cooldown_minutes": 1,
     "max_trades_per_day": 15,
-    "max_contract_price": 1.50,
+    "maximum_position_cost_dollars": 150.00,
     "contract_selection_mode": "closest_within_budget",
     "contracts": 1,
     "option_momentum_percent": 1.0,
@@ -146,9 +148,43 @@ def default_tournament_profile_settings() -> dict[str, dict]:
     return defaults
 
 
+def _profile_settings_payload(raw):
+    if isinstance(raw, dict) and isinstance(raw.get("profiles"), dict):
+        return raw.get("profiles") or {}, int(raw.get("schema_version", 1) or 1)
+    return raw if isinstance(raw, dict) else {}, 1
+
+
+def _backup_existing_settings(path: str) -> None:
+    if not os.path.exists(path):
+        return
+    backup_path = path[:-5] + ".backup.json" if path.endswith(".json") else path + ".backup"
+    try:
+        shutil.copy2(path, backup_path)
+    except OSError:
+        pass
+
+
+def migrate_tournament_profile_settings(raw) -> tuple[dict[str, dict], bool]:
+    raw_profiles, schema_version = _profile_settings_payload(raw)
+    migrated = schema_version < TOURNAMENT_PROFILE_SCHEMA_VERSION
+    migrated_profiles: dict[str, dict] = {}
+    for profile_id in PROFILE_ORDER:
+        row = deepcopy(raw_profiles.get(profile_id, {})) if isinstance(raw_profiles.get(profile_id, {}), dict) else {}
+        if "maximum_position_cost_dollars" not in row and "max_contract_price" in row:
+            row["maximum_position_cost_dollars"] = _float(row.get("max_contract_price"), 0.0) * 100
+            migrated = True
+        if "locked_profit_dollars" not in row and "locked_profit_amount" in row:
+            row["locked_profit_dollars"] = _float(row.get("locked_profit_amount"), 0.0) * 100
+            migrated = True
+        row.pop("max_contract_price", None)
+        row.pop("locked_profit_amount", None)
+        migrated_profiles[profile_id] = row
+    return migrated_profiles, migrated
+
+
 def normalize_profile_settings(raw_settings: dict | None, *, strict: bool = False) -> tuple[dict[str, dict], list[str]]:
     defaults = default_tournament_profile_settings()
-    raw_settings = raw_settings if isinstance(raw_settings, dict) else {}
+    raw_settings, _ = migrate_tournament_profile_settings(raw_settings if isinstance(raw_settings, dict) else {})
     errors: list[str] = []
     normalized: dict[str, dict] = {}
 
@@ -174,10 +210,10 @@ def normalize_profile_settings(raw_settings: dict | None, *, strict: bool = Fals
             "required_breakout_candles": ("int", 1, None, defaults[profile_id]["required_breakout_candles"]),
             "hard_stop_percent": ("float", 0, 100, defaults[profile_id]["hard_stop_percent"]),
             "trailing_stop_percent": ("float", 0, 100, defaults[profile_id]["trailing_stop_percent"]),
-            "locked_profit_amount": ("float", 0, None, defaults[profile_id]["locked_profit_amount"]),
+            "locked_profit_dollars": ("float", 0, None, defaults[profile_id]["locked_profit_dollars"]),
             "cooldown_minutes": ("int", 0, None, defaults[profile_id]["cooldown_minutes"]),
             "max_trades_per_day": ("int", 1, None, defaults[profile_id]["max_trades_per_day"]),
-            "max_contract_price": ("float", 0, None, defaults[profile_id]["max_contract_price"]),
+            "maximum_position_cost_dollars": ("float", 0, None, defaults[profile_id]["maximum_position_cost_dollars"]),
             "contracts": ("int", 1, None, defaults[profile_id]["contracts"]),
             "max_quote_age_seconds": ("int", 1, None, defaults[profile_id]["max_quote_age_seconds"]),
         }
@@ -215,6 +251,12 @@ def load_tournament_profile_settings(path: str = TOURNAMENT_PROFILES_FILE) -> di
             raw = json.load(handle)
     except Exception:
         return default_tournament_profile_settings()
+    migrated_raw, migrated = migrate_tournament_profile_settings(raw)
+    if migrated:
+        print(f"TOURNAMENT PROFILE MIGRATION: upgraded {path} to schema {TOURNAMENT_PROFILE_SCHEMA_VERSION}")
+        _backup_existing_settings(path)
+        save_tournament_profile_settings(migrated_raw, path)
+        raw = migrated_raw
     normalized, errors = normalize_profile_settings(raw, strict=False)
     if errors:
         return default_tournament_profile_settings()
@@ -228,7 +270,11 @@ def save_tournament_profile_settings(settings: dict, path: str = TOURNAMENT_PROF
     fd, temp_path = tempfile.mkstemp(prefix=".tournament_profiles.", suffix=".tmp", dir=directory, text=True)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(normalized, handle, indent=2, sort_keys=True)
+            payload = {
+                "schema_version": TOURNAMENT_PROFILE_SCHEMA_VERSION,
+                "profiles": normalized,
+            }
+            json.dump(payload, handle, indent=2, sort_keys=True)
             handle.write("\n")
         os.replace(temp_path, path)
     except Exception:
@@ -272,7 +318,7 @@ def copy_tournament_profile_settings(source_profile_id: str, copy_mode: str, pat
 def _apply_profile_settings(config: dict, settings: dict) -> dict:
     config["minimum_confidence"] = settings["minimum_confidence"]
     config["minimum_dominance_percent"] = settings["minimum_dominance_percent"]
-    config["max_contract_price"] = settings["max_contract_price"]
+    config["maximum_position_cost_dollars"] = settings["maximum_position_cost_dollars"]
     config["contract_selection_mode"] = settings["contract_selection_mode"]
     config["contracts"] = settings["contracts"]
     config["option_momentum_confirmation_enabled"] = settings["option_momentum_confirmation_enabled"]
@@ -296,7 +342,7 @@ def _apply_profile_settings(config: dict, settings: dict) -> dict:
     strategy["hard_stop_percent"] = settings["hard_stop_percent"]
     strategy["trailing_stop_percent"] = settings["trailing_stop_percent"]
     strategy["enable_profit_floor_trailing_stop"] = settings["enable_profit_floor_trailing_stop"]
-    strategy["locked_profit_amount"] = settings["locked_profit_amount"]
+    strategy["locked_profit_dollars"] = settings["locked_profit_dollars"]
     return config
 
 
@@ -308,7 +354,7 @@ def _settings_from_runtime(runtime_config: dict | None) -> dict[str, dict]:
     runtime_field_sources = {
         "minimum_confidence": runtime_config,
         "minimum_dominance_percent": runtime_config,
-        "max_contract_price": runtime_config,
+        "maximum_position_cost_dollars": runtime_config,
         "contract_selection_mode": runtime_config,
         "contracts": runtime_config,
         "option_momentum_percent": runtime_config,
@@ -326,8 +372,12 @@ def _settings_from_runtime(runtime_config: dict | None) -> dict[str, dict]:
         "hard_stop_percent": strategy,
         "trailing_stop_percent": strategy,
         "enable_profit_floor_trailing_stop": strategy,
-        "locked_profit_amount": strategy,
+        "locked_profit_dollars": strategy,
     }
+    if "maximum_position_cost_dollars" not in runtime_config and "max_contract_price" in runtime_config:
+        runtime_field_sources["max_contract_price"] = runtime_config
+    if "locked_profit_dollars" not in strategy and "locked_profit_amount" in strategy:
+        runtime_field_sources["locked_profit_amount"] = strategy
     for row in settings.values():
         for field, source in runtime_field_sources.items():
             if field in source:

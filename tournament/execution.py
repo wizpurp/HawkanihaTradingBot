@@ -132,14 +132,18 @@ def try_open_virtual_position(
         _reject(decision, "REJECTED", stale_reason or REJECT_INVALID_QUOTE_TIMESTAMP)
         return None
 
-    max_contract_price = float(config.get("max_contract_price", 0) or 0)
-    if max_contract_price > 0 and float(option_ask) > max_contract_price:
-        _block_entry(decision, "MAX_CONTRACT_PRICE_EXCEEDED")
-        return None
-
     contracts = int(config.get("contracts", 1) or 1)
     if contracts < 1:
         _block_entry(decision, "INVALID_CONTRACTS")
+        return None
+
+    entry_price = float(option_ask)
+    entry_cost = entry_price * 100 * contracts
+    maximum_position_cost_dollars = float(config.get("maximum_position_cost_dollars", 0) or 0)
+    if maximum_position_cost_dollars <= 0 and "max_contract_price" in config:
+        maximum_position_cost_dollars = float(config.get("max_contract_price", 0) or 0) * 100 * contracts
+    if maximum_position_cost_dollars > 0 and entry_cost > maximum_position_cost_dollars:
+        _block_entry(decision, "MAXIMUM_POSITION_COST_EXCEEDED")
         return None
 
     fingerprint = _entry_fingerprint(profile.profile_id, option_symbol, direction, snapshot, decision)
@@ -148,8 +152,6 @@ def try_open_virtual_position(
         return None
 
     timestamp = market_timestamp()
-    entry_price = float(option_ask)
-    entry_cost = entry_price * 100 * contracts
     display_name = profile_display_name(profile.profile_id)
     trade_id = generate_trade_id(profile.profile_id, option_symbol, timestamp)
 
@@ -210,7 +212,7 @@ def try_open_virtual_position(
         hard_stop_percent=float(strategy.get("hard_stop_percent", 0) or 0),
         trailing_stop_percent=float(strategy.get("trailing_stop_percent", 0) or 0),
         enable_profit_floor_trailing_stop=bool(strategy.get("enable_profit_floor_trailing_stop", False)),
-        locked_profit_amount=float(strategy.get("locked_profit_amount", 0) or 0),
+        locked_profit_dollars=float(strategy.get("locked_profit_dollars", strategy.get("locked_profit_amount", 0)) or 0),
         confidence=snapshot.confidence,
         dominance_percent=snapshot.dominance_percent,
         bullish_score=snapshot.bullish_score,
@@ -226,6 +228,7 @@ def try_open_virtual_position(
     cooldown_minutes = int(rules.get("cooldown_minutes", 0) or 0)
     state.virtual_entry_cooldown_until_epoch = now_epoch + (cooldown_minutes * 60) if cooldown_minutes > 0 else None
     state.last_entry_fingerprint = fingerprint
+    state.momentum_candidate = None
     state.last_updated_at = timestamp
     decision.entry_status = "OPENED"
     decision.entry_block_reason = None

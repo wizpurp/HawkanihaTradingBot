@@ -41,14 +41,14 @@ def runtime_config():
         "bot_enabled": True,
         "minimum_confidence": 1,
         "minimum_dominance_percent": 50,
-        "max_contract_price": 10.0,
+        "maximum_position_cost_dollars": 1000.0,
         "contracts": 1,
         "max_quote_age_seconds": 10,
         "strategy": {
             "hard_stop_percent": 20,
             "trailing_stop_percent": 10,
             "enable_profit_floor_trailing_stop": True,
-            "locked_profit_amount": 5.0,
+            "locked_profit_dollars": 5.0,
             "exit_poll_interval_ms": 500,
         },
         "entry_rules": {

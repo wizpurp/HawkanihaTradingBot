@@ -15,7 +15,7 @@ class TournamentProfilesTest(unittest.TestCase):
             "symbol": "SPY",
             "minimum_confidence": 4,
             "minimum_dominance_percent": 60,
-            "max_contract_price": 1.0,
+            "maximum_position_cost_dollars": 100.0,
             "contracts": 1,
             "bot_starting_account_balance": 1000.0,
             "strategy": {
@@ -24,7 +24,7 @@ class TournamentProfilesTest(unittest.TestCase):
                 "direction_threshold_percent": 60,
                 "exit_poll_interval_ms": 1000,
                 "enable_profit_floor_trailing_stop": True,
-                "locked_profit_amount": 0.0,
+                "locked_profit_dollars": 0.0,
             },
             "entry_rules": {
                 "minimum_signals": 2,

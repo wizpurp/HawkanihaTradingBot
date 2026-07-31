@@ -43,3 +43,4 @@ Thumbs.db
 # Local temp files
 *.tmp
 *.bak
+data/tournament_profiles.backup.json

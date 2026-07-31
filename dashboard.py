@@ -17,6 +17,7 @@ from logs.trade_logger import *
 from tournament.evaluator import evaluate_all_profiles
 from tournament.execution import try_open_virtual_position
 from tournament.exits import evaluate_virtual_exit, process_virtual_exits, stop_snapshot, update_virtual_position_price, valid_bid
+from tournament.momentum import apply_tournament_momentum
 from tournament.profiles import (
     PROFILE_ORDER,
     TOURNAMENT_PROFILES_FILE,
@@ -361,10 +362,10 @@ TOURNAMENT_SETTING_FIELDS = [
     "hard_stop_percent",
     "trailing_stop_percent",
     "enable_profit_floor_trailing_stop",
-    "locked_profit_amount",
+    "locked_profit_dollars",
     "cooldown_minutes",
     "max_trades_per_day",
-    "max_contract_price",
+    "maximum_position_cost_dollars",
     "contract_selection_mode",
     "contracts",
 ]
@@ -2847,6 +2848,23 @@ def serialize_tournament_positions(states):
     return rows
 
 
+def tournament_option_money_snapshot(snapshot, profile, decision):
+    direction = decision.direction or decision.final_direction or decision.preliminary_direction
+    option_premium = None
+    if direction == "CALL":
+        option_premium = snapshot.call_option_ask if snapshot.call_option_ask is not None else snapshot.option_ask
+    elif direction == "PUT":
+        option_premium = snapshot.put_option_ask if snapshot.put_option_ask is not None else snapshot.option_ask
+    contracts = int((profile.config or {}).get("contracts", 1) or 1)
+    total_position_cost = float(option_premium) * 100 * contracts if option_premium is not None else None
+    return {
+        "option_premium": option_premium,
+        "contracts": contracts,
+        "total_position_cost": total_position_cost,
+        "maximum_position_cost_dollars": float((profile.config or {}).get("maximum_position_cost_dollars", 0) or 0),
+    }
+
+
 def evaluate_tournament_decisions(config, signal, call_contract=None, put_contract=None):
     profiles = build_tournament_profiles(config)
     signal = add_snapshot_option_fields(signal, call_contract, put_contract)
@@ -2861,6 +2879,7 @@ def evaluate_tournament_decisions(config, signal, call_contract=None, put_contra
         decisions = evaluate_all_profiles(profiles, states, snapshot)
         opened_trades = []
         now_epoch = time.time()
+        decisions = apply_tournament_momentum(profiles, states, decisions, snapshot, now_epoch)
         for profile_id, profile in profiles.items():
             trade = try_open_virtual_position(
                 profile,
@@ -2884,6 +2903,7 @@ def evaluate_tournament_decisions(config, signal, call_contract=None, put_contra
         state_by_profile = {
             profile_id: {
                 "virtual_position": dict(asdict(state.virtual_position), **stop_snapshot(state.virtual_position)) if state.virtual_position else None,
+                "momentum_candidate": asdict(state.momentum_candidate) if state.momentum_candidate else None,
                 "virtual_trades_today": state.virtual_trades_today,
                 "cooldown_remaining_seconds": max(0, int(state.virtual_entry_cooldown_until_epoch - now_epoch)) if state.virtual_entry_cooldown_until_epoch else 0,
                 "last_entry_fingerprint": state.last_entry_fingerprint,
@@ -2892,7 +2912,10 @@ def evaluate_tournament_decisions(config, signal, call_contract=None, put_contra
         }
         positions = serialize_tournament_positions(states)
         decisions_payload = {
-            profile_id: asdict(decision)
+            profile_id: dict(
+                asdict(decision),
+                **tournament_option_money_snapshot(snapshot, profiles[profile_id], decision),
+            )
             for profile_id, decision in decisions.items()
         }
         decisions_evaluated = sum(state.decisions_evaluated for state in states.values())
@@ -2919,6 +2942,7 @@ def refresh_tournament_state_snapshot(states):
     return {
         profile_id: {
             "virtual_position": dict(asdict(state.virtual_position), **stop_snapshot(state.virtual_position)) if state.virtual_position else None,
+            "momentum_candidate": asdict(state.momentum_candidate) if state.momentum_candidate else None,
             "virtual_trades_today": state.virtual_trades_today,
             "cooldown_remaining_seconds": max(0, int(state.virtual_entry_cooldown_until_epoch - now_epoch)) if state.virtual_entry_cooldown_until_epoch else 0,
             "last_entry_fingerprint": state.last_entry_fingerprint,
@@ -5821,10 +5845,10 @@ Allow Puts: {tournament_checkbox(profile_id, row, "allow_puts")}<br>
 Hard Stop %: {tournament_input(profile_id, row, "hard_stop_percent", step="0.1", minimum=0, maximum=100)}<br>
 Trailing Stop %: {tournament_input(profile_id, row, "trailing_stop_percent", step="0.1", minimum=0, maximum=100)}<br>
 Profit Floor Enabled: {tournament_checkbox(profile_id, row, "enable_profit_floor_trailing_stop")}<br>
-Locked Profit Amount: {tournament_input(profile_id, row, "locked_profit_amount", step="0.01", minimum=0)}<br>
+Locked Profit ($): {tournament_input(profile_id, row, "locked_profit_dollars", step="0.01", minimum=0)}<br>
 Cooldown Minutes: {tournament_input(profile_id, row, "cooldown_minutes", minimum=0)}<br>
 Max Trades Per Day: {tournament_input(profile_id, row, "max_trades_per_day", minimum=1)}<br>
-Max Contract Price: {tournament_input(profile_id, row, "max_contract_price", step="0.01", minimum=0)}<br>
+Maximum Position Cost ($): {tournament_input(profile_id, row, "maximum_position_cost_dollars", step="0.01", minimum=0)}<br>
 Contract Selection Mode:
 <select name="tournament__{profile_id}__contract_selection_mode">
 <option value="strict_atm" {selected("strict_atm", mode)}>Strict ATM</option>
@@ -5863,6 +5887,9 @@ Contracts: {tournament_input(profile_id, row, "contracts", minimum=1)}<br>
             evaluated = state.decisions_evaluated if state else 0
             position = state.virtual_position if state else None
             stops = stop_snapshot(position) if position else {}
+            option_premium = row.get("option_premium")
+            total_position_cost = row.get("total_position_cost")
+            maximum_position_cost = row.get("maximum_position_cost_dollars")
             rows.append(f"""
 <tr>
 <td>{html_lib.escape(settings_row.get("display_name", profile_id))}</td>
@@ -5875,12 +5902,25 @@ Contracts: {tournament_input(profile_id, row, "contracts", minimum=1)}<br>
 <td>{safe_float(row.get("direction_threshold")):.1f}%</td>
 <td>{safe_float(row.get("minimum_dominance")):.1f}%</td>
 <td>{html_lib.escape(str(row.get("momentum_status", "N/A")))}</td>
+<td>{html_lib.escape(str(row.get("momentum_candidate_direction") or ""))}</td>
+<td>{html_lib.escape(str(row.get("momentum_candidate_option_symbol") or ""))}</td>
+<td>{fmt_trade_price(row.get("momentum_starting_price"))}</td>
+<td>{fmt_trade_price(row.get("momentum_current_price"))}</td>
+<td>{safe_float(row.get("momentum_observed_percent")):.2f}%</td>
+<td>{safe_float(row.get("momentum_required_percent")):.2f}%</td>
+<td>{safe_float(row.get("momentum_candidate_age_seconds")):.0f}s</td>
+<td>{safe_float(row.get("momentum_time_remaining_seconds")):.0f}s</td>
+<td>{html_lib.escape(str(row.get("momentum_block_reason") or ""))}</td>
 <td>{html_lib.escape(str(row.get("or_confirmation_status", "N/A")))}</td>
 <td>{html_lib.escape(str(row.get("final_direction") or row.get("direction") or "NONE"))}</td>
 <td>{row.get("accepted", False)}</td>
 <td>{html_lib.escape(str(row.get("rejection_reason") or ""))}</td>
 <td>{html_lib.escape(str(row.get("entry_status") or ""))}</td>
 <td>{html_lib.escape(str(row.get("entry_block_reason") or ""))}</td>
+<td>{fmt_trade_price(option_premium)}</td>
+<td>{escape_html(row.get("contracts") or settings_row.get("contracts", ""))}</td>
+<td>{fmt_money(total_position_cost) if total_position_cost not in (None, "") else ""}</td>
+<td>{fmt_money(maximum_position_cost) if maximum_position_cost not in (None, "") else ""}</td>
 <td>{evaluated}</td>
 <td>{escape_html(position.status if position else "NONE")}</td>
 <td>{escape_html(position.option_symbol if position else "")}</td>
@@ -6114,12 +6154,25 @@ Bot Reason Log:<br>
 <th>Direction Threshold</th>
 <th>Minimum Dominance</th>
 <th>Momentum Result</th>
+<th>Candidate Direction</th>
+<th>Candidate Option</th>
+<th>Starting Price</th>
+<th>Current Price</th>
+<th>Movement Observed</th>
+<th>Movement Required</th>
+<th>Candidate Age</th>
+<th>Time Remaining</th>
+<th>Momentum Block Reason</th>
 <th>OR Result</th>
 <th>Final Direction</th>
 <th>Accepted</th>
 <th>Rejection Reason</th>
 <th>Entry Status</th>
 <th>Entry Block Reason</th>
+<th>Option Premium</th>
+<th>Contracts</th>
+<th>Total Position Cost</th>
+<th>Maximum Position Cost</th>
 <th>Decisions Evaluated</th>
 <th>Position Status</th>
 <th>Option</th>
@@ -6996,12 +7049,25 @@ function renderTournamentDecisions(decisions, evaluatedByProfile, settings, stat
 <td>${{Number(row.direction_threshold || 0).toFixed(1)}}%</td>
 <td>${{Number(row.minimum_dominance || 0).toFixed(1)}}%</td>
 <td>${{escapeHtml(row.momentum_status || "N/A")}}</td>
+<td>${{escapeHtml(row.momentum_candidate_direction || "")}}</td>
+<td>${{escapeHtml(row.momentum_candidate_option_symbol || "")}}</td>
+<td>${{fmtMoney(row.momentum_starting_price)}}</td>
+<td>${{fmtMoney(row.momentum_current_price)}}</td>
+<td>${{Number(row.momentum_observed_percent || 0).toFixed(2)}}%</td>
+<td>${{Number(row.momentum_required_percent || 0).toFixed(2)}}%</td>
+<td>${{Number(row.momentum_candidate_age_seconds || 0).toFixed(0)}}s</td>
+<td>${{Number(row.momentum_time_remaining_seconds || 0).toFixed(0)}}s</td>
+<td>${{escapeHtml(row.momentum_block_reason || "")}}</td>
 <td>${{escapeHtml(row.or_confirmation_status || "N/A")}}</td>
 <td>${{escapeHtml(row.final_direction || row.direction || "NONE")}}</td>
 <td>${{escapeHtml(row.accepted ?? false)}}</td>
 <td>${{escapeHtml(row.rejection_reason || "")}}</td>
 <td>${{escapeHtml(row.entry_status || "")}}</td>
 <td>${{escapeHtml(row.entry_block_reason || "")}}</td>
+<td>${{fmtMoney(row.option_premium)}}</td>
+<td>${{escapeHtml(row.contracts || settings.contracts || "")}}</td>
+<td>${{fmtMoney(row.total_position_cost)}}</td>
+<td>${{fmtMoney(row.maximum_position_cost_dollars)}}</td>
 <td>${{escapeHtml(evaluatedByProfile[profileId] || 0)}}</td>
 <td>${{escapeHtml(position?.status || "NONE")}}</td>
 <td>${{escapeHtml(position?.option_symbol || "")}}</td>

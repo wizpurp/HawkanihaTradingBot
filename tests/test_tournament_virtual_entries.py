@@ -19,13 +19,13 @@ def runtime_config():
         "bot_enabled": True,
         "minimum_confidence": 1,
         "minimum_dominance_percent": 50,
-        "max_contract_price": 2.0,
+        "maximum_position_cost_dollars": 200.0,
         "contracts": 1,
         "strategy": {
             "hard_stop_percent": 12,
             "trailing_stop_percent": 12,
             "enable_profit_floor_trailing_stop": True,
-            "locked_profit_amount": 0.05,
+            "locked_profit_dollars": 5.0,
         },
         "entry_rules": {
             "minimum_signals": 1,
@@ -120,6 +120,14 @@ class TournamentVirtualEntriesTest(unittest.TestCase):
             now_epoch,
         )
 
+    def rebuild_profiles(self, contracts=1, maximum_position_cost_dollars=200.0, locked_profit_dollars=5.0):
+        config = runtime_config()
+        config["contracts"] = contracts
+        config["maximum_position_cost_dollars"] = maximum_position_cost_dollars
+        config["strategy"]["locked_profit_dollars"] = locked_profit_dollars
+        self.profiles = build_tournament_profiles(config, settings_path=os.path.join(self.tempdir.name, "rebuild_profiles.json"))
+        self.states = create_all_initial_states(self.profiles)
+
     def test_accepted_baseline_opens_virtual_position(self):
         trade = self.open_position("BOT_A_BASELINE")
         self.assertIsNotNone(trade)
@@ -148,9 +156,37 @@ class TournamentVirtualEntriesTest(unittest.TestCase):
         self.assertIsNone(self.open_position(snap=snapshot(option_ask=None)))
         self.assertIsNone(self.open_position(snap=snapshot(option_ask=0)))
 
-    def test_ask_above_max_contract_price_does_not_open(self):
-        self.profiles["BOT_A_BASELINE"].config["max_contract_price"] = 0.50
+    def test_ask_above_maximum_position_cost_does_not_open(self):
+        self.profiles["BOT_A_BASELINE"].config["maximum_position_cost_dollars"] = 50.00
         self.assertIsNone(self.open_position(snap=snapshot(option_ask=1.0)))
+
+    def test_ui_value_150_accepts_one_contract_at_149(self):
+        self.rebuild_profiles(contracts=1, maximum_position_cost_dollars=150.0)
+        trade = self.open_position(snap=snapshot(option_ask=1.49))
+        self.assertIsNotNone(trade)
+        self.assertEqual(trade.entry_cost, 149.0)
+
+    def test_ui_value_150_accepts_one_contract_at_150(self):
+        self.rebuild_profiles(contracts=1, maximum_position_cost_dollars=150.0)
+        trade = self.open_position(snap=snapshot(option_ask=1.50))
+        self.assertIsNotNone(trade)
+        self.assertEqual(trade.entry_cost, 150.0)
+
+    def test_ui_value_150_rejects_one_contract_at_151(self):
+        self.rebuild_profiles(contracts=1, maximum_position_cost_dollars=150.0)
+        trade = self.open_position(snap=snapshot(option_ask=1.51))
+        self.assertIsNone(trade)
+
+    def test_ui_value_150_accepts_two_contracts_at_075(self):
+        self.rebuild_profiles(contracts=2, maximum_position_cost_dollars=150.0)
+        trade = self.open_position(snap=snapshot(option_ask=0.75))
+        self.assertIsNotNone(trade)
+        self.assertEqual(trade.entry_cost, 150.0)
+
+    def test_ui_value_150_rejects_two_contracts_at_100(self):
+        self.rebuild_profiles(contracts=2, maximum_position_cost_dollars=150.0)
+        trade = self.open_position(snap=snapshot(option_ask=1.00))
+        self.assertIsNone(trade)
 
     def test_existing_open_position_blocks_same_profile(self):
         self.open_position("BOT_A_BASELINE")
@@ -192,6 +228,7 @@ class TournamentVirtualEntriesTest(unittest.TestCase):
 
     def test_contracts_are_respected(self):
         self.profiles["BOT_A_BASELINE"].config["contracts"] = 3
+        self.profiles["BOT_A_BASELINE"].config["maximum_position_cost_dollars"] = 500.0
         trade = self.open_position(snap=snapshot(option_ask=1.0))
         self.assertEqual(trade.contracts, 3)
         self.assertEqual(trade.entry_cost, 300.0)
@@ -249,12 +286,12 @@ class TournamentVirtualEntriesTest(unittest.TestCase):
     def test_risk_settings_are_captured_at_entry(self):
         self.profiles["BOT_A_BASELINE"].config["strategy"]["hard_stop_percent"] = 9
         self.profiles["BOT_A_BASELINE"].config["strategy"]["trailing_stop_percent"] = 11
-        self.profiles["BOT_A_BASELINE"].config["strategy"]["locked_profit_amount"] = 0.25
+        self.profiles["BOT_A_BASELINE"].config["strategy"]["locked_profit_dollars"] = 25.0
         self.open_position()
         position = self.states["BOT_A_BASELINE"].virtual_position
         self.assertEqual(position.hard_stop_percent, 9)
         self.assertEqual(position.trailing_stop_percent, 11)
-        self.assertEqual(position.locked_profit_amount, 0.25)
+        self.assertEqual(position.locked_profit_dollars, 25.0)
 
     def test_tournament_trade_is_stored_separately_from_original_trades(self):
         self.open_position(snap=snapshot(option_symbol="TOURNAMENT_ONLY"))

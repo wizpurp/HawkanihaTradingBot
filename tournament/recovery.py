@@ -149,7 +149,7 @@ def reconstruct_position_from_trade(profile: BotProfile, trade: TournamentTrade)
         hard_stop_percent=float(strategy.get("hard_stop_percent", 0) or 0),
         trailing_stop_percent=float(strategy.get("trailing_stop_percent", 0) or 0),
         enable_profit_floor_trailing_stop=bool(strategy.get("enable_profit_floor_trailing_stop", False)),
-        locked_profit_amount=float(strategy.get("locked_profit_amount", 0) or 0),
+        locked_profit_dollars=float(strategy.get("locked_profit_dollars", strategy.get("locked_profit_amount", 0)) or 0),
         confidence=int(trade.confidence or 0),
         dominance_percent=float(trade.dominance_percent or 0.0),
         bullish_score=int(trade.bullish_score or 0),

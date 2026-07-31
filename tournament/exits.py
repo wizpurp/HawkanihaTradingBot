@@ -50,7 +50,7 @@ def trailing_stop_price(position: VirtualTournamentPosition) -> float:
 def profit_floor_price(position: VirtualTournamentPosition) -> float | None:
     if not position.enable_profit_floor_trailing_stop:
         return None
-    return position.entry_price + (position.locked_profit_amount / 100 / position.contracts)
+    return position.entry_price + (position.locked_profit_dollars / 100 / position.contracts)
 
 
 def profit_floor_activated(position: VirtualTournamentPosition) -> bool:

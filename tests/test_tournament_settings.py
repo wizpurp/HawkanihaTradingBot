@@ -1,4 +1,5 @@
 import copy
+import json
 import os
 import tempfile
 import unittest
@@ -23,7 +24,7 @@ def runtime_config():
         "bot_enabled": True,
         "minimum_confidence": 1,
         "minimum_dominance_percent": 50,
-        "max_contract_price": 9.99,
+        "maximum_position_cost_dollars": 999.0,
         "contract_selection_mode": "strict_atm",
         "contracts": 2,
         "strategy": {
@@ -31,7 +32,7 @@ def runtime_config():
             "hard_stop_percent": 20,
             "trailing_stop_percent": 20,
             "enable_profit_floor_trailing_stop": False,
-            "locked_profit_amount": 0.0,
+            "locked_profit_dollars": 0.0,
         },
         "entry_rules": {
             "minimum_signals": 1,
@@ -179,6 +180,45 @@ class TournamentSettingsTest(unittest.TestCase):
             build_tournament_profiles(config, path)
 
         self.assertEqual(config, before)
+
+    def test_legacy_money_settings_migrate_to_dollars_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.temp_path(directory)
+            legacy = default_tournament_profile_settings()
+            for row in legacy.values():
+                row.pop("maximum_position_cost_dollars", None)
+                row.pop("locked_profit_dollars", None)
+                row["max_contract_price"] = 1.50
+                row["locked_profit_amount"] = 0.05
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(legacy, handle)
+
+            first_load = load_tournament_profile_settings(path)
+            second_load = load_tournament_profile_settings(path)
+
+        for profile_id in first_load:
+            self.assertEqual(first_load[profile_id]["maximum_position_cost_dollars"], 150.0)
+            self.assertEqual(first_load[profile_id]["locked_profit_dollars"], 5.0)
+            self.assertEqual(second_load[profile_id]["maximum_position_cost_dollars"], 150.0)
+            self.assertEqual(second_load[profile_id]["locked_profit_dollars"], 5.0)
+
+    def test_saved_profile_file_has_schema_version(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.temp_path(directory)
+            save_tournament_profile_settings(default_tournament_profile_settings(), path)
+            with open(path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+
+        self.assertEqual(payload["schema_version"], 2)
+        self.assertIn("profiles", payload)
+
+    def test_dashboard_labels_tournament_money_inputs_as_dollars(self):
+        import dashboard
+
+        html = dashboard.app.test_client().get("/").get_data(as_text=True)
+
+        self.assertIn("Maximum Position Cost ($)", html)
+        self.assertIn("Locked Profit ($)", html)
 
 
 if __name__ == "__main__":
