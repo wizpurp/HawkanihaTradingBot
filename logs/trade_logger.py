@@ -22,7 +22,7 @@ TRADE_COLUMNS = [
     "Source", "EntryGrade", "LiveGrade", "ExitGrade", "BotGrade", "OverallGrade",
     "TradeScore", "GradeReason", "HoldTime", "PeakPrice",
     "HardStopPrice", "TrailingStopPrice", "MaxDrawdownFromPeakPercent",
-    "ProfitFloorEnabled", "LockedProfitAmount", "ProfitFloorPrice",
+    "ProfitFloorEnabled", "LockedProfitAmount", "LockedProfitDollars", "RequiredPremiumMovement", "ProfitFloorPrice",
     "ProfitFloorActivated", "PercentageTrailingStop", "EffectiveTrailingStop",
     "StopControlRule",
     "PnLPercent", "ExitReason", "EntryPriceSource", "EstimatedEntryPrice",
@@ -175,6 +175,8 @@ def log_trade(
     trailing_stop_price = ""
     profit_floor_enabled = ""
     locked_profit_amount = ""
+    locked_profit_dollars = ""
+    required_premium_movement = ""
     profit_floor_price = ""
     profit_floor_activated = ""
     percentage_trailing_stop = ""
@@ -226,6 +228,8 @@ def log_trade(
             trailing_stop_price = stop_values["trailing_stop_price"]
             profit_floor_enabled = stop_values.get("profit_floor_enabled", "")
             locked_profit_amount = stop_values.get("locked_profit_amount", "")
+            locked_profit_dollars = stop_values.get("locked_profit_dollars", locked_profit_amount)
+            required_premium_movement = stop_values.get("required_premium_movement", "")
             profit_floor_price = stop_values.get("profit_floor_price", "")
             profit_floor_activated = stop_values.get("profit_floor_activated", "")
             percentage_trailing_stop = stop_values.get("percentage_trailing_stop", "")
@@ -266,6 +270,8 @@ def log_trade(
         "TrailingStopPrice": trailing_stop_price,
         "ProfitFloorEnabled": profit_floor_enabled,
         "LockedProfitAmount": locked_profit_amount,
+        "LockedProfitDollars": locked_profit_dollars,
+        "RequiredPremiumMovement": required_premium_movement,
         "ProfitFloorPrice": profit_floor_price,
         "ProfitFloorActivated": profit_floor_activated,
         "PercentageTrailingStop": percentage_trailing_stop,

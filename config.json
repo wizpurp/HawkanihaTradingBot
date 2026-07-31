@@ -7,7 +7,6 @@
     "strategy_mode": "SURFER",
     "decision_time": "9:42",
     "bot_budget": 1000.0,
-    "max_contract_price": 1.0,
     "contract_selection_mode": "strict_atm",
     "option_momentum_confirmation_enabled": true,
     "option_momentum_percent": 1.0,
@@ -28,7 +27,7 @@
         "exit_poll_interval_ms": 1000,
         "direction_threshold_percent": 60.0,
         "enable_profit_floor_trailing_stop": true,
-        "locked_profit_amount": 0.0
+        "locked_profit_dollars": 0.0
     },
     "scanner": {
         "interval_seconds": 60
@@ -60,5 +59,7 @@
     "two_candle_or_confirmation_enabled": true,
     "required_breakout_candles": 2,
     "pre_confirmation_max_drawdown_percent": 5.0,
-    "pending_entry_retry_cooldown_seconds": 60
+    "pending_entry_retry_cooldown_seconds": 60,
+    "maximum_position_cost_dollars": 100.0,
+    "config_schema_version": 2
 }
