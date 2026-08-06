@@ -8,7 +8,7 @@ from dataclasses import asdict, fields, is_dataclass
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from .models import BotMetrics, BotProfile, BotRuntimeState, PendingEntryState, ProfileDecision, TournamentMomentumCandidate, VirtualPosition, VirtualTournamentPosition
+from .models import BotMetrics, BotProfile, BotRuntimeState, PendingEntryState, ProfileDecision, TournamentMomentumCandidate, VirtualPosition, VirtualTournamentPosition, default_pipeline_counters
 
 
 MARKET_TZ = ZoneInfo("America/New_York")
@@ -113,6 +113,19 @@ def _coerce_dataclass(model_type, value):
     return model_type(**{key: value.get(key) for key in allowed_fields if key in value})
 
 
+def _coerce_pipeline_counters(value) -> dict:
+    counters = default_pipeline_counters()
+    if not isinstance(value, dict):
+        return counters
+    for key in counters:
+        if key == "entry_block_reasons":
+            reasons = value.get(key)
+            counters[key] = dict(reasons) if isinstance(reasons, dict) else {}
+        else:
+            counters[key] = int(value.get(key, 0) or 0)
+    return counters
+
+
 def create_initial_state(profile: BotProfile) -> BotRuntimeState:
     starting_balance = float(
         profile.config.get(
@@ -185,6 +198,7 @@ def _state_from_dict(profile_id: str, value: dict, profile: BotProfile) -> BotRu
         recovery_status=value.get("recovery_status"),
         recovered_trade_id=value.get("recovered_trade_id"),
         momentum_candidate=momentum_candidate,
+        pipeline_counters=_coerce_pipeline_counters(value.get("pipeline_counters")),
     )
 
 

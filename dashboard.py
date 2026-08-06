@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, time as datetime_time
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from logs.trade_logger import *
-from tournament.evaluator import evaluate_all_profiles
+from tournament.evaluator import evaluate_all_profiles, evaluate_profile
 from tournament.execution import try_open_virtual_position
 from tournament.exits import evaluate_virtual_exit, process_virtual_exits, stop_snapshot, update_virtual_position_price, valid_bid
 from tournament.momentum import apply_tournament_momentum
@@ -45,6 +45,7 @@ from tournament.trades import (
     create_synthetic_tournament_trade,
     get_tournament_trade,
     list_tournament_trades,
+    save_tournament_trades,
     update_tournament_trade,
 )
 
@@ -2982,6 +2983,163 @@ def tournament_option_money_snapshot(snapshot, profile, decision):
     }
 
 
+def tournament_pipeline_counters(state):
+    counters = state.pipeline_counters if isinstance(state.pipeline_counters, dict) else {}
+    defaults = {
+        "candidates_started": 0,
+        "momentum_confirmed": 0,
+        "or_confirmed": 0,
+        "decisions_accepted": 0,
+        "entries_attempted": 0,
+        "entries_opened": 0,
+        "entry_block_reasons": {},
+    }
+    for key, value in defaults.items():
+        if key not in counters or (key == "entry_block_reasons" and not isinstance(counters.get(key), dict)):
+            counters[key] = dict(value) if isinstance(value, dict) else value
+    state.pipeline_counters = counters
+    return counters
+
+
+def increment_tournament_counter(state, key, amount=1):
+    counters = tournament_pipeline_counters(state)
+    counters[key] = int(counters.get(key, 0) or 0) + amount
+
+
+def increment_tournament_block_reason(state, reason):
+    counters = tournament_pipeline_counters(state)
+    reasons = counters.setdefault("entry_block_reasons", {})
+    reason = str(reason or "UNKNOWN")
+    reasons[reason] = int(reasons.get(reason, 0) or 0) + 1
+
+
+def record_tournament_pipeline_counters(states, before_candidates, decisions):
+    for profile_id, decision in decisions.items():
+        state = states[profile_id]
+        before = before_candidates.get(profile_id)
+        after = state.momentum_candidate
+        if before is None and after is not None:
+            increment_tournament_counter(state, "candidates_started")
+        if decision.momentum_required and decision.momentum_passed:
+            increment_tournament_counter(state, "momentum_confirmed")
+        if decision.or_confirmation_required and decision.two_candle_or_passed:
+            increment_tournament_counter(state, "or_confirmed")
+        if decision.accepted:
+            increment_tournament_counter(state, "decisions_accepted")
+
+
+def synthetic_tournament_signal(profile, option_price, *, signal_label="TEST_PIPELINE"):
+    config = profile.config or {}
+    contracts = int(config.get("contracts", 1) or 1)
+    maximum_cost = float(config.get("maximum_position_cost_dollars", 150.0) or 150.0)
+    option_price = min(float(option_price), max(0.01, maximum_cost / (100 * max(1, contracts))))
+    option_price = round(option_price, 4)
+    return {
+        "price": 501.0,
+        "bullish_score": 10,
+        "bearish_score": 0,
+        "confidence": 10,
+        "dominance_percent": 100.0,
+        "market_state": "BULLISH",
+        "current_signal": signal_label,
+        "ema_state": "BULLISH",
+        "macd_state": "BULLISH",
+        "vwap_state": "BULLISH",
+        "volume_state": "BULLISH",
+        "levels": {
+            "opening_range_high": 499.0,
+            "opening_range_low": 490.0,
+        },
+        "completed_closes": (500.0, 501.0),
+        "call_option_symbol": "SPYTESTPIPELINECALL",
+        "call_option_bid": option_price,
+        "call_option_ask": option_price,
+        "call_option_last": option_price,
+        "call_option_midpoint": option_price,
+        "put_option_symbol": "SPYTESTPIPELINEPUT",
+        "put_option_bid": option_price,
+        "put_option_ask": option_price,
+        "put_option_last": option_price,
+        "put_option_midpoint": option_price,
+        "option_quote_timestamp": market_now().isoformat(),
+    }
+
+
+def run_profile_pipeline_proof(profile):
+    required_percent = float((profile.config or {}).get("option_momentum_percent", 1.0) or 1.0)
+    contracts = int((profile.config or {}).get("contracts", 1) or 1)
+    maximum_cost = float((profile.config or {}).get("maximum_position_cost_dollars", 150.0) or 150.0)
+    maximum_premium = max(0.01, maximum_cost / (100 * max(1, contracts)))
+    start_price = min(1.0, maximum_premium * 0.75)
+    confirmation_price = start_price * (1 + ((required_percent + 0.25) / 100))
+    start_signal = synthetic_tournament_signal(profile, start_price)
+    confirm_signal = synthetic_tournament_signal(profile, confirmation_price)
+    start_snapshot = build_market_snapshot_from_signal(start_signal, "SPY", market_now().isoformat())
+    confirm_snapshot = build_market_snapshot_from_signal(confirm_signal, "SPY", market_now().isoformat())
+    proof_state = create_all_initial_states({profile.profile_id: profile})[profile.profile_id]
+    proof_epoch = 1000.0
+    result = {
+        "profile_id": profile.profile_id,
+        "profile_name": profile.display_name,
+        "preliminary_direction": None,
+        "candidate_created": False,
+        "momentum_confirmed": False,
+        "or_confirmed": False,
+        "decision_accepted": False,
+        "entry_attempted": False,
+        "entry_opened": False,
+        "status": "NOT_STARTED",
+        "block_reason": None,
+        "trade_id": None,
+    }
+
+    initial_decision = evaluate_profile(profile, proof_state, start_snapshot)
+    result["preliminary_direction"] = initial_decision.preliminary_direction or initial_decision.direction
+    initial_decisions = {profile.profile_id: initial_decision}
+    apply_tournament_momentum({profile.profile_id: profile}, {profile.profile_id: proof_state}, initial_decisions, start_snapshot, proof_epoch)
+    result["candidate_created"] = proof_state.momentum_candidate is not None
+    if not result["candidate_created"]:
+        result["status"] = "BLOCKED"
+        result["block_reason"] = initial_decision.entry_block_reason or initial_decision.rejection_reason or initial_decision.momentum_block_reason
+        return result
+
+    confirmation_decision = evaluate_profile(profile, proof_state, confirm_snapshot)
+    confirmed_decisions = apply_tournament_momentum(
+        {profile.profile_id: profile},
+        {profile.profile_id: proof_state},
+        {profile.profile_id: confirmation_decision},
+        confirm_snapshot,
+        proof_epoch + 1,
+    )
+    final_decision = confirmed_decisions[profile.profile_id]
+    result["momentum_confirmed"] = bool(final_decision.momentum_passed)
+    result["or_confirmed"] = (not final_decision.or_confirmation_required) or bool(final_decision.two_candle_or_passed)
+    result["decision_accepted"] = bool(final_decision.accepted)
+    result["block_reason"] = final_decision.entry_block_reason or final_decision.rejection_reason or final_decision.momentum_block_reason
+    if not final_decision.accepted:
+        result["status"] = "BLOCKED"
+        return result
+
+    result["entry_attempted"] = True
+    trade = try_open_virtual_position(profile, proof_state, final_decision, confirm_snapshot, proof_epoch + 1)
+    result["entry_opened"] = trade is not None
+    result["status"] = "POSITION_OPENED" if trade else "ENTRY_BLOCKED"
+    result["block_reason"] = final_decision.entry_block_reason or final_decision.rejection_reason
+    result["trade_id"] = trade.trade_id if trade else None
+    return result
+
+
+def run_tournament_pipeline_proof(config):
+    profiles = build_tournament_profiles(config, TOURNAMENT_PROFILES_FILE)
+    results = {}
+    for profile_id in ("BOT_B_MOMENTUM", "BOT_D_COMBINED"):
+        if profile_id not in profiles:
+            results[profile_id] = {"profile_id": profile_id, "status": "BLOCKED", "block_reason": "PROFILE_MISSING"}
+            continue
+        results[profile_id] = run_profile_pipeline_proof(profiles[profile_id])
+    return results
+
+
 def evaluate_tournament_decisions(config, signal, call_contract=None, put_contract=None):
     profiles = build_tournament_profiles(config)
     signal = add_snapshot_option_fields(signal, call_contract, put_contract)
@@ -2993,11 +3151,22 @@ def evaluate_tournament_decisions(config, signal, call_contract=None, put_contra
     with TOURNAMENT_LOCK:
         states = ensure_tournament_runtime_states(profiles)
         daily_reset_changed = apply_daily_resets(profiles, states, time.time())
+        counters_before = json.dumps({
+            profile_id: tournament_pipeline_counters(state)
+            for profile_id, state in states.items()
+        }, sort_keys=True)
         decisions = evaluate_all_profiles(profiles, states, snapshot)
         opened_trades = []
         now_epoch = time.time()
+        before_candidates = {
+            profile_id: state.momentum_candidate
+            for profile_id, state in states.items()
+        }
         decisions = apply_tournament_momentum(profiles, states, decisions, snapshot, now_epoch)
+        record_tournament_pipeline_counters(states, before_candidates, decisions)
         for profile_id, profile in profiles.items():
+            if decisions[profile_id].accepted:
+                increment_tournament_counter(states[profile_id], "entries_attempted")
             trade = try_open_virtual_position(
                 profile,
                 states[profile_id],
@@ -3006,6 +3175,7 @@ def evaluate_tournament_decisions(config, signal, call_contract=None, put_contra
                 now_epoch,
             )
             if trade:
+                increment_tournament_counter(states[profile_id], "entries_opened")
                 opened_trades.append(trade)
                 print("TOURNAMENT VIRTUAL ENTRY")
                 print("profile:", trade.profile_id)
@@ -3015,7 +3185,13 @@ def evaluate_tournament_decisions(config, signal, call_contract=None, put_contra
                 print("entry_price:", trade.entry_price)
                 print("contracts:", trade.contracts)
                 print("entry_cost:", trade.entry_cost)
-        if opened_trades or daily_reset_changed:
+            elif decisions[profile_id].entry_block_reason:
+                increment_tournament_block_reason(states[profile_id], decisions[profile_id].entry_block_reason)
+        counters_after = json.dumps({
+            profile_id: tournament_pipeline_counters(state)
+            for profile_id, state in states.items()
+        }, sort_keys=True)
+        if opened_trades or daily_reset_changed or counters_after != counters_before:
             save_tournament_state_safe(states)
         state_by_profile = {
             profile_id: {
@@ -3024,6 +3200,7 @@ def evaluate_tournament_decisions(config, signal, call_contract=None, put_contra
                 "virtual_trades_today": state.virtual_trades_today,
                 "cooldown_remaining_seconds": max(0, int(state.virtual_entry_cooldown_until_epoch - now_epoch)) if state.virtual_entry_cooldown_until_epoch else 0,
                 "last_entry_fingerprint": state.last_entry_fingerprint,
+                "pipeline_counters": tournament_pipeline_counters(state),
             }
             for profile_id, state in states.items()
         }
@@ -3063,6 +3240,7 @@ def refresh_tournament_state_snapshot(states):
             "virtual_trades_today": state.virtual_trades_today,
             "cooldown_remaining_seconds": max(0, int(state.virtual_entry_cooldown_until_epoch - now_epoch)) if state.virtual_entry_cooldown_until_epoch else 0,
             "last_entry_fingerprint": state.last_entry_fingerprint,
+            "pipeline_counters": tournament_pipeline_counters(state),
         }
         for profile_id, state in states.items()
     }
@@ -4888,6 +5066,28 @@ def api_close_latest_test_tournament_trade():
     return jsonify({"ok": True, "trade": tournament_trade_to_dict(updated)})
 
 
+@app.route("/api/tournament/pipeline-proof/run", methods=["POST"])
+def api_run_tournament_pipeline_proof():
+    try:
+        results = run_tournament_pipeline_proof(load_config())
+        ok = all(row.get("status") == "POSITION_OPENED" for row in results.values())
+        return jsonify({"ok": ok, "results": results}), 200 if ok else 400
+    except Exception as error:
+        return jsonify({"ok": False, "errors": [str(error)]}), 400
+
+
+@app.route("/api/tournament/pipeline-proof/delete", methods=["POST"])
+def api_delete_tournament_pipeline_proof_trades():
+    try:
+        trades = list_tournament_trades(path=TOURNAMENT_TRADES_FILE)
+        kept = [trade for trade in trades if trade.signal != "TEST_PIPELINE"]
+        deleted = len(trades) - len(kept)
+        save_tournament_trades(kept, TOURNAMENT_TRADES_FILE)
+        return jsonify({"ok": True, "deleted": deleted})
+    except Exception as error:
+        return jsonify({"ok": False, "errors": [str(error)]}), 400
+
+
 @app.route("/api/tournament/positions", methods=["GET"])
 def api_tournament_positions():
     with BOT_LOCK:
@@ -6331,6 +6531,7 @@ Bot Reason Log:<br>
 <th>Total Position Cost</th>
 <th>Maximum Position Cost</th>
 <th>Decisions Evaluated</th>
+<th>Pipeline Counters</th>
 <th>Position Status</th>
 <th>Option</th>
 <th>Entry Price</th>
@@ -6363,7 +6564,10 @@ Bot Reason Log:<br>
 </select>
 <button type="button" onclick="createTestTournamentTrade()">Create Test Tournament Trade</button>
 <button type="button" class="yellow" onclick="closeLatestTestTournamentTrade()">Close Latest Test Trade</button>
+<button type="button" onclick="runTournamentPipelineProof()">Run Bot B/D Pipeline Proof</button>
+<button type="button" class="red" onclick="deleteTournamentPipelineProofTrades()">Delete Pipeline Proof Trades</button>
 <br><small>Developer-only synthetic records. Direction is derived from the latest automatic ProfileDecision. These records are not proof that automatic direction selection works.</small>
+<pre id="tournament-proof-result" style="white-space:pre-wrap;"></pre>
 </details>
 <br>
 <div class="history-panel tournament-trades-panel">
@@ -7210,7 +7414,11 @@ function renderTournamentDecisions(decisions, evaluatedByProfile, settings, stat
     el.innerHTML = TOURNAMENT_PROFILES.map(([profileId, label]) => {{
         const row = decisions[profileId] || {{}};
         const enabled = settings[profileId]?.enabled;
-        const position = stateByProfile[profileId]?.virtual_position || null;
+        const state = stateByProfile[profileId] || {{}};
+        const position = state.virtual_position || null;
+        const counters = state.pipeline_counters || {{}};
+        const blockReasons = counters.entry_block_reasons || {{}};
+        const blockText = Object.entries(blockReasons).map(([reason, count]) => `${{reason}}:${{count}}`).join(", ");
         return `
 <tr>
 <td>${{escapeHtml(label)}}</td>
@@ -7243,6 +7451,15 @@ function renderTournamentDecisions(decisions, evaluatedByProfile, settings, stat
 <td>${{fmtMoney(row.total_position_cost)}}</td>
 <td>${{fmtMoney(row.maximum_position_cost_dollars)}}</td>
 <td>${{escapeHtml(evaluatedByProfile[profileId] || 0)}}</td>
+<td>
+C:${{escapeHtml(counters.candidates_started || 0)}}
+ M:${{escapeHtml(counters.momentum_confirmed || 0)}}
+ OR:${{escapeHtml(counters.or_confirmed || 0)}}
+ A:${{escapeHtml(counters.decisions_accepted || 0)}}
+ Try:${{escapeHtml(counters.entries_attempted || 0)}}
+ Open:${{escapeHtml(counters.entries_opened || 0)}}<br>
+<small>${{escapeHtml(blockText)}}</small>
+</td>
 <td>${{escapeHtml(position?.status || "NONE")}}</td>
 <td>${{escapeHtml(position?.option_symbol || "")}}</td>
 <td>${{position ? fmtMoney(position.entry_price) : ""}}</td>
@@ -7341,6 +7558,31 @@ async function closeLatestTestTournamentTrade() {{
         headers: {{ "Content-Type": "application/json" }},
         body: JSON.stringify({{}})
     }});
+    await updateTournamentTrades();
+}}
+
+async function runTournamentPipelineProof() {{
+    const el = document.getElementById("tournament-proof-result");
+    if (el) el.textContent = "Running pipeline proof...";
+    const response = await fetch("/api/tournament/pipeline-proof/run", {{
+        method: "POST",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify({{}})
+    }});
+    const data = await response.json();
+    if (el) el.textContent = JSON.stringify(data, null, 2);
+    await updateTournamentTrades();
+}}
+
+async function deleteTournamentPipelineProofTrades() {{
+    const el = document.getElementById("tournament-proof-result");
+    const response = await fetch("/api/tournament/pipeline-proof/delete", {{
+        method: "POST",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify({{}})
+    }});
+    const data = await response.json();
+    if (el) el.textContent = JSON.stringify(data, null, 2);
     await updateTournamentTrades();
 }}
 

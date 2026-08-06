@@ -3,6 +3,18 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 
+def default_pipeline_counters() -> dict:
+    return {
+        "candidates_started": 0,
+        "momentum_confirmed": 0,
+        "or_confirmed": 0,
+        "decisions_accepted": 0,
+        "entries_attempted": 0,
+        "entries_opened": 0,
+        "entry_block_reasons": {},
+    }
+
+
 @dataclass
 class ProfileDecision:
     profile_id: str
@@ -211,3 +223,4 @@ class BotRuntimeState:
     recovery_status: str | None = None
     recovered_trade_id: str | None = None
     momentum_candidate: TournamentMomentumCandidate | None = None
+    pipeline_counters: dict = field(default_factory=default_pipeline_counters)
