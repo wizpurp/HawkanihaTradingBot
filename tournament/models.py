@@ -12,6 +12,14 @@ def default_pipeline_counters() -> dict:
         "entries_attempted": 0,
         "entries_opened": 0,
         "entry_block_reasons": {},
+        "candidate_created": 0,
+        "candidate_survived_next_cycle": 0,
+        "candidate_direction_changed": 0,
+        "candidate_option_changed": 0,
+        "candidate_confirmed": 0,
+        "candidate_timed_out": 0,
+        "candidate_drawdown_failed": 0,
+        "candidate_quote_stale": 0,
     }
 
 
@@ -224,3 +232,4 @@ class BotRuntimeState:
     recovered_trade_id: str | None = None
     momentum_candidate: TournamentMomentumCandidate | None = None
     pipeline_counters: dict = field(default_factory=default_pipeline_counters)
+    candidate_transitions: list = field(default_factory=list)

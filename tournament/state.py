@@ -199,6 +199,7 @@ def _state_from_dict(profile_id: str, value: dict, profile: BotProfile) -> BotRu
         recovered_trade_id=value.get("recovered_trade_id"),
         momentum_candidate=momentum_candidate,
         pipeline_counters=_coerce_pipeline_counters(value.get("pipeline_counters")),
+        candidate_transitions=list(value.get("candidate_transitions") or [])[-20:] if isinstance(value.get("candidate_transitions"), list) else [],
     )
 
 

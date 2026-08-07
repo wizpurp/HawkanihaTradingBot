@@ -14,6 +14,7 @@ MOMENTUM_TRACKING = "TRACKING"
 MOMENTUM_CONFIRMED = "CONFIRMED"
 MOMENTUM_TIMEOUT = "TIMEOUT"
 MOMENTUM_DIRECTION_CHANGED = "DIRECTION_CHANGED"
+MOMENTUM_OPTION_CHANGED = "OPTION_CHANGED"
 MOMENTUM_DRAWDOWN_FAILED = "DRAWDOWN_FAILED"
 MOMENTUM_INVALID_QUOTE = "INVALID_QUOTE"
 MOMENTUM_QUOTE_STALE = "QUOTE_STALE"
@@ -46,7 +47,33 @@ def _config_int(config: dict, key: str, default: int) -> int:
         return default
 
 
-def option_price_for_momentum(snapshot: MarketSnapshot, direction: str) -> tuple[float | None, str | None, str | None]:
+def _quote_price_from_row(row: dict | None) -> tuple[float | None, str | None]:
+    if not isinstance(row, dict):
+        return None, None
+    bid = _float_or_none(row.get("bid"))
+    ask = _float_or_none(row.get("ask"))
+    last = _float_or_none(row.get("last"))
+    midpoint = _float_or_none(row.get("midpoint"))
+    if midpoint is not None:
+        return midpoint, "MIDPOINT"
+    if bid is not None and ask is not None:
+        return (bid + ask) / 2, "MIDPOINT"
+    if ask is not None:
+        return ask, "ASK"
+    if last is not None:
+        return last, "LAST"
+    if bid is not None:
+        return bid, "BID"
+    return None, None
+
+
+def option_price_for_momentum(snapshot: MarketSnapshot, direction: str, locked_option_symbol: str | None = None) -> tuple[float | None, str | None, str | None]:
+    if locked_option_symbol and isinstance(snapshot.locked_option_quotes, dict):
+        locked_quote = snapshot.locked_option_quotes.get(locked_option_symbol)
+        price, source = _quote_price_from_row(locked_quote)
+        if price is not None:
+            return price, source, locked_option_symbol
+
     if direction == "CALL":
         bid = _float_or_none(snapshot.call_option_bid)
         ask = _float_or_none(snapshot.call_option_ask)
@@ -79,6 +106,41 @@ def _movement_percent(starting_price: float, current_price: float) -> float:
 
 def _drawdown_percent(starting_price: float, current_price: float) -> float:
     return max(0.0, ((starting_price - current_price) / starting_price) * 100) if starting_price > 0 else 0.0
+
+
+def _counter(state: BotRuntimeState, key: str) -> None:
+    counters = state.pipeline_counters if isinstance(state.pipeline_counters, dict) else {}
+    counters[key] = int(counters.get(key, 0) or 0) + 1
+    state.pipeline_counters = counters
+
+
+def _transition(
+    state: BotRuntimeState,
+    profile: BotProfile,
+    old_direction: str | None,
+    new_direction: str | None,
+    old_option: str | None,
+    new_option: str | None,
+    status: str,
+    reason: str | None,
+    candidate_age: float,
+    now_epoch: float,
+) -> None:
+    row = {
+        "time": now_epoch,
+        "profile_id": profile.profile_id,
+        "profile_name": profile.display_name,
+        "old_direction": old_direction,
+        "new_direction": new_direction,
+        "old_option": old_option,
+        "new_option": new_option,
+        "status": status,
+        "reason": reason,
+        "candidate_age": max(0.0, candidate_age),
+    }
+    history = list(state.candidate_transitions or [])
+    history.append(row)
+    state.candidate_transitions = history[-20:]
 
 
 def _apply_trace(decision: ProfileDecision, candidate: TournamentMomentumCandidate | None, status: str, reason: str | None, now_epoch: float) -> None:
@@ -157,17 +219,23 @@ def update_profile_momentum(
         candidate = state.momentum_candidate
         if _candidate_active(candidate):
             retry = _config_int(config, "pending_entry_retry_cooldown_seconds", 60)
+            old_candidate = candidate
             candidate = _cancel_candidate(state, candidate, status, freshness_reason or REJECT_INVALID_QUOTE_TIMESTAMP, now_epoch, retry)
+            _counter(state, "candidate_quote_stale")
+            _transition(state, profile, old_candidate.direction, direction, old_candidate.option_symbol, old_candidate.option_symbol, status, freshness_reason or REJECT_INVALID_QUOTE_TIMESTAMP, now_epoch - old_candidate.started_epoch, now_epoch)
         _apply_trace(decision, candidate, status, freshness_reason or REJECT_INVALID_QUOTE_TIMESTAMP, now_epoch)
         decision.momentum_passed = False
         return False
 
-    current_price, price_source, option_symbol = option_price_for_momentum(snapshot, direction)
+    candidate = state.momentum_candidate
+    locked_option_symbol = candidate.option_symbol if _candidate_active(candidate) or (candidate and candidate.status == MOMENTUM_CONFIRMED) else None
+    _, _, selected_option_symbol = option_price_for_momentum(snapshot, direction, None)
+    current_price, price_source, option_symbol = option_price_for_momentum(snapshot, direction, locked_option_symbol)
     if current_price is None or not option_symbol:
-        candidate = state.momentum_candidate
         if _candidate_active(candidate):
             retry = _config_int(config, "pending_entry_retry_cooldown_seconds", 60)
             candidate = _cancel_candidate(state, candidate, MOMENTUM_INVALID_QUOTE, "invalid option quote", now_epoch, retry)
+            _transition(state, profile, candidate.direction, direction, candidate.option_symbol, option_symbol, MOMENTUM_INVALID_QUOTE, "invalid option quote", now_epoch - candidate.started_epoch, now_epoch)
         _apply_trace(decision, candidate, MOMENTUM_INVALID_QUOTE, "invalid option quote", now_epoch)
         decision.momentum_passed = False
         return False
@@ -176,9 +244,8 @@ def update_profile_momentum(
     timeout_seconds = _config_int(config, "confirmation_timeout_seconds", 60)
     max_drawdown_percent = _config_float(config, "pre_confirmation_max_drawdown_percent", default=5.0)
     retry_cooldown_seconds = _config_int(config, "pending_entry_retry_cooldown_seconds", 60)
-    candidate = state.momentum_candidate
 
-    if candidate and candidate.status == MOMENTUM_CONFIRMED and candidate.direction == direction and candidate.option_symbol == option_symbol:
+    if candidate and candidate.status == MOMENTUM_CONFIRMED and candidate.direction == direction:
         observed = _movement_percent(candidate.starting_option_price, current_price)
         candidate = replace(
             candidate,
@@ -198,9 +265,12 @@ def update_profile_momentum(
         decision.momentum_passed = False
         return False
 
-    if _candidate_active(candidate) and (candidate.direction != direction or candidate.option_symbol != option_symbol):
-        candidate = _cancel_candidate(state, candidate, MOMENTUM_DIRECTION_CHANGED, "direction or option changed", now_epoch, retry_cooldown_seconds)
-        _apply_trace(decision, candidate, MOMENTUM_DIRECTION_CHANGED, "direction or option changed", now_epoch)
+    if _candidate_active(candidate) and candidate.direction != direction:
+        old_candidate = candidate
+        candidate = _cancel_candidate(state, candidate, MOMENTUM_DIRECTION_CHANGED, "direction changed", now_epoch, retry_cooldown_seconds)
+        _counter(state, "candidate_direction_changed")
+        _transition(state, profile, old_candidate.direction, direction, old_candidate.option_symbol, option_symbol, MOMENTUM_DIRECTION_CHANGED, "direction changed", now_epoch - old_candidate.started_epoch, now_epoch)
+        _apply_trace(decision, candidate, MOMENTUM_DIRECTION_CHANGED, "direction changed", now_epoch)
         decision.momentum_passed = False
         return False
 
@@ -220,10 +290,25 @@ def update_profile_momentum(
             current_option_price=current_price,
         )
         state.momentum_candidate = candidate
+        _counter(state, "candidate_created")
+        _transition(state, profile, None, direction, None, option_symbol, MOMENTUM_TRACKING, "candidate created", 0.0, now_epoch)
+        if required_percent <= 0:
+            candidate = replace(candidate, status=MOMENTUM_CONFIRMED, block_reason=None)
+            state.momentum_candidate = candidate
+            _counter(state, "candidate_confirmed")
+            _transition(state, profile, direction, direction, option_symbol, option_symbol, MOMENTUM_CONFIRMED, "zero percent momentum confirmed on creation", 0.0, now_epoch)
+            _apply_trace(decision, candidate, MOMENTUM_CONFIRMED, None, now_epoch)
+            decision.momentum_passed = True
+            return True
         _apply_trace(decision, candidate, MOMENTUM_TRACKING, "candidate created", now_epoch)
         decision.momentum_passed = False
         return False
 
+    if selected_option_symbol and candidate.option_symbol != selected_option_symbol:
+        _counter(state, "candidate_option_changed")
+        _transition(state, profile, candidate.direction, direction, candidate.option_symbol, selected_option_symbol, MOMENTUM_OPTION_CHANGED, "selector changed; candidate stayed locked", now_epoch - candidate.started_epoch, now_epoch)
+
+    _counter(state, "candidate_survived_next_cycle")
     high = max(candidate.highest_candidate_price, current_price)
     low = min(candidate.lowest_candidate_price, current_price)
     observed = _movement_percent(candidate.starting_option_price, current_price)
@@ -239,12 +324,16 @@ def update_profile_momentum(
 
     if max_drawdown_percent > 0 and _drawdown_percent(candidate.starting_option_price, current_price) >= max_drawdown_percent:
         candidate = _cancel_candidate(state, candidate, MOMENTUM_DRAWDOWN_FAILED, "pre-confirmation drawdown exceeded", now_epoch, retry_cooldown_seconds)
+        _counter(state, "candidate_drawdown_failed")
+        _transition(state, profile, candidate.direction, direction, candidate.option_symbol, option_symbol, MOMENTUM_DRAWDOWN_FAILED, candidate.block_reason, now_epoch - candidate.started_epoch, now_epoch)
         _apply_trace(decision, candidate, MOMENTUM_DRAWDOWN_FAILED, candidate.block_reason, now_epoch)
         decision.momentum_passed = False
         return False
 
     if now_epoch >= candidate.deadline_epoch:
         candidate = _cancel_candidate(state, candidate, MOMENTUM_TIMEOUT, "confirmation timeout expired", now_epoch, retry_cooldown_seconds)
+        _counter(state, "candidate_timed_out")
+        _transition(state, profile, candidate.direction, direction, candidate.option_symbol, option_symbol, MOMENTUM_TIMEOUT, candidate.block_reason, now_epoch - candidate.started_epoch, now_epoch)
         _apply_trace(decision, candidate, MOMENTUM_TIMEOUT, candidate.block_reason, now_epoch)
         decision.momentum_passed = False
         return False
@@ -252,6 +341,8 @@ def update_profile_momentum(
     if observed >= required_percent:
         candidate = replace(candidate, status=MOMENTUM_CONFIRMED, block_reason=None)
         state.momentum_candidate = candidate
+        _counter(state, "candidate_confirmed")
+        _transition(state, profile, candidate.direction, direction, candidate.option_symbol, option_symbol, MOMENTUM_CONFIRMED, None, now_epoch - candidate.started_epoch, now_epoch)
         _apply_trace(decision, candidate, MOMENTUM_CONFIRMED, None, now_epoch)
         decision.momentum_passed = True
         return True

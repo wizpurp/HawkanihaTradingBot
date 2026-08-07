@@ -43,6 +43,7 @@ class MarketSnapshot:
     put_option_last: float | None = None
     put_option_midpoint: float | None = None
     momentum_confirmed: bool = False
+    locked_option_quotes: dict | None = None
 
 
 def _float_or_none(value):
@@ -117,4 +118,5 @@ def build_market_snapshot_from_signal(signal: dict, symbol: str, timestamp: str)
         put_option_last=_float_or_none(signal.get("put_option_last")),
         put_option_midpoint=_float_or_none(signal.get("put_option_midpoint")),
         momentum_confirmed=bool(signal.get("momentum_confirmed") or signal.get("option_momentum_confirmed")),
+        locked_option_quotes=signal.get("locked_option_quotes") if isinstance(signal.get("locked_option_quotes"), dict) else None,
     )

@@ -10,7 +10,7 @@ import time
 import html as html_lib
 import traceback
 import atexit
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta, time as datetime_time
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
@@ -2937,6 +2937,73 @@ def add_snapshot_option_fields(signal, call_contract=None, put_contract=None):
     return signal
 
 
+def locked_quote_row_from_quote(quote):
+    if not isinstance(quote, dict):
+        return None
+    bid = safe_float(quote.get("bid"), None)
+    ask = safe_float(quote.get("ask"), None)
+    last = safe_float(quote.get("last"), None)
+    midpoint = ((bid + ask) / 2) if bid is not None and ask is not None and bid > 0 and ask > 0 else None
+    return {
+        "symbol": quote.get("symbol"),
+        "bid": bid,
+        "ask": ask,
+        "last": last,
+        "midpoint": midpoint,
+        "timestamp": quote.get("_fetched_at"),
+    }
+
+
+def enrich_snapshot_with_locked_candidate_quotes(snapshot, states):
+    symbols = sorted({
+        state.momentum_candidate.option_symbol
+        for state in states.values()
+        if state.momentum_candidate
+        and state.momentum_candidate.status in {"TRACKING", "CONFIRMED"}
+        and state.momentum_candidate.option_symbol
+    })
+    if not symbols:
+        return snapshot
+
+    locked_quotes = dict(snapshot.locked_option_quotes or {})
+    for symbol in symbols:
+        if symbol in locked_quotes:
+            continue
+        quote = get_market_quote(symbol)
+        row = locked_quote_row_from_quote(quote)
+        if row:
+            locked_quotes[symbol] = row
+    return replace(snapshot, locked_option_quotes=locked_quotes)
+
+
+def snapshot_for_confirmed_candidate_entry(snapshot, state):
+    candidate = state.momentum_candidate
+    if not candidate or candidate.status != "CONFIRMED":
+        return snapshot
+    quote = (snapshot.locked_option_quotes or {}).get(candidate.option_symbol)
+    if not isinstance(quote, dict):
+        return snapshot
+    if candidate.direction == "CALL":
+        return replace(
+            snapshot,
+            call_option_symbol=candidate.option_symbol,
+            call_option_bid=safe_float(quote.get("bid"), None),
+            call_option_ask=safe_float(quote.get("ask"), None),
+            call_option_last=safe_float(quote.get("last"), None),
+            call_option_midpoint=safe_float(quote.get("midpoint"), None),
+        )
+    if candidate.direction == "PUT":
+        return replace(
+            snapshot,
+            put_option_symbol=candidate.option_symbol,
+            put_option_bid=safe_float(quote.get("bid"), None),
+            put_option_ask=safe_float(quote.get("ask"), None),
+            put_option_last=safe_float(quote.get("last"), None),
+            put_option_midpoint=safe_float(quote.get("midpoint"), None),
+        )
+    return snapshot
+
+
 def print_tournament_decisions(decisions):
     print("TOURNAMENT DECISIONS")
     for profile_id in ["BOT_A_BASELINE", "BOT_B_MOMENTUM", "BOT_C_TWO_CANDLE_OR", "BOT_D_COMBINED"]:
@@ -3121,7 +3188,8 @@ def run_profile_pipeline_proof(profile):
         return result
 
     result["entry_attempted"] = True
-    trade = try_open_virtual_position(profile, proof_state, final_decision, confirm_snapshot, proof_epoch + 1)
+    entry_snapshot = snapshot_for_confirmed_candidate_entry(confirm_snapshot, proof_state)
+    trade = try_open_virtual_position(profile, proof_state, final_decision, entry_snapshot, proof_epoch + 1)
     result["entry_opened"] = trade is not None
     result["status"] = "POSITION_OPENED" if trade else "ENTRY_BLOCKED"
     result["block_reason"] = final_decision.entry_block_reason or final_decision.rejection_reason
@@ -3151,6 +3219,7 @@ def evaluate_tournament_decisions(config, signal, call_contract=None, put_contra
     with TOURNAMENT_LOCK:
         states = ensure_tournament_runtime_states(profiles)
         daily_reset_changed = apply_daily_resets(profiles, states, time.time())
+        snapshot = enrich_snapshot_with_locked_candidate_quotes(snapshot, states)
         counters_before = json.dumps({
             profile_id: tournament_pipeline_counters(state)
             for profile_id, state in states.items()
@@ -3167,11 +3236,12 @@ def evaluate_tournament_decisions(config, signal, call_contract=None, put_contra
         for profile_id, profile in profiles.items():
             if decisions[profile_id].accepted:
                 increment_tournament_counter(states[profile_id], "entries_attempted")
+            entry_snapshot = snapshot_for_confirmed_candidate_entry(snapshot, states[profile_id])
             trade = try_open_virtual_position(
                 profile,
                 states[profile_id],
                 decisions[profile_id],
-                snapshot,
+                entry_snapshot,
                 now_epoch,
             )
             if trade:
@@ -3201,6 +3271,7 @@ def evaluate_tournament_decisions(config, signal, call_contract=None, put_contra
                 "cooldown_remaining_seconds": max(0, int(state.virtual_entry_cooldown_until_epoch - now_epoch)) if state.virtual_entry_cooldown_until_epoch else 0,
                 "last_entry_fingerprint": state.last_entry_fingerprint,
                 "pipeline_counters": tournament_pipeline_counters(state),
+                "candidate_transitions": list(state.candidate_transitions or [])[-20:],
             }
             for profile_id, state in states.items()
         }
@@ -3241,6 +3312,7 @@ def refresh_tournament_state_snapshot(states):
             "cooldown_remaining_seconds": max(0, int(state.virtual_entry_cooldown_until_epoch - now_epoch)) if state.virtual_entry_cooldown_until_epoch else 0,
             "last_entry_fingerprint": state.last_entry_fingerprint,
             "pipeline_counters": tournament_pipeline_counters(state),
+            "candidate_transitions": list(state.candidate_transitions or [])[-20:],
         }
         for profile_id, state in states.items()
     }
@@ -6551,6 +6623,30 @@ Bot Reason Log:<br>
 </div>
 
 <div class="card">
+<h2>Bot B / Bot D Momentum Candidate Transitions (Last 20)</h2>
+<div class="history-panel">
+<table class="decision-table">
+<thead>
+<tr>
+<th>Time</th>
+<th>Profile</th>
+<th>Old Direction</th>
+<th>New Direction</th>
+<th>Old Option</th>
+<th>New Option</th>
+<th>Status</th>
+<th>Reason</th>
+<th>Candidate Age</th>
+</tr>
+</thead>
+<tbody id="tournament-candidate-transitions-body">
+<tr><td colspan="9">No candidate transitions yet.</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<div class="card">
 <h2>TOURNAMENT TRADES</h2>
 <details class="item">
 <summary><strong>DEVELOPER TEST TOOLS</strong></summary>
@@ -7474,6 +7570,37 @@ C:${{escapeHtml(counters.candidates_started || 0)}}
     }}).join("");
 }}
 
+function renderTournamentCandidateTransitions(stateByProfile) {{
+    const el = document.getElementById("tournament-candidate-transitions-body");
+    if (!el) return;
+    stateByProfile = stateByProfile || {{}};
+    const rows = [];
+    for (const profileId of ["BOT_B_MOMENTUM", "BOT_D_COMBINED"]) {{
+        const state = stateByProfile[profileId] || {{}};
+        for (const row of (state.candidate_transitions || [])) {{
+            rows.push(row);
+        }}
+    }}
+    rows.sort((a, b) => Number(b.time || 0) - Number(a.time || 0));
+    const latest = rows.slice(0, 20);
+    if (!latest.length) {{
+        el.innerHTML = '<tr><td colspan="9">No candidate transitions yet.</td></tr>';
+        return;
+    }}
+    el.innerHTML = latest.map((row) => `
+<tr>
+<td>${{escapeHtml(row.time || "")}}</td>
+<td>${{escapeHtml(row.profile_name || row.profile_id || "")}}</td>
+<td>${{escapeHtml(row.old_direction || "")}}</td>
+<td>${{escapeHtml(row.new_direction || "")}}</td>
+<td>${{escapeHtml(row.old_option || "")}}</td>
+<td>${{escapeHtml(row.new_option || "")}}</td>
+<td>${{escapeHtml(row.status || "")}}</td>
+<td>${{escapeHtml(row.reason || "")}}</td>
+<td>${{Number(row.candidate_age || 0).toFixed(1)}}s</td>
+</tr>`).join("");
+}}
+
 function fmtSignedMoney(value) {{
     if (value === null || value === undefined || value === "") return "";
     const num = Number(value);
@@ -7607,6 +7734,7 @@ async function updateBotState() {{
     renderPendingEntry(data.pending_entry);
     renderPendingEntryHistory(data.pending_entry_history, pendingHistoryLimit);
     renderTournamentDecisions(data.tournament_decisions, data.tournament_decisions_evaluated_by_profile, data.tournament_profile_settings, data.tournament_state_by_profile);
+    renderTournamentCandidateTransitions(data.tournament_state_by_profile);
     renderTournamentHealth(data.tournament_health);
     setText("bot-last-action", data.last_action);
     setText("bot-trades-today", data.trades_today);

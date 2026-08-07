@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import patch
 
 import dashboard
+from tournament.profiles import default_tournament_profile_settings, save_tournament_profile_settings
 from tournament.trades import list_tournament_trades
 
 
@@ -58,6 +59,20 @@ class TournamentPipelineProofTest(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["deleted"], 2)
         self.assertEqual(list_tournament_trades(path=self.trades_path), [])
+
+    def test_bot_b_and_bot_d_zero_percent_momentum_proof_opens(self):
+        settings = default_tournament_profile_settings()
+        settings["BOT_B_MOMENTUM"]["option_momentum_percent"] = 0.0
+        settings["BOT_D_COMBINED"]["option_momentum_percent"] = 0.0
+        save_tournament_profile_settings(settings, self.profiles_path)
+
+        response = self.client.post("/api/tournament/pipeline-proof/run", json={})
+        payload = response.get_json()
+
+        self.assertEqual(response.status_code, 200, payload)
+        for profile_id in ("BOT_B_MOMENTUM", "BOT_D_COMBINED"):
+            self.assertEqual(payload["results"][profile_id]["status"], "POSITION_OPENED")
+            self.assertTrue(payload["results"][profile_id]["momentum_confirmed"])
 
 
 if __name__ == "__main__":
