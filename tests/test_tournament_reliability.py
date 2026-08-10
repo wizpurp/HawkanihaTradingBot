@@ -80,7 +80,7 @@ def accepted_decision(profile_id="BOT_A_BASELINE"):
     )
 
 
-def snapshot(symbol="SPYREL", ask=1.0, quote_time="2026-07-28T10:00:00-04:00"):
+def snapshot(symbol="SPYRELCALL", ask=1.0, quote_time="2026-07-28T10:00:00-04:00"):
     return MarketSnapshot(
         timestamp=quote_time,
         symbol="SPY",
@@ -129,7 +129,7 @@ class TournamentReliabilityTest(unittest.TestCase):
         self.execution_patch.stop()
         self.tempdir.cleanup()
 
-    def open_position(self, profile_id="BOT_A_BASELINE", option_symbol="SPYREL", now_epoch=None):
+    def open_position(self, profile_id="BOT_A_BASELINE", option_symbol="SPYRELCALL", now_epoch=None):
         now_epoch = epoch_at() if now_epoch is None else now_epoch
         trade = try_open_virtual_position(
             self.profiles[profile_id],
@@ -168,8 +168,8 @@ class TournamentReliabilityTest(unittest.TestCase):
         self.assertEqual(summary["statuses"]["BOT_A_BASELINE"], "CLOSED_POSITION_CLEARED")
 
     def test_duplicate_open_trades_are_cleaned(self):
-        first, _ = self.open_position(option_symbol="ONE", now_epoch=epoch_at(minute=0))
-        second = replace(first, trade_id=first.trade_id + "-DUP", option_symbol="TWO", entry_epoch=epoch_at(minute=1))
+        first, _ = self.open_position(option_symbol="ONECALL", now_epoch=epoch_at(minute=0))
+        second = replace(first, trade_id=first.trade_id + "-DUP", option_symbol="TWOCALL", entry_epoch=epoch_at(minute=1))
         states, trades, summary = reconcile_tournament_state(self.profiles, self.states, [first, second])
         cancelled = [trade for trade in trades if trade.status == "CANCELLED"]
         self.assertEqual(cancelled[0].exit_reason, EXIT_RECOVERY_DUPLICATE_OPEN_POSITION)
@@ -261,7 +261,7 @@ class TournamentReliabilityTest(unittest.TestCase):
 
     def test_zero_bid_does_not_close(self):
         self.open_position()
-        closed = process_virtual_exits(self.profiles, self.states, {"SPYREL": {"bid": 0, "_fetched_at": "2026-07-28T10:00:00-04:00"}}, epoch_at())
+        closed = process_virtual_exits(self.profiles, self.states, {"SPYRELCALL": {"bid": 0, "_fetched_at": "2026-07-28T10:00:00-04:00"}}, epoch_at())
         self.assertEqual(closed, [])
 
     def test_stale_quote_does_not_open(self):
@@ -272,7 +272,7 @@ class TournamentReliabilityTest(unittest.TestCase):
 
     def test_stale_quote_does_not_close(self):
         self.open_position()
-        closed = process_virtual_exits(self.profiles, self.states, {"SPYREL": {"bid": 0.5, "_fetched_at": "2026-07-28T09:59:00-04:00"}}, epoch_at())
+        closed = process_virtual_exits(self.profiles, self.states, {"SPYRELCALL": {"bid": 0.5, "_fetched_at": "2026-07-28T09:59:00-04:00"}}, epoch_at())
         self.assertEqual(closed, [])
         self.assertIsNotNone(self.states["BOT_A_BASELINE"].virtual_position)
 

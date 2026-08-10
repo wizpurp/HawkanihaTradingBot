@@ -190,12 +190,12 @@ class TournamentVirtualEntriesTest(unittest.TestCase):
 
     def test_existing_open_position_blocks_same_profile(self):
         self.open_position("BOT_A_BASELINE")
-        second = self.open_position("BOT_A_BASELINE", snap=snapshot(option_symbol="SPYTESTCALL2"))
+        second = self.open_position("BOT_A_BASELINE", snap=snapshot(option_symbol="SPYTESTTWOCALL"))
         self.assertIsNone(second)
 
     def test_another_profile_may_open_same_contract_independently(self):
-        first = self.open_position("BOT_A_BASELINE", snap=snapshot(option_symbol="SPYSAME"))
-        second = self.open_position("BOT_B_MOMENTUM", snap=snapshot(option_symbol="SPYSAME"))
+        first = self.open_position("BOT_A_BASELINE", snap=snapshot(option_symbol="SPYSAMECALL"))
+        second = self.open_position("BOT_B_MOMENTUM", snap=snapshot(option_symbol="SPYSAMECALL"))
         self.assertIsNotNone(first)
         self.assertIsNotNone(second)
         self.assertNotEqual(first.trade_id, second.trade_id)
@@ -283,6 +283,27 @@ class TournamentVirtualEntriesTest(unittest.TestCase):
         self.assertIsNone(trade)
         self.assertEqual(decision.entry_block_reason, "OPTION_DIRECTION_MISMATCH")
 
+    def test_put_decision_cannot_open_call_contract(self):
+        snap = replace(snapshot(option_symbol="SPYTESTCALL", direction="PUT"), put_option_symbol="SPYTESTCALL", put_option_ask=1.0)
+        decision = accepted_decision("BOT_A_BASELINE", "PUT", snap.timestamp)
+        trade = try_open_virtual_position(self.profiles["BOT_A_BASELINE"], self.states["BOT_A_BASELINE"], decision, snap, 1000.0)
+        self.assertIsNone(trade)
+        self.assertEqual(decision.entry_block_reason, "OPTION_DIRECTION_MISMATCH")
+
+    def test_call_generic_fallback_rejects_put_symbol(self):
+        snap = replace(snapshot(option_symbol="SPY260810P00773000"), call_option_symbol=None)
+        decision = accepted_decision("BOT_A_BASELINE", "CALL", snap.timestamp)
+        trade = try_open_virtual_position(self.profiles["BOT_A_BASELINE"], self.states["BOT_A_BASELINE"], decision, snap, 1000.0)
+        self.assertIsNone(trade)
+        self.assertEqual(decision.entry_block_reason, "OPTION_DIRECTION_MISMATCH")
+
+    def test_put_generic_fallback_rejects_call_symbol(self):
+        snap = replace(snapshot(option_symbol="SPY260810C00773000", direction="PUT"), put_option_symbol=None)
+        decision = accepted_decision("BOT_A_BASELINE", "PUT", snap.timestamp)
+        trade = try_open_virtual_position(self.profiles["BOT_A_BASELINE"], self.states["BOT_A_BASELINE"], decision, snap, 1000.0)
+        self.assertIsNone(trade)
+        self.assertEqual(decision.entry_block_reason, "OPTION_DIRECTION_MISMATCH")
+
     def test_risk_settings_are_captured_at_entry(self):
         self.profiles["BOT_A_BASELINE"].config["strategy"]["hard_stop_percent"] = 9
         self.profiles["BOT_A_BASELINE"].config["strategy"]["trailing_stop_percent"] = 11
@@ -294,9 +315,9 @@ class TournamentVirtualEntriesTest(unittest.TestCase):
         self.assertEqual(position.locked_profit_dollars, 25.0)
 
     def test_tournament_trade_is_stored_separately_from_original_trades(self):
-        self.open_position(snap=snapshot(option_symbol="TOURNAMENT_ONLY"))
+        self.open_position(snap=snapshot(option_symbol="TOURNAMENT_ONLY_CALL"))
         rows = list_tournament_trades(path=self.trades_path)
-        self.assertEqual(rows[0].option_symbol, "TOURNAMENT_ONLY")
+        self.assertEqual(rows[0].option_symbol, "TOURNAMENT_ONLY_CALL")
 
     def test_no_tradier_or_broker_function_is_called(self):
         before = set(sys.modules)
@@ -313,12 +334,12 @@ class TournamentVirtualEntriesTest(unittest.TestCase):
         self.assertEqual(loaded["BOT_A_BASELINE"].virtual_trades_today, 0)
 
     def test_four_profiles_maintain_independent_state(self):
-        self.open_position("BOT_A_BASELINE", snap=snapshot(option_symbol="A"))
-        self.open_position("BOT_B_MOMENTUM", snap=snapshot(option_symbol="B"))
+        self.open_position("BOT_A_BASELINE", snap=snapshot(option_symbol="ACALL"))
+        self.open_position("BOT_B_MOMENTUM", snap=snapshot(option_symbol="BCALL"))
         self.states["BOT_A_BASELINE"].virtual_trades_today = 9
         self.assertEqual(self.states["BOT_B_MOMENTUM"].virtual_trades_today, 1)
-        self.assertEqual(self.states["BOT_A_BASELINE"].virtual_position.option_symbol, "A")
-        self.assertEqual(self.states["BOT_B_MOMENTUM"].virtual_position.option_symbol, "B")
+        self.assertEqual(self.states["BOT_A_BASELINE"].virtual_position.option_symbol, "ACALL")
+        self.assertEqual(self.states["BOT_B_MOMENTUM"].virtual_position.option_symbol, "BCALL")
 
 
 if __name__ == "__main__":

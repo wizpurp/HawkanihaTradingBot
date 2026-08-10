@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from .models import BotProfile, BotRuntimeState, ProfileDecision, TournamentTrade, VirtualTournamentPosition
+from .option_symbols import option_symbol_matches_direction
 from .profiles import PROFILE_ORDER
 from .recovery import (
     REJECT_INVALID_QUOTE_TIMESTAMP,
@@ -49,33 +50,58 @@ def _block_entry(decision: ProfileDecision, reason: str) -> None:
 
 def _selected_option(snapshot: MarketSnapshot, direction: str) -> dict:
     if direction == "CALL":
+        if snapshot.call_option_symbol and option_symbol_matches_direction(snapshot.call_option_symbol, "CALL"):
+            return {
+                "symbol": snapshot.call_option_symbol,
+                "bid": snapshot.call_option_bid,
+                "ask": snapshot.call_option_ask,
+                "last": snapshot.call_option_last,
+                "midpoint": snapshot.call_option_midpoint,
+            }
+        if snapshot.option_symbol and option_symbol_matches_direction(snapshot.option_symbol, "CALL"):
+            return {
+                "symbol": snapshot.option_symbol,
+                "bid": snapshot.option_bid,
+                "ask": snapshot.option_ask,
+                "last": snapshot.option_last,
+                "midpoint": snapshot.option_midpoint,
+            }
         return {
-            "symbol": snapshot.call_option_symbol or snapshot.option_symbol,
-            "bid": snapshot.call_option_bid if snapshot.call_option_bid is not None else snapshot.option_bid,
-            "ask": snapshot.call_option_ask if snapshot.call_option_ask is not None else snapshot.option_ask,
-            "last": snapshot.call_option_last if snapshot.call_option_last is not None else snapshot.option_last,
-            "midpoint": snapshot.call_option_midpoint if snapshot.call_option_midpoint is not None else snapshot.option_midpoint,
+            "symbol": None,
+            "bid": None,
+            "ask": None,
+            "last": None,
+            "midpoint": None,
         }
     if direction == "PUT":
+        if snapshot.put_option_symbol and option_symbol_matches_direction(snapshot.put_option_symbol, "PUT"):
+            return {
+                "symbol": snapshot.put_option_symbol,
+                "bid": snapshot.put_option_bid,
+                "ask": snapshot.put_option_ask,
+                "last": snapshot.put_option_last,
+                "midpoint": snapshot.put_option_midpoint,
+            }
+        if snapshot.option_symbol and option_symbol_matches_direction(snapshot.option_symbol, "PUT"):
+            return {
+                "symbol": snapshot.option_symbol,
+                "bid": snapshot.option_bid,
+                "ask": snapshot.option_ask,
+                "last": snapshot.option_last,
+                "midpoint": snapshot.option_midpoint,
+            }
         return {
-            "symbol": snapshot.put_option_symbol or snapshot.option_symbol,
-            "bid": snapshot.put_option_bid if snapshot.put_option_bid is not None else snapshot.option_bid,
-            "ask": snapshot.put_option_ask if snapshot.put_option_ask is not None else snapshot.option_ask,
-            "last": snapshot.put_option_last if snapshot.put_option_last is not None else snapshot.option_last,
-            "midpoint": snapshot.put_option_midpoint if snapshot.put_option_midpoint is not None else snapshot.option_midpoint,
+            "symbol": None,
+            "bid": None,
+            "ask": None,
+            "last": None,
+            "midpoint": None,
         }
     return {"symbol": None, "bid": None, "ask": None, "last": None, "midpoint": None}
 
 
 def _option_symbol_matches_direction(option_symbol: str | None, direction: str) -> bool:
-    text = str(option_symbol or "").upper()
-    if not text:
-        return False
-    if text.endswith("CALL") or text.endswith("PUT"):
-        return text.endswith(direction)
-    if len(text) >= 9 and ("C00" in text or "P00" in text):
-        return ("C00" in text and direction == "CALL") or ("P00" in text and direction == "PUT")
-    return True
+    return option_symbol_matches_direction(option_symbol, direction)
 
 
 def try_open_virtual_position(

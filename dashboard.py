@@ -36,6 +36,7 @@ from tournament.recovery import (
     tournament_market_is_open,
 )
 from tournament.snapshot import build_market_snapshot_from_signal
+from tournament.option_symbols import option_symbol_direction, option_symbol_matches_direction
 from tournament import state as tournament_state_module
 from tournament import trades as tournament_trades_module
 from tournament.state import TOURNAMENT_STATE_FILE, create_all_initial_states, load_tournament_state, save_tournament_state
@@ -2916,22 +2917,29 @@ def initialize_tournament_recovery():
 
 def add_snapshot_option_fields(signal, call_contract=None, put_contract=None):
     signal = dict(signal or {})
+    diagnostics = list(signal.get("option_diagnostics") or [])
 
-    def add_contract(prefix, contract):
+    def add_contract(prefix, contract, required_direction):
         if not contract:
+            return
+        option_symbol = contract.get("symbol")
+        if option_symbol_direction(option_symbol) != required_direction:
+            diagnostics.append(f"INVALID_{prefix.upper()}_OPTION_SYMBOL")
             return
         bid = safe_float(contract.get("bid"), None)
         ask = safe_float(contract.get("ask"), None)
         last = safe_float(contract.get("last"), None)
         midpoint = ((bid + ask) / 2) if bid is not None and ask is not None and bid > 0 and ask > 0 else None
-        signal[f"{prefix}_option_symbol"] = contract.get("symbol")
+        signal[f"{prefix}_option_symbol"] = option_symbol
         signal[f"{prefix}_option_bid"] = bid
         signal[f"{prefix}_option_ask"] = ask
         signal[f"{prefix}_option_last"] = last
         signal[f"{prefix}_option_midpoint"] = midpoint
 
-    add_contract("call", call_contract)
-    add_contract("put", put_contract)
+    add_contract("call", call_contract, "CALL")
+    add_contract("put", put_contract, "PUT")
+    if diagnostics:
+        signal["option_diagnostics"] = diagnostics
     if call_contract or put_contract:
         signal["option_quote_timestamp"] = market_now().isoformat()
     return signal
@@ -3047,6 +3055,23 @@ def tournament_option_money_snapshot(snapshot, profile, decision):
         "contracts": contracts,
         "total_position_cost": total_position_cost,
         "maximum_position_cost_dollars": float((profile.config or {}).get("maximum_position_cost_dollars", 0) or 0),
+        "call_contract": snapshot.call_option_symbol,
+        "put_contract": snapshot.put_option_symbol,
+        "candidate_contract_type": option_symbol_direction(decision.momentum_candidate_option_symbol),
+        "decision_direction": direction,
+        "contract_direction_match": (
+            option_symbol_matches_direction(decision.momentum_candidate_option_symbol, direction)
+            if decision.momentum_candidate_option_symbol and direction in {"CALL", "PUT"}
+            else None
+        ),
+        "contract_direction_mismatch_reason": (
+            "OPTION_DIRECTION_MISMATCH"
+            if decision.momentum_candidate_option_symbol
+            and direction in {"CALL", "PUT"}
+            and not option_symbol_matches_direction(decision.momentum_candidate_option_symbol, direction)
+            else None
+        ),
+        "option_diagnostics": list(snapshot.option_diagnostics or ()),
     }
 
 
@@ -3095,35 +3120,39 @@ def record_tournament_pipeline_counters(states, before_candidates, decisions):
             increment_tournament_counter(state, "decisions_accepted")
 
 
-def synthetic_tournament_signal(profile, option_price, *, signal_label="TEST_PIPELINE"):
+def synthetic_tournament_signal(profile, option_price, *, direction="CALL", signal_label="TEST_PIPELINE"):
     config = profile.config or {}
     contracts = int(config.get("contracts", 1) or 1)
     maximum_cost = float(config.get("maximum_position_cost_dollars", 150.0) or 150.0)
     option_price = min(float(option_price), max(0.01, maximum_cost / (100 * max(1, contracts))))
     option_price = round(option_price, 4)
+    bullish_score = 10 if direction == "CALL" else 0
+    bearish_score = 10 if direction == "PUT" else 0
+    current_price = 501.0 if direction == "CALL" else 489.0
+    completed_closes = (500.0, 501.0) if direction == "CALL" else (489.0, 488.0)
     return {
-        "price": 501.0,
-        "bullish_score": 10,
-        "bearish_score": 0,
+        "price": current_price,
+        "bullish_score": bullish_score,
+        "bearish_score": bearish_score,
         "confidence": 10,
         "dominance_percent": 100.0,
-        "market_state": "BULLISH",
+        "market_state": "BULLISH" if direction == "CALL" else "BEARISH",
         "current_signal": signal_label,
-        "ema_state": "BULLISH",
-        "macd_state": "BULLISH",
-        "vwap_state": "BULLISH",
-        "volume_state": "BULLISH",
+        "ema_state": "BULLISH" if direction == "CALL" else "BEARISH",
+        "macd_state": "BULLISH" if direction == "CALL" else "BEARISH",
+        "vwap_state": "BULLISH" if direction == "CALL" else "BEARISH",
+        "volume_state": "BULLISH" if direction == "CALL" else "BEARISH",
         "levels": {
             "opening_range_high": 499.0,
             "opening_range_low": 490.0,
         },
-        "completed_closes": (500.0, 501.0),
-        "call_option_symbol": "SPYTESTPIPELINECALL",
+        "completed_closes": completed_closes,
+        "call_option_symbol": "SPY260101C00500000",
         "call_option_bid": option_price,
         "call_option_ask": option_price,
         "call_option_last": option_price,
         "call_option_midpoint": option_price,
-        "put_option_symbol": "SPYTESTPIPELINEPUT",
+        "put_option_symbol": "SPY260101P00500000",
         "put_option_bid": option_price,
         "put_option_ask": option_price,
         "put_option_last": option_price,
@@ -3132,15 +3161,15 @@ def synthetic_tournament_signal(profile, option_price, *, signal_label="TEST_PIP
     }
 
 
-def run_profile_pipeline_proof(profile):
+def run_profile_pipeline_proof(profile, direction="CALL"):
     required_percent = float((profile.config or {}).get("option_momentum_percent", 1.0) or 1.0)
     contracts = int((profile.config or {}).get("contracts", 1) or 1)
     maximum_cost = float((profile.config or {}).get("maximum_position_cost_dollars", 150.0) or 150.0)
     maximum_premium = max(0.01, maximum_cost / (100 * max(1, contracts)))
     start_price = min(1.0, maximum_premium * 0.75)
     confirmation_price = start_price * (1 + ((required_percent + 0.25) / 100))
-    start_signal = synthetic_tournament_signal(profile, start_price)
-    confirm_signal = synthetic_tournament_signal(profile, confirmation_price)
+    start_signal = synthetic_tournament_signal(profile, start_price, direction=direction)
+    confirm_signal = synthetic_tournament_signal(profile, confirmation_price, direction=direction)
     start_snapshot = build_market_snapshot_from_signal(start_signal, "SPY", market_now().isoformat())
     confirm_snapshot = build_market_snapshot_from_signal(confirm_signal, "SPY", market_now().isoformat())
     proof_state = create_all_initial_states({profile.profile_id: profile})[profile.profile_id]
@@ -3148,6 +3177,11 @@ def run_profile_pipeline_proof(profile):
     result = {
         "profile_id": profile.profile_id,
         "profile_name": profile.display_name,
+        "requested_direction": direction,
+        "decision_direction": None,
+        "candidate_symbol": None,
+        "candidate_type": None,
+        "contract_direction_match": None,
         "preliminary_direction": None,
         "candidate_created": False,
         "momentum_confirmed": False,
@@ -3179,6 +3213,10 @@ def run_profile_pipeline_proof(profile):
         proof_epoch + 1,
     )
     final_decision = confirmed_decisions[profile.profile_id]
+    result["decision_direction"] = final_decision.direction
+    result["candidate_symbol"] = final_decision.momentum_candidate_option_symbol
+    result["candidate_type"] = option_symbol_direction(final_decision.momentum_candidate_option_symbol)
+    result["contract_direction_match"] = option_symbol_matches_direction(final_decision.momentum_candidate_option_symbol, final_decision.direction)
     result["momentum_confirmed"] = bool(final_decision.momentum_passed)
     result["or_confirmed"] = (not final_decision.or_confirmation_required) or bool(final_decision.two_candle_or_passed)
     result["decision_accepted"] = bool(final_decision.accepted)
@@ -3204,7 +3242,10 @@ def run_tournament_pipeline_proof(config):
         if profile_id not in profiles:
             results[profile_id] = {"profile_id": profile_id, "status": "BLOCKED", "block_reason": "PROFILE_MISSING"}
             continue
-        results[profile_id] = run_profile_pipeline_proof(profiles[profile_id])
+        results[profile_id] = {
+            "CALL": run_profile_pipeline_proof(profiles[profile_id], "CALL"),
+            "PUT": run_profile_pipeline_proof(profiles[profile_id], "PUT"),
+        }
     return results
 
 
@@ -5142,7 +5183,11 @@ def api_close_latest_test_tournament_trade():
 def api_run_tournament_pipeline_proof():
     try:
         results = run_tournament_pipeline_proof(load_config())
-        ok = all(row.get("status") == "POSITION_OPENED" for row in results.values())
+        ok = all(
+            row.get("status") == "POSITION_OPENED"
+            for profile_results in results.values()
+            for row in (profile_results.values() if isinstance(profile_results, dict) else [profile_results])
+        )
         return jsonify({"ok": ok, "results": results}), 200 if ok else 400
     except Exception as error:
         return jsonify({"ok": False, "errors": [str(error)]}), 400
@@ -6331,8 +6376,13 @@ Contracts: {tournament_input(profile_id, row, "contracts", minimum=1)}<br>
 <td>{safe_float(row.get("direction_threshold")):.1f}%</td>
 <td>{safe_float(row.get("minimum_dominance")):.1f}%</td>
 <td>{html_lib.escape(str(row.get("momentum_status", "N/A")))}</td>
+<td>{html_lib.escape(str(row.get("call_contract") or ""))}</td>
+<td>{html_lib.escape(str(row.get("put_contract") or ""))}</td>
 <td>{html_lib.escape(str(row.get("momentum_candidate_direction") or ""))}</td>
 <td>{html_lib.escape(str(row.get("momentum_candidate_option_symbol") or ""))}</td>
+<td>{html_lib.escape(str(row.get("candidate_contract_type") or ""))}</td>
+<td>{html_lib.escape(str(row.get("decision_direction") or row.get("final_direction") or row.get("direction") or ""))}</td>
+<td>{html_lib.escape(str(row.get("contract_direction_match") if row.get("contract_direction_match") is not None else ""))} {html_lib.escape(str(row.get("contract_direction_mismatch_reason") or ""))}</td>
 <td>{fmt_trade_price(row.get("momentum_starting_price"))}</td>
 <td>{fmt_trade_price(row.get("momentum_current_price"))}</td>
 <td>{safe_float(row.get("momentum_observed_percent")):.2f}%</td>
@@ -6583,8 +6633,13 @@ Bot Reason Log:<br>
 <th>Direction Threshold</th>
 <th>Minimum Dominance</th>
 <th>Momentum Result</th>
+<th>Call Contract</th>
+<th>Put Contract</th>
 <th>Candidate Direction</th>
 <th>Candidate Option</th>
+<th>Candidate Type</th>
+<th>Decision Direction</th>
+<th>Contract Direction Match</th>
 <th>Starting Price</th>
 <th>Current Price</th>
 <th>Movement Observed</th>
@@ -7527,8 +7582,13 @@ function renderTournamentDecisions(decisions, evaluatedByProfile, settings, stat
 <td>${{Number(row.direction_threshold || 0).toFixed(1)}}%</td>
 <td>${{Number(row.minimum_dominance || 0).toFixed(1)}}%</td>
 <td>${{escapeHtml(row.momentum_status || "N/A")}}</td>
+<td>${{escapeHtml(row.call_contract || "")}}</td>
+<td>${{escapeHtml(row.put_contract || "")}}</td>
 <td>${{escapeHtml(row.momentum_candidate_direction || "")}}</td>
 <td>${{escapeHtml(row.momentum_candidate_option_symbol || "")}}</td>
+<td>${{escapeHtml(row.candidate_contract_type || "")}}</td>
+<td>${{escapeHtml(row.decision_direction || row.final_direction || row.direction || "")}}</td>
+<td>${{escapeHtml(row.contract_direction_match === null || row.contract_direction_match === undefined ? "" : row.contract_direction_match)}} ${{escapeHtml(row.contract_direction_mismatch_reason || "")}}</td>
 <td>${{fmtMoney(row.momentum_starting_price)}}</td>
 <td>${{fmtMoney(row.momentum_current_price)}}</td>
 <td>${{Number(row.momentum_observed_percent || 0).toFixed(2)}}%</td>

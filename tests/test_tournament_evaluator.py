@@ -226,6 +226,42 @@ class TournamentEvaluatorTest(unittest.TestCase):
         self.assertEqual(snapshot.suggested_direction, None)
         self.assertEqual(decision.direction, "CALL")
 
+    def test_call_snapshot_drops_put_symbol(self):
+        snap = build_market_snapshot_from_signal(
+            {
+                "price": 500,
+                "bullish_score": 5,
+                "bearish_score": 0,
+                "confidence": 5,
+                "call_option_symbol": "SPY260810P00773000",
+                "call_option_bid": 1.0,
+                "call_option_ask": 1.1,
+            },
+            "SPY",
+            "2026-08-10T10:00:00-04:00",
+        )
+        self.assertIsNone(snap.call_option_symbol)
+        self.assertIsNone(snap.call_option_ask)
+        self.assertIn("INVALID_CALL_OPTION_SYMBOL", snap.option_diagnostics)
+
+    def test_put_snapshot_drops_call_symbol(self):
+        snap = build_market_snapshot_from_signal(
+            {
+                "price": 500,
+                "bullish_score": 0,
+                "bearish_score": 5,
+                "confidence": 5,
+                "put_option_symbol": "SPY260810C00773000",
+                "put_option_bid": 1.0,
+                "put_option_ask": 1.1,
+            },
+            "SPY",
+            "2026-08-10T10:00:00-04:00",
+        )
+        self.assertIsNone(snap.put_option_symbol)
+        self.assertIsNone(snap.put_option_ask)
+        self.assertIn("INVALID_PUT_OPTION_SYMBOL", snap.option_diagnostics)
+
     def test_confidence_below_four_rejects_all_profiles(self):
         snapshot = self.snapshot(bullish_score=5, bearish_score=2, confidence=3, dominance_percent=71.4)
         decisions = evaluate_all_profiles(self.profiles, self.states, snapshot)

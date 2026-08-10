@@ -68,7 +68,7 @@ def accepted_decision(profile_id="BOT_A_BASELINE"):
     )
 
 
-def snapshot(option_symbol="SPYEXIT", ask=1.0):
+def snapshot(option_symbol="SPYEXITCALL", ask=1.0):
     return MarketSnapshot(
         timestamp="2026-07-28T09:35:00-04:00",
         symbol="SPY",
@@ -116,7 +116,7 @@ class TournamentVirtualExitsTest(unittest.TestCase):
         self.trade_path_patch.stop()
         self.tempdir.cleanup()
 
-    def open_position(self, profile_id="BOT_A_BASELINE", ask=1.0, symbol="SPYEXIT", contracts=None, locked_profit_dollars=None):
+    def open_position(self, profile_id="BOT_A_BASELINE", ask=1.0, symbol="SPYEXITCALL", contracts=None, locked_profit_dollars=None):
         if contracts is not None or locked_profit_dollars is not None:
             config = runtime_config(
                 contracts=contracts or 1,
@@ -239,8 +239,8 @@ class TournamentVirtualExitsTest(unittest.TestCase):
         self.assertIsNone(state.virtual_position)
 
     def test_other_profile_position_remains_open(self):
-        self.open_position("BOT_A_BASELINE", symbol="A")
-        self.open_position("BOT_B_MOMENTUM", symbol="B")
+        self.open_position("BOT_A_BASELINE", symbol="ACALL")
+        self.open_position("BOT_B_MOMENTUM", symbol="BCALL")
         close_virtual_position(self.profiles["BOT_A_BASELINE"], self.states["BOT_A_BASELINE"], 1.25, EXIT_TRAILING_STOP, 1001.0)
         self.assertIsNone(self.states["BOT_A_BASELINE"].virtual_position)
         self.assertIsNotNone(self.states["BOT_B_MOMENTUM"].virtual_position)
@@ -248,8 +248,8 @@ class TournamentVirtualExitsTest(unittest.TestCase):
     def test_shared_contract_quote_is_fetched_once_for_multiple_profiles(self):
         import dashboard
 
-        self.open_position("BOT_A_BASELINE", symbol="SAME")
-        self.open_position("BOT_B_MOMENTUM", symbol="SAME")
+        self.open_position("BOT_A_BASELINE", symbol="SAMECALL")
+        self.open_position("BOT_B_MOMENTUM", symbol="SAMECALL")
         dashboard.TOURNAMENT_RUNTIME_STATES = self.states
         dashboard.TOURNAMENT_RUNTIME_STATES_LOADED = True
         with patch.object(dashboard, "TOURNAMENT_TRADES_FILE", self.trades_path), patch.object(dashboard, "TOURNAMENT_STATE_FILE", os.path.join(self.tempdir.name, "state.json")), patch.object(dashboard, "get_market_quote", return_value={"bid": 1.01}) as quote_mock:

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .option_symbols import option_symbol_direction
+
 
 @dataclass(frozen=True)
 class MarketSnapshot:
@@ -44,6 +46,7 @@ class MarketSnapshot:
     put_option_midpoint: float | None = None
     momentum_confirmed: bool = False
     locked_option_quotes: dict | None = None
+    option_diagnostics: tuple[str, ...] = ()
 
 
 def _float_or_none(value):
@@ -78,6 +81,33 @@ def build_market_snapshot_from_signal(signal: dict, symbol: str, timestamp: str)
     macd_state = signal.get("macd_state")
     vwap_state = signal.get("vwap_state")
     volume_state = signal.get("volume_state")
+    diagnostics = list(signal.get("option_diagnostics") or [])
+
+    call_option_symbol = signal.get("call_option_symbol")
+    call_option_bid = _float_or_none(signal.get("call_option_bid"))
+    call_option_ask = _float_or_none(signal.get("call_option_ask"))
+    call_option_last = _float_or_none(signal.get("call_option_last"))
+    call_option_midpoint = _float_or_none(signal.get("call_option_midpoint"))
+    if call_option_symbol and option_symbol_direction(call_option_symbol) != "CALL":
+        diagnostics.append("INVALID_CALL_OPTION_SYMBOL")
+        call_option_symbol = None
+        call_option_bid = None
+        call_option_ask = None
+        call_option_last = None
+        call_option_midpoint = None
+
+    put_option_symbol = signal.get("put_option_symbol")
+    put_option_bid = _float_or_none(signal.get("put_option_bid"))
+    put_option_ask = _float_or_none(signal.get("put_option_ask"))
+    put_option_last = _float_or_none(signal.get("put_option_last"))
+    put_option_midpoint = _float_or_none(signal.get("put_option_midpoint"))
+    if put_option_symbol and option_symbol_direction(put_option_symbol) != "PUT":
+        diagnostics.append("INVALID_PUT_OPTION_SYMBOL")
+        put_option_symbol = None
+        put_option_bid = None
+        put_option_ask = None
+        put_option_last = None
+        put_option_midpoint = None
 
     return MarketSnapshot(
         timestamp=timestamp,
@@ -107,16 +137,17 @@ def build_market_snapshot_from_signal(signal: dict, symbol: str, timestamp: str)
         option_last=_float_or_none(signal.get("option_last")),
         option_midpoint=_float_or_none(signal.get("option_midpoint")),
         option_quote_timestamp=signal.get("option_quote_timestamp"),
-        call_option_symbol=signal.get("call_option_symbol"),
-        call_option_bid=_float_or_none(signal.get("call_option_bid")),
-        call_option_ask=_float_or_none(signal.get("call_option_ask")),
-        call_option_last=_float_or_none(signal.get("call_option_last")),
-        call_option_midpoint=_float_or_none(signal.get("call_option_midpoint")),
-        put_option_symbol=signal.get("put_option_symbol"),
-        put_option_bid=_float_or_none(signal.get("put_option_bid")),
-        put_option_ask=_float_or_none(signal.get("put_option_ask")),
-        put_option_last=_float_or_none(signal.get("put_option_last")),
-        put_option_midpoint=_float_or_none(signal.get("put_option_midpoint")),
+        call_option_symbol=call_option_symbol,
+        call_option_bid=call_option_bid,
+        call_option_ask=call_option_ask,
+        call_option_last=call_option_last,
+        call_option_midpoint=call_option_midpoint,
+        put_option_symbol=put_option_symbol,
+        put_option_bid=put_option_bid,
+        put_option_ask=put_option_ask,
+        put_option_last=put_option_last,
+        put_option_midpoint=put_option_midpoint,
         momentum_confirmed=bool(signal.get("momentum_confirmed") or signal.get("option_momentum_confirmed")),
         locked_option_quotes=signal.get("locked_option_quotes") if isinstance(signal.get("locked_option_quotes"), dict) else None,
+        option_diagnostics=tuple(diagnostics),
     )

@@ -103,6 +103,15 @@ def snapshot_with_call_symbol(symbol, call_mid=1.0, locked_quotes=None, quote_ti
     )
 
 
+def snapshot_with_put_symbol(symbol, put_mid=1.0, locked_quotes=None, quote_time="2026-07-28T10:00:00-04:00", completed_closes=None):
+    snap = snapshot(direction="PUT", put_mid=put_mid, quote_time=quote_time, completed_closes=completed_closes)
+    return replace(
+        snap,
+        put_option_symbol=symbol,
+        locked_option_quotes=locked_quotes,
+    )
+
+
 class TournamentMomentumTest(unittest.TestCase):
     def setUp(self):
         self.profiles = build_tournament_profiles(runtime_config())
@@ -132,11 +141,25 @@ class TournamentMomentumTest(unittest.TestCase):
         self.assertTrue(decisions["BOT_B_MOMENTUM"].accepted)
         self.assertEqual(decisions["BOT_B_MOMENTUM"].direction, "CALL")
 
+    def test_call_momentum_candidate_cannot_track_put_contract(self):
+        decisions = self.decisions_with_momentum(snapshot_with_call_symbol("SPY260810P00773000", call_mid=1.00), epoch_at())
+        decision = decisions["BOT_B_MOMENTUM"]
+        self.assertEqual(decision.momentum_status, "INVALID_QUOTE")
+        self.assertFalse(decision.momentum_passed)
+        self.assertIsNone(self.states["BOT_B_MOMENTUM"].momentum_candidate)
+
     def test_put_candidate_confirms_when_put_option_rises(self):
         self.decisions_with_momentum(snapshot(direction="PUT", put_mid=1.00), epoch_at())
         decisions = self.decisions_with_momentum(snapshot(direction="PUT", put_mid=1.02), epoch_at(second=1))
         self.assertTrue(decisions["BOT_B_MOMENTUM"].accepted)
         self.assertEqual(decisions["BOT_B_MOMENTUM"].direction, "PUT")
+
+    def test_put_momentum_candidate_cannot_track_call_contract(self):
+        decisions = self.decisions_with_momentum(snapshot_with_put_symbol("SPY260810C00773000", put_mid=1.00), epoch_at())
+        decision = decisions["BOT_B_MOMENTUM"]
+        self.assertEqual(decision.momentum_status, "INVALID_QUOTE")
+        self.assertFalse(decision.momentum_passed)
+        self.assertIsNone(self.states["BOT_B_MOMENTUM"].momentum_candidate)
 
     def test_movement_below_threshold_remains_tracking(self):
         self.decisions_with_momentum(snapshot(call_mid=1.00), epoch_at())
@@ -157,9 +180,9 @@ class TournamentMomentumTest(unittest.TestCase):
         self.assertEqual(self.states["BOT_B_MOMENTUM"].pipeline_counters["candidate_direction_changed"], 1)
 
     def test_neighboring_option_change_does_not_cancel_candidate(self):
-        self.decisions_with_momentum(snapshot_with_call_symbol("SPYSTRIKEA", call_mid=1.00), epoch_at())
+        self.decisions_with_momentum(snapshot_with_call_symbol("SPY260810C00773000", call_mid=1.00), epoch_at())
         locked_quotes = {
-            "SPYSTRIKEA": {
+            "SPY260810C00773000": {
                 "bid": 1.01,
                 "ask": 1.03,
                 "last": 1.02,
@@ -167,39 +190,39 @@ class TournamentMomentumTest(unittest.TestCase):
             }
         }
         decisions = self.decisions_with_momentum(
-            snapshot_with_call_symbol("SPYSTRIKEB", call_mid=0.99, locked_quotes=locked_quotes),
+            snapshot_with_call_symbol("SPY260810C00774000", call_mid=0.99, locked_quotes=locked_quotes),
             epoch_at(second=1),
         )
         decision = decisions["BOT_B_MOMENTUM"]
         self.assertEqual(decision.momentum_status, MOMENTUM_CONFIRMED)
-        self.assertEqual(decision.momentum_candidate_option_symbol, "SPYSTRIKEA")
-        self.assertEqual(self.states["BOT_B_MOMENTUM"].momentum_candidate.option_symbol, "SPYSTRIKEA")
+        self.assertEqual(decision.momentum_candidate_option_symbol, "SPY260810C00773000")
+        self.assertEqual(self.states["BOT_B_MOMENTUM"].momentum_candidate.option_symbol, "SPY260810C00773000")
         self.assertEqual(self.states["BOT_B_MOMENTUM"].pipeline_counters["candidate_option_changed"], 1)
         self.assertTrue(any(row["status"] == MOMENTUM_OPTION_CHANGED for row in self.states["BOT_B_MOMENTUM"].candidate_transitions))
 
     def test_zero_percent_momentum_confirms_on_candidate_creation(self):
         self.profiles["BOT_B_MOMENTUM"].config["option_momentum_percent"] = 0.0
-        decisions = self.decisions_with_momentum(snapshot_with_call_symbol("SPYSTRIKEA", call_mid=1.00), epoch_at())
+        decisions = self.decisions_with_momentum(snapshot_with_call_symbol("SPY260810C00773000", call_mid=1.00), epoch_at())
         decision = decisions["BOT_B_MOMENTUM"]
         self.assertEqual(decision.momentum_status, MOMENTUM_CONFIRMED)
         self.assertTrue(decision.momentum_passed)
         self.assertEqual(self.states["BOT_B_MOMENTUM"].pipeline_counters["candidate_confirmed"], 1)
 
     def test_locked_strike_is_used_for_virtual_entry_after_selector_changes(self):
-        self.decisions_with_momentum(snapshot_with_call_symbol("SPYSTRIKEA", call_mid=1.00), epoch_at())
+        self.decisions_with_momentum(snapshot_with_call_symbol("SPY260810C00773000", call_mid=1.00), epoch_at())
         locked_quotes = {
-            "SPYSTRIKEA": {
+            "SPY260810C00773000": {
                 "bid": 1.01,
                 "ask": 1.03,
                 "last": 1.02,
                 "midpoint": 1.02,
             }
         }
-        confirm_snap = snapshot_with_call_symbol("SPYSTRIKEB", call_mid=0.99, locked_quotes=locked_quotes)
+        confirm_snap = snapshot_with_call_symbol("SPY260810C00774000", call_mid=0.99, locked_quotes=locked_quotes)
         decisions = self.decisions_with_momentum(confirm_snap, epoch_at(second=1))
         entry_snap = replace(
             confirm_snap,
-            call_option_symbol="SPYSTRIKEA",
+            call_option_symbol="SPY260810C00773000",
             call_option_bid=1.01,
             call_option_ask=1.03,
             call_option_last=1.02,
@@ -213,7 +236,7 @@ class TournamentMomentumTest(unittest.TestCase):
             epoch_at(second=1),
         )
         self.assertIsNotNone(trade)
-        self.assertEqual(trade.option_symbol, "SPYSTRIKEA")
+        self.assertEqual(trade.option_symbol, "SPY260810C00773000")
 
     def test_excess_drawdown_cancels_candidate(self):
         self.decisions_with_momentum(snapshot(call_mid=1.00), epoch_at())
@@ -246,9 +269,9 @@ class TournamentMomentumTest(unittest.TestCase):
         self.assertTrue(passed_both["BOT_D_COMBINED"].accepted)
 
     def test_bot_d_momentum_survives_option_change_while_or_tracks(self):
-        self.decisions_with_momentum(snapshot_with_call_symbol("SPYSTRIKEA", call_mid=1.00, completed_closes=(500.0, 499.0)), epoch_at())
+        self.decisions_with_momentum(snapshot_with_call_symbol("SPY260810C00773000", call_mid=1.00, completed_closes=(500.0, 499.0)), epoch_at())
         locked_quotes = {
-            "SPYSTRIKEA": {
+            "SPY260810C00773000": {
                 "bid": 1.01,
                 "ask": 1.03,
                 "last": 1.02,
@@ -256,17 +279,17 @@ class TournamentMomentumTest(unittest.TestCase):
             }
         }
         waiting_or = self.decisions_with_momentum(
-            snapshot_with_call_symbol("SPYSTRIKEB", call_mid=0.99, locked_quotes=locked_quotes, completed_closes=(500.0, 499.0)),
+            snapshot_with_call_symbol("SPY260810C00774000", call_mid=0.99, locked_quotes=locked_quotes, completed_closes=(500.0, 499.0)),
             epoch_at(second=1),
         )
         passed_both = self.decisions_with_momentum(
-            snapshot_with_call_symbol("SPYSTRIKEB", call_mid=0.99, locked_quotes=locked_quotes, completed_closes=(500.0, 501.0)),
+            snapshot_with_call_symbol("SPY260810C00774000", call_mid=0.99, locked_quotes=locked_quotes, completed_closes=(500.0, 501.0)),
             epoch_at(second=2),
         )
         self.assertEqual(waiting_or["BOT_D_COMBINED"].momentum_status, MOMENTUM_CONFIRMED)
         self.assertFalse(waiting_or["BOT_D_COMBINED"].accepted)
         self.assertTrue(passed_both["BOT_D_COMBINED"].accepted)
-        self.assertEqual(passed_both["BOT_D_COMBINED"].momentum_candidate_option_symbol, "SPYSTRIKEA")
+        self.assertEqual(passed_both["BOT_D_COMBINED"].momentum_candidate_option_symbol, "SPY260810C00773000")
 
     def test_bot_a_remains_unaffected(self):
         decisions = self.decisions_with_momentum(snapshot(), epoch_at())

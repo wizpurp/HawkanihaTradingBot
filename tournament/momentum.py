@@ -4,6 +4,7 @@ from dataclasses import replace
 
 from .evaluator import evaluate_profile
 from .models import BotProfile, BotRuntimeState, ProfileDecision, TournamentMomentumCandidate
+from .option_symbols import option_symbol_matches_direction
 from .recovery import REJECT_INVALID_QUOTE_TIMESTAMP, REJECT_QUOTE_STALE, quote_is_fresh
 from .snapshot import MarketSnapshot
 
@@ -68,6 +69,8 @@ def _quote_price_from_row(row: dict | None) -> tuple[float | None, str | None]:
 
 
 def option_price_for_momentum(snapshot: MarketSnapshot, direction: str, locked_option_symbol: str | None = None) -> tuple[float | None, str | None, str | None]:
+    if locked_option_symbol and not option_symbol_matches_direction(locked_option_symbol, direction):
+        return None, None, locked_option_symbol
     if locked_option_symbol and isinstance(snapshot.locked_option_quotes, dict):
         locked_quote = snapshot.locked_option_quotes.get(locked_option_symbol)
         price, source = _quote_price_from_row(locked_quote)
@@ -86,6 +89,9 @@ def option_price_for_momentum(snapshot: MarketSnapshot, direction: str, locked_o
         symbol = snapshot.put_option_symbol
     else:
         return None, None, None
+
+    if symbol and not option_symbol_matches_direction(symbol, direction):
+        return None, None, symbol
 
     if bid is not None and ask is not None:
         return (bid + ask) / 2, "MIDPOINT", symbol
@@ -228,6 +234,16 @@ def update_profile_momentum(
         return False
 
     candidate = state.momentum_candidate
+    retry_cooldown_seconds = _config_int(config, "pending_entry_retry_cooldown_seconds", 60)
+    if _candidate_active(candidate) and candidate.direction != direction:
+        old_candidate = candidate
+        candidate = _cancel_candidate(state, candidate, MOMENTUM_DIRECTION_CHANGED, "direction changed", now_epoch, retry_cooldown_seconds)
+        _counter(state, "candidate_direction_changed")
+        _transition(state, profile, old_candidate.direction, direction, old_candidate.option_symbol, None, MOMENTUM_DIRECTION_CHANGED, "direction changed", now_epoch - old_candidate.started_epoch, now_epoch)
+        _apply_trace(decision, candidate, MOMENTUM_DIRECTION_CHANGED, "direction changed", now_epoch)
+        decision.momentum_passed = False
+        return False
+
     locked_option_symbol = candidate.option_symbol if _candidate_active(candidate) or (candidate and candidate.status == MOMENTUM_CONFIRMED) else None
     _, _, selected_option_symbol = option_price_for_momentum(snapshot, direction, None)
     current_price, price_source, option_symbol = option_price_for_momentum(snapshot, direction, locked_option_symbol)
@@ -243,7 +259,6 @@ def update_profile_momentum(
     required_percent = _config_float(config, "option_momentum_confirmation_percent", "option_momentum_percent", "momentum_percent", default=1.0)
     timeout_seconds = _config_int(config, "confirmation_timeout_seconds", 60)
     max_drawdown_percent = _config_float(config, "pre_confirmation_max_drawdown_percent", default=5.0)
-    retry_cooldown_seconds = _config_int(config, "pending_entry_retry_cooldown_seconds", 60)
 
     if candidate and candidate.status == MOMENTUM_CONFIRMED and candidate.direction == direction:
         observed = _movement_percent(candidate.starting_option_price, current_price)
@@ -262,15 +277,6 @@ def update_profile_momentum(
 
     if candidate and candidate.retry_until_epoch and now_epoch < candidate.retry_until_epoch and not _candidate_active(candidate):
         _apply_trace(decision, candidate, candidate.status, f"retry cooldown active; {int(candidate.retry_until_epoch - now_epoch)} seconds remaining", now_epoch)
-        decision.momentum_passed = False
-        return False
-
-    if _candidate_active(candidate) and candidate.direction != direction:
-        old_candidate = candidate
-        candidate = _cancel_candidate(state, candidate, MOMENTUM_DIRECTION_CHANGED, "direction changed", now_epoch, retry_cooldown_seconds)
-        _counter(state, "candidate_direction_changed")
-        _transition(state, profile, old_candidate.direction, direction, old_candidate.option_symbol, option_symbol, MOMENTUM_DIRECTION_CHANGED, "direction changed", now_epoch - old_candidate.started_epoch, now_epoch)
-        _apply_trace(decision, candidate, MOMENTUM_DIRECTION_CHANGED, "direction changed", now_epoch)
         decision.momentum_passed = False
         return False
 
