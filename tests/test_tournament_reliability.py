@@ -18,6 +18,8 @@ from tournament.recovery import (
     REJECT_INVALID_QUOTE_TIMESTAMP,
     REJECT_MARKET_CLOSED,
     REJECT_QUOTE_STALE,
+    RECOVERY_SYNTHETIC_PROOF_CLEARED,
+    TEST_TYPE_PIPELINE_PROOF,
     apply_daily_reset,
     quote_is_fresh,
     reconcile_tournament_state,
@@ -80,24 +82,24 @@ def accepted_decision(profile_id="BOT_A_BASELINE"):
     )
 
 
-def snapshot(symbol="SPYRELCALL", ask=1.0, quote_time="2026-07-28T10:00:00-04:00"):
+def snapshot(symbol="SPYRELCALL", ask=1.0, quote_time="2026-07-28T10:00:00-04:00", direction="CALL"):
     return MarketSnapshot(
         timestamp=quote_time,
         symbol="SPY",
         current_price=500.0,
-        bullish_score=5,
-        bearish_score=0,
+        bullish_score=5 if direction == "CALL" else 0,
+        bearish_score=5 if direction == "PUT" else 0,
         confidence=5,
         dominance_percent=100.0,
-        market_state="BULLISH",
-        suggested_direction="CALL",
-        signal="CALL",
-        ema_bullish=True,
-        ema_bearish=False,
-        macd_bullish=True,
-        macd_bearish=False,
-        above_vwap=True,
-        below_vwap=False,
+        market_state="BULLISH" if direction == "CALL" else "BEARISH",
+        suggested_direction=direction,
+        signal=direction,
+        ema_bullish=direction == "CALL",
+        ema_bearish=direction == "PUT",
+        macd_bullish=direction == "CALL",
+        macd_bearish=direction == "PUT",
+        above_vwap=direction == "CALL",
+        below_vwap=direction == "PUT",
         volume_confirmed=True,
         opening_range_ready=True,
         opening_range_high=499.0,
@@ -108,6 +110,16 @@ def snapshot(symbol="SPYRELCALL", ask=1.0, quote_time="2026-07-28T10:00:00-04:00
         option_ask=ask,
         option_last=ask,
         option_midpoint=ask,
+        call_option_symbol=symbol if direction == "CALL" else None,
+        call_option_bid=ask - 0.05 if direction == "CALL" else None,
+        call_option_ask=ask if direction == "CALL" else None,
+        call_option_last=ask if direction == "CALL" else None,
+        call_option_midpoint=ask if direction == "CALL" else None,
+        put_option_symbol=symbol if direction == "PUT" else None,
+        put_option_bid=ask - 0.05 if direction == "PUT" else None,
+        put_option_ask=ask if direction == "PUT" else None,
+        put_option_last=ask if direction == "PUT" else None,
+        put_option_midpoint=ask if direction == "PUT" else None,
         option_quote_timestamp=quote_time,
     )
 
@@ -190,6 +202,92 @@ class TournamentReliabilityTest(unittest.TestCase):
         states, trades, summary = reconcile_tournament_state(self.profiles, self.states, [])
         self.assertIsNone(states["BOT_A_BASELINE"].virtual_position)
         self.assertEqual(summary["cancelled_invalid"], 1)
+
+    def test_old_spytest_position_is_detected_as_synthetic_and_cleared(self):
+        _, position = self.open_position("BOT_B_MOMENTUM", "SPYTESTCALL")
+        self.states["BOT_B_MOMENTUM"].virtual_position = position
+        self.states["BOT_B_MOMENTUM"].virtual_trades_today = 1
+        self.states["BOT_B_MOMENTUM"].virtual_entry_cooldown_until_epoch = epoch_at(minute=10)
+        self.states["BOT_B_MOMENTUM"].last_entry_fingerprint = "synthetic"
+
+        states, trades, summary = reconcile_tournament_state(self.profiles, self.states, [])
+
+        self.assertIsNone(states["BOT_B_MOMENTUM"].virtual_position)
+        self.assertEqual(states["BOT_B_MOMENTUM"].virtual_trades_today, 0)
+        self.assertIsNone(states["BOT_B_MOMENTUM"].virtual_entry_cooldown_until_epoch)
+        self.assertIsNone(states["BOT_B_MOMENTUM"].last_entry_fingerprint)
+        self.assertEqual(summary["synthetic_positions_cleared"], 1)
+        self.assertEqual(summary["statuses"]["BOT_B_MOMENTUM"], RECOVERY_SYNTHETIC_PROOF_CLEARED)
+
+    def test_recovery_clears_explicit_pipeline_proof_position_metadata(self):
+        _, position = self.open_position("BOT_D_COMBINED", "SPY260101C00500000")
+        position.is_test_position = True
+        position.test_type = TEST_TYPE_PIPELINE_PROOF
+        self.states["BOT_D_COMBINED"].virtual_position = position
+
+        states, trades, summary = reconcile_tournament_state(self.profiles, self.states, [])
+
+        self.assertIsNone(states["BOT_D_COMBINED"].virtual_position)
+        self.assertEqual(summary["synthetic_positions_cleared"], 1)
+
+    def test_synthetic_cleanup_preserves_real_historical_trades(self):
+        real_trade, _ = self.open_position("BOT_A_BASELINE", "SPY260101C00500000")
+        synthetic_trade = replace(
+            real_trade,
+            trade_id=real_trade.trade_id + "-TEST",
+            profile_id="BOT_B_MOMENTUM",
+            profile_display_name="Bot B Momentum",
+            option_symbol="SPYTESTCALL",
+            signal="TEST_PIPELINE",
+            is_test_position=True,
+            test_type=TEST_TYPE_PIPELINE_PROOF,
+        )
+
+        states, trades, summary = reconcile_tournament_state(self.profiles, self.states, [real_trade, synthetic_trade])
+
+        self.assertEqual([trade.trade_id for trade in trades], [real_trade.trade_id])
+        self.assertEqual(summary["synthetic_trades_removed"], 1)
+        self.assertEqual(states["BOT_A_BASELINE"].virtual_position.trade_id, real_trade.trade_id)
+
+    def test_bot_b_can_open_real_call_after_fake_position_removed(self):
+        _, fake_position = self.open_position("BOT_B_MOMENTUM", "SPYTESTCALL")
+        self.states["BOT_B_MOMENTUM"].virtual_position = fake_position
+        states, trades, summary = reconcile_tournament_state(self.profiles, self.states, [])
+
+        trade = try_open_virtual_position(
+            self.profiles["BOT_B_MOMENTUM"],
+            states["BOT_B_MOMENTUM"],
+            accepted_decision("BOT_B_MOMENTUM"),
+            snapshot("SPY260101C00500000", quote_time="2026-07-28T10:02:00-04:00"),
+            epoch_at(minute=2),
+        )
+
+        self.assertEqual(summary["synthetic_positions_cleared"], 1)
+        self.assertIsNotNone(trade)
+        self.assertEqual(trade.direction, "CALL")
+        self.assertEqual(trade.option_symbol, "SPY260101C00500000")
+
+    def test_bot_b_can_open_real_put_after_fake_position_removed(self):
+        _, fake_position = self.open_position("BOT_B_MOMENTUM", "SPYTESTCALL")
+        self.states["BOT_B_MOMENTUM"].virtual_position = fake_position
+        states, trades, summary = reconcile_tournament_state(self.profiles, self.states, [])
+        put_decision = accepted_decision("BOT_B_MOMENTUM")
+        put_decision.direction = "PUT"
+        put_decision.bullish_score = 0
+        put_decision.bearish_score = 5
+
+        trade = try_open_virtual_position(
+            self.profiles["BOT_B_MOMENTUM"],
+            states["BOT_B_MOMENTUM"],
+            put_decision,
+            snapshot("SPY260101P00500000", quote_time="2026-07-28T10:02:00-04:00", direction="PUT"),
+            epoch_at(minute=2),
+        )
+
+        self.assertEqual(summary["synthetic_positions_cleared"], 1)
+        self.assertIsNotNone(trade)
+        self.assertEqual(trade.direction, "PUT")
+        self.assertEqual(trade.option_symbol, "SPY260101P00500000")
 
     def test_main_state_corrupt_loads_backup(self):
         save_tournament_state(self.state_path, self.states)

@@ -11,6 +11,7 @@ from .trades import profile_display_name, save_tournament_trades
 
 MARKET_TZ = ZoneInfo("America/New_York")
 
+TEST_TYPE_PIPELINE_PROOF = "PIPELINE_PROOF"
 RECOVERY_NO_ACTION = "NO_ACTION"
 RECOVERY_POSITION_RESUMED = "POSITION_RESUMED"
 RECOVERY_TRADE_RECONSTRUCTED = "TRADE_RECONSTRUCTED"
@@ -18,6 +19,7 @@ RECOVERY_POSITION_RECONSTRUCTED = "POSITION_RECONSTRUCTED"
 RECOVERY_DUPLICATES_CLEANED = "DUPLICATES_CLEANED"
 RECOVERY_INVALID_STATE_CANCELLED = "INVALID_STATE_CANCELLED"
 RECOVERY_CLOSED_POSITION_CLEARED = "CLOSED_POSITION_CLEARED"
+RECOVERY_SYNTHETIC_PROOF_CLEARED = "SYNTHETIC_PROOF_CLEARED"
 RECOVERY_ERROR = "RECOVERY_ERROR"
 
 EXIT_RECOVERY_INVALID_STATE = "RECOVERY_INVALID_STATE"
@@ -103,6 +105,65 @@ def mark_recovery(state: BotRuntimeState, status: str, trade_id: str | None = No
     state.last_updated_at = state.last_recovery_time
 
 
+def is_synthetic_proof_symbol(option_symbol: str | None) -> bool:
+    return bool(str(option_symbol or "").upper().startswith("SPYTEST"))
+
+
+def is_synthetic_proof_position(position: VirtualTournamentPosition | None) -> bool:
+    if not position:
+        return False
+    if bool(getattr(position, "is_test_position", False)) and getattr(position, "test_type", None) == TEST_TYPE_PIPELINE_PROOF:
+        return True
+    return is_synthetic_proof_symbol(getattr(position, "option_symbol", None))
+
+
+def is_synthetic_proof_trade(trade: TournamentTrade | None) -> bool:
+    if not trade:
+        return False
+    if bool(getattr(trade, "is_test_position", False)) and getattr(trade, "test_type", None) == TEST_TYPE_PIPELINE_PROOF:
+        return True
+    if getattr(trade, "signal", None) == "TEST_PIPELINE":
+        return True
+    return is_synthetic_proof_symbol(getattr(trade, "option_symbol", None))
+
+
+def clear_synthetic_proof_state(
+    profiles: dict[str, BotProfile],
+    states: dict[str, BotRuntimeState],
+    trades: list[TournamentTrade],
+) -> tuple[list[TournamentTrade], dict, bool]:
+    summary = {
+        "synthetic_positions_cleared": 0,
+        "synthetic_trades_removed": 0,
+        "synthetic_profiles": [],
+    }
+    changed = False
+    kept_trades = []
+    for trade in trades:
+        if is_synthetic_proof_trade(trade):
+            summary["synthetic_trades_removed"] += 1
+            changed = True
+            continue
+        kept_trades.append(trade)
+
+    for profile_id in profiles:
+        state = states.get(profile_id)
+        if not state or not is_synthetic_proof_position(state.virtual_position):
+            continue
+        state.virtual_position = None
+        state.last_virtual_entry_epoch = None
+        state.virtual_entry_cooldown_until_epoch = None
+        state.last_entry_fingerprint = None
+        state.virtual_trades_today = max(0, int(state.virtual_trades_today or 0) - 1)
+        state.momentum_candidate = None
+        mark_recovery(state, RECOVERY_SYNTHETIC_PROOF_CLEARED)
+        summary["synthetic_positions_cleared"] += 1
+        summary["synthetic_profiles"].append(profile_id)
+        changed = True
+
+    return kept_trades, summary, changed
+
+
 def _trade_sort_key(trade: TournamentTrade) -> float:
     if trade.entry_epoch is not None:
         try:
@@ -161,6 +222,8 @@ def reconstruct_position_from_trade(profile: BotProfile, trade: TournamentTrade)
         updated_at=timestamp,
         max_profit_dollars=float(trade.max_profit_dollars or 0.0),
         max_drawdown_dollars=float(trade.max_drawdown_dollars or 0.0),
+        is_test_position=bool(trade.is_test_position),
+        test_type=trade.test_type,
     )
 
 
@@ -196,6 +259,8 @@ def reconstruct_trade_from_position(profile: BotProfile, position: VirtualTourna
         or_confirmation_required=position.or_confirmation_required,
         created_at=position.created_at or timestamp,
         updated_at=timestamp,
+        is_test_position=bool(position.is_test_position),
+        test_type=position.test_type,
     )
 
 
@@ -243,10 +308,17 @@ def reconcile_tournament_state(
         "recovered_positions": 0,
         "cancelled_invalid": 0,
         "duplicates_cleaned": 0,
+        "synthetic_positions_cleared": 0,
+        "synthetic_trades_removed": 0,
+        "synthetic_profiles": [],
         "state_source": "MAIN",
         "statuses": {},
     }
     changed = False
+    trades, synthetic_summary, synthetic_changed = clear_synthetic_proof_state(profiles, states, trades)
+    summary.update(synthetic_summary)
+    changed = changed or synthetic_changed
+    synthetic_profiles = set(synthetic_summary.get("synthetic_profiles") or [])
     trades_by_profile: dict[str, list[TournamentTrade]] = {profile_id: [] for profile_id in profiles}
     for trade in trades:
         if trade.profile_id in trades_by_profile:
@@ -261,7 +333,7 @@ def reconcile_tournament_state(
             open_trades = sorted([trade for trade in profile_trades if trade.status == "OPEN"], key=_trade_sort_key, reverse=True)
             position = state.virtual_position if state.virtual_position and state.virtual_position.status == "OPEN" else None
             closed_trade_ids = {trade.trade_id for trade in profile_trades if trade.status == "CLOSED"}
-            status = RECOVERY_NO_ACTION
+            status = RECOVERY_SYNTHETIC_PROOF_CLEARED if profile_id in synthetic_profiles else RECOVERY_NO_ACTION
             recovered_trade_id = None
 
             if len(open_trades) > 1:

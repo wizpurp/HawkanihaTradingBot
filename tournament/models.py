@@ -117,6 +117,8 @@ class VirtualTournamentPosition:
     updated_at: str
     max_profit_dollars: float = 0.0
     max_drawdown_dollars: float = 0.0
+    is_test_position: bool = False
+    test_type: str | None = None
 
 
 @dataclass
@@ -156,6 +158,8 @@ class TournamentTrade:
     or_confirmation_required: bool = False
     created_at: str = ""
     updated_at: str = ""
+    is_test_position: bool = False
+    test_type: str | None = None
 
 
 @dataclass

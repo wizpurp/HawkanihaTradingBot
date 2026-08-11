@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Callable
+
 from .models import BotProfile, BotRuntimeState, ProfileDecision, TournamentTrade, VirtualTournamentPosition
 from .option_symbols import option_symbol_matches_direction
 from .profiles import PROFILE_ORDER
@@ -110,6 +112,9 @@ def try_open_virtual_position(
     decision: ProfileDecision,
     snapshot: MarketSnapshot,
     now_epoch: float,
+    trade_writer: Callable[[TournamentTrade], TournamentTrade] | None = None,
+    is_test_position: bool = False,
+    test_type: str | None = None,
 ) -> TournamentTrade | None:
     config = profile.config or {}
     rules = _entry_rules(config)
@@ -209,8 +214,11 @@ def try_open_virtual_position(
         or_confirmation_required=decision.or_confirmation_required,
         created_at=timestamp,
         updated_at=timestamp,
+        is_test_position=is_test_position,
+        test_type=test_type,
     )
-    append_tournament_trade(trade, TOURNAMENT_TRADES_FILE)
+    writer = trade_writer or (lambda row: append_tournament_trade(row, TOURNAMENT_TRADES_FILE))
+    trade = writer(trade)
 
     state.virtual_position = VirtualTournamentPosition(
         profile_id=profile.profile_id,
@@ -248,6 +256,8 @@ def try_open_virtual_position(
         or_confirmation_required=decision.or_confirmation_required,
         created_at=timestamp,
         updated_at=timestamp,
+        is_test_position=is_test_position,
+        test_type=test_type,
     )
     state.last_virtual_entry_epoch = now_epoch
     state.virtual_trades_today += 1

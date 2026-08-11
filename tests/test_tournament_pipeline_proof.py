@@ -12,9 +12,15 @@ class TournamentPipelineProofTest(unittest.TestCase):
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
         self.trades_path = os.path.join(self.tempdir.name, "tournament_trades.json")
+        self.state_path = os.path.join(self.tempdir.name, "tournament_state.json")
         self.profiles_path = os.path.join(self.tempdir.name, "missing_profiles.json")
+        with open(self.trades_path, "w", encoding="utf-8") as handle:
+            handle.write("[]\n")
+        with open(self.state_path, "w", encoding="utf-8") as handle:
+            handle.write("{}\n")
         self.patches = [
             patch.object(dashboard, "TOURNAMENT_TRADES_FILE", self.trades_path),
+            patch.object(dashboard, "TOURNAMENT_STATE_FILE", self.state_path),
             patch.object(dashboard, "TOURNAMENT_PROFILES_FILE", self.profiles_path),
             patch("tournament.execution.TOURNAMENT_TRADES_FILE", self.trades_path),
         ]
@@ -47,15 +53,17 @@ class TournamentPipelineProofTest(unittest.TestCase):
                 self.assertTrue(row["decision_accepted"])
                 self.assertTrue(row["entry_attempted"])
                 self.assertTrue(row["entry_opened"])
+                self.assertTrue(row["would_open"])
                 self.assertEqual(row["status"], "POSITION_OPENED")
                 self.assertIsNotNone(row["trade_id"])
+                self.assertIsNotNone(row["simulated_trade"])
+                self.assertTrue(row["simulated_trade"]["is_test_position"])
+                self.assertEqual(row["simulated_trade"]["test_type"], "PIPELINE_PROOF")
 
         trades = list_tournament_trades(path=self.trades_path)
-        self.assertEqual(len(trades), 4)
-        self.assertEqual({trade.profile_id for trade in trades}, {"BOT_B_MOMENTUM", "BOT_D_COMBINED"})
-        self.assertEqual({trade.signal for trade in trades}, {"TEST_PIPELINE"})
-        for trade in trades:
-            self.assertIn("C00500000" if trade.direction == "CALL" else "P00500000", trade.option_symbol)
+        self.assertEqual(trades, [])
+        with open(self.state_path, "r", encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "{}\n")
 
     def test_delete_pipeline_proof_trades_removes_only_test_pipeline_records(self):
         self.client.post("/api/tournament/pipeline-proof/run", json={})
@@ -64,7 +72,7 @@ class TournamentPipelineProofTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200, payload)
         self.assertTrue(payload["ok"])
-        self.assertEqual(payload["deleted"], 4)
+        self.assertEqual(payload["deleted"], 0)
         self.assertEqual(list_tournament_trades(path=self.trades_path), [])
 
     def test_bot_b_and_bot_d_zero_percent_momentum_proof_opens(self):
@@ -79,9 +87,28 @@ class TournamentPipelineProofTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200, payload)
         for profile_id in ("BOT_B_MOMENTUM", "BOT_D_COMBINED"):
             self.assertEqual(payload["results"][profile_id]["CALL"]["status"], "POSITION_OPENED")
+            self.assertTrue(payload["results"][profile_id]["CALL"]["would_open"])
             self.assertTrue(payload["results"][profile_id]["CALL"]["momentum_confirmed"])
             self.assertEqual(payload["results"][profile_id]["PUT"]["status"], "POSITION_OPENED")
+            self.assertTrue(payload["results"][profile_id]["PUT"]["would_open"])
             self.assertTrue(payload["results"][profile_id]["PUT"]["momentum_confirmed"])
+
+    def test_pipeline_proof_does_not_mutate_files_or_global_runtime_state(self):
+        with open(self.trades_path, "w", encoding="utf-8") as handle:
+            handle.write("[]\n")
+        with open(self.state_path, "w", encoding="utf-8") as handle:
+            handle.write("{}\n")
+        dashboard.TOURNAMENT_RUNTIME_STATES = {}
+        dashboard.TOURNAMENT_RUNTIME_STATES_LOADED = False
+
+        response = self.client.post("/api/tournament/pipeline-proof/run", json={})
+        self.assertEqual(response.status_code, 200, response.get_json())
+
+        with open(self.trades_path, "r", encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "[]\n")
+        with open(self.state_path, "r", encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "{}\n")
+        self.assertEqual(dashboard.TOURNAMENT_RUNTIME_STATES, {})
 
 
 if __name__ == "__main__":

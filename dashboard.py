@@ -1,4 +1,5 @@
 import re
+import copy
 from flask import Flask, request, redirect, jsonify
 import requests
 import json
@@ -30,7 +31,9 @@ from tournament.profiles import (
     save_tournament_profile_settings,
 )
 from tournament.recovery import (
+    TEST_TYPE_PIPELINE_PROOF,
     apply_daily_resets,
+    is_synthetic_proof_position,
     quote_is_fresh,
     reconcile_tournament_state,
     tournament_market_is_open,
@@ -3033,12 +3036,19 @@ def serialize_tournament_positions(states):
         if position and position.status == "OPEN":
             row = asdict(position)
             row.update(stop_snapshot(position))
+            row["position_source"] = tournament_position_source(position)
             cooldown_until = state.virtual_entry_cooldown_until_epoch
             row["virtual_trades_today"] = state.virtual_trades_today
             row["cooldown_remaining_seconds"] = max(0, int(cooldown_until - now_epoch)) if cooldown_until else 0
             row["last_entry_fingerprint"] = state.last_entry_fingerprint
             rows.append(row)
     return rows
+
+
+def tournament_position_source(position):
+    if not position:
+        return "NONE"
+    return "TEST" if is_synthetic_proof_position(position) else "REAL"
 
 
 def tournament_option_money_snapshot(snapshot, profile, decision):
@@ -3120,6 +3130,16 @@ def record_tournament_pipeline_counters(states, before_candidates, decisions):
             increment_tournament_counter(state, "decisions_accepted")
 
 
+def clear_stale_confirmed_candidate_after_entry_attempt(state, decision):
+    candidate = getattr(state, "momentum_candidate", None)
+    if not candidate or candidate.status != "CONFIRMED":
+        return False
+    if decision.entry_status not in {"BLOCKED", "OPENED"} and not decision.rejection_reason:
+        return False
+    state.momentum_candidate = None
+    return True
+
+
 def synthetic_tournament_signal(profile, option_price, *, direction="CALL", signal_label="TEST_PIPELINE"):
     config = profile.config or {}
     contracts = int(config.get("contracts", 1) or 1)
@@ -3162,6 +3182,7 @@ def synthetic_tournament_signal(profile, option_price, *, direction="CALL", sign
 
 
 def run_profile_pipeline_proof(profile, direction="CALL"):
+    profile = copy.deepcopy(profile)
     required_percent = float((profile.config or {}).get("option_momentum_percent", 1.0) or 1.0)
     contracts = int((profile.config or {}).get("contracts", 1) or 1)
     maximum_cost = float((profile.config or {}).get("maximum_position_cost_dollars", 150.0) or 150.0)
@@ -3172,7 +3193,8 @@ def run_profile_pipeline_proof(profile, direction="CALL"):
     confirm_signal = synthetic_tournament_signal(profile, confirmation_price, direction=direction)
     start_snapshot = build_market_snapshot_from_signal(start_signal, "SPY", market_now().isoformat())
     confirm_snapshot = build_market_snapshot_from_signal(confirm_signal, "SPY", market_now().isoformat())
-    proof_state = create_all_initial_states({profile.profile_id: profile})[profile.profile_id]
+    proof_state = copy.deepcopy(create_all_initial_states({profile.profile_id: profile})[profile.profile_id])
+    simulated_trades = []
     proof_epoch = 1000.0
     result = {
         "profile_id": profile.profile_id,
@@ -3189,6 +3211,8 @@ def run_profile_pipeline_proof(profile, direction="CALL"):
         "decision_accepted": False,
         "entry_attempted": False,
         "entry_opened": False,
+        "would_open": False,
+        "simulated_trade": None,
         "status": "NOT_STARTED",
         "block_reason": None,
         "trade_id": None,
@@ -3227,11 +3251,28 @@ def run_profile_pipeline_proof(profile, direction="CALL"):
 
     result["entry_attempted"] = True
     entry_snapshot = snapshot_for_confirmed_candidate_entry(confirm_snapshot, proof_state)
-    trade = try_open_virtual_position(profile, proof_state, final_decision, entry_snapshot, proof_epoch + 1)
+    def proof_trade_writer(trade):
+        simulated_trades.append(copy.deepcopy(trade))
+        return trade
+
+    trade = try_open_virtual_position(
+        profile,
+        proof_state,
+        final_decision,
+        entry_snapshot,
+        proof_epoch + 1,
+        trade_writer=proof_trade_writer,
+        is_test_position=True,
+        test_type=TEST_TYPE_PIPELINE_PROOF,
+    )
     result["entry_opened"] = trade is not None
+    result["would_open"] = trade is not None
     result["status"] = "POSITION_OPENED" if trade else "ENTRY_BLOCKED"
     result["block_reason"] = final_decision.entry_block_reason or final_decision.rejection_reason
     result["trade_id"] = trade.trade_id if trade else None
+    result["simulated_trade"] = asdict(trade) if trade else None
+    proof_state.virtual_position = None
+    proof_state.momentum_candidate = None
     return result
 
 
@@ -3274,6 +3315,7 @@ def evaluate_tournament_decisions(config, signal, call_contract=None, put_contra
         }
         decisions = apply_tournament_momentum(profiles, states, decisions, snapshot, now_epoch)
         record_tournament_pipeline_counters(states, before_candidates, decisions)
+        candidate_cleanup_changed = False
         for profile_id, profile in profiles.items():
             if decisions[profile_id].accepted:
                 increment_tournament_counter(states[profile_id], "entries_attempted")
@@ -3298,11 +3340,13 @@ def evaluate_tournament_decisions(config, signal, call_contract=None, put_contra
                 print("entry_cost:", trade.entry_cost)
             elif decisions[profile_id].entry_block_reason:
                 increment_tournament_block_reason(states[profile_id], decisions[profile_id].entry_block_reason)
+            if clear_stale_confirmed_candidate_after_entry_attempt(states[profile_id], decisions[profile_id]):
+                candidate_cleanup_changed = True
         counters_after = json.dumps({
             profile_id: tournament_pipeline_counters(state)
             for profile_id, state in states.items()
         }, sort_keys=True)
-        if opened_trades or daily_reset_changed or counters_after != counters_before:
+        if opened_trades or daily_reset_changed or candidate_cleanup_changed or counters_after != counters_before:
             save_tournament_state_safe(states)
         state_by_profile = {
             profile_id: {
@@ -3347,7 +3391,12 @@ def refresh_tournament_state_snapshot(states):
     now_epoch = time.time()
     return {
         profile_id: {
-            "virtual_position": dict(asdict(state.virtual_position), **stop_snapshot(state.virtual_position)) if state.virtual_position else None,
+            "virtual_position": dict(
+                asdict(state.virtual_position),
+                **stop_snapshot(state.virtual_position),
+                position_source=tournament_position_source(state.virtual_position),
+            ) if state.virtual_position else None,
+            "position_source": tournament_position_source(state.virtual_position),
             "momentum_candidate": asdict(state.momentum_candidate) if state.momentum_candidate else None,
             "virtual_trades_today": state.virtual_trades_today,
             "cooldown_remaining_seconds": max(0, int(state.virtual_entry_cooldown_until_epoch - now_epoch)) if state.virtual_entry_cooldown_until_epoch else 0,
@@ -5184,7 +5233,7 @@ def api_run_tournament_pipeline_proof():
     try:
         results = run_tournament_pipeline_proof(load_config())
         ok = all(
-            row.get("status") == "POSITION_OPENED"
+            bool(row.get("would_open"))
             for profile_results in results.values()
             for row in (profile_results.values() if isinstance(profile_results, dict) else [profile_results])
         )
@@ -6360,6 +6409,7 @@ Contracts: {tournament_input(profile_id, row, "contracts", minimum=1)}<br>
             state = TOURNAMENT_RUNTIME_STATES.get(profile_id)
             evaluated = state.decisions_evaluated if state else 0
             position = state.virtual_position if state else None
+            position_source = tournament_position_source(position)
             stops = stop_snapshot(position) if position else {}
             option_premium = row.get("option_premium")
             total_position_cost = row.get("total_position_cost")
@@ -6402,6 +6452,7 @@ Contracts: {tournament_input(profile_id, row, "contracts", minimum=1)}<br>
 <td>{fmt_money(maximum_position_cost) if maximum_position_cost not in (None, "") else ""}</td>
 <td>{evaluated}</td>
 <td>{escape_html(position.status if position else "NONE")}</td>
+<td>{escape_html(position_source)}</td>
 <td>{escape_html(position.option_symbol if position else "")}</td>
 <td>{fmt_trade_price(position.entry_price if position else "")}</td>
 <td>{fmt_trade_price(position.current_price if position else "")}</td>
@@ -6660,6 +6711,7 @@ Bot Reason Log:<br>
 <th>Decisions Evaluated</th>
 <th>Pipeline Counters</th>
 <th>Position Status</th>
+<th>Current Position Source</th>
 <th>Option</th>
 <th>Entry Price</th>
 <th>Current Bid</th>
@@ -7567,6 +7619,7 @@ function renderTournamentDecisions(decisions, evaluatedByProfile, settings, stat
         const enabled = settings[profileId]?.enabled;
         const state = stateByProfile[profileId] || {{}};
         const position = state.virtual_position || null;
+        const positionSource = position?.position_source || state.position_source || "NONE";
         const counters = state.pipeline_counters || {{}};
         const blockReasons = counters.entry_block_reasons || {{}};
         const blockText = Object.entries(blockReasons).map(([reason, count]) => `${{reason}}:${{count}}`).join(", ");
@@ -7617,6 +7670,7 @@ C:${{escapeHtml(counters.candidates_started || 0)}}
 <small>${{escapeHtml(blockText)}}</small>
 </td>
 <td>${{escapeHtml(position?.status || "NONE")}}</td>
+<td>${{escapeHtml(positionSource)}}</td>
 <td>${{escapeHtml(position?.option_symbol || "")}}</td>
 <td>${{position ? fmtMoney(position.entry_price) : ""}}</td>
 <td>${{position ? fmtMoney(position.current_price) : ""}}</td>
