@@ -59,6 +59,7 @@ load_dotenv()
 app = Flask(__name__)
 MARKET_TZ = ZoneInfo("America/New_York")
 CONFIG_SCHEMA_VERSION = 2
+MARKET_CLOSED_SLEEP_SECONDS = 300
 
 
 def market_now():
@@ -232,7 +233,11 @@ BOT_STATE = {
     "tournament_decisions_evaluated_by_profile": {},
     "tournament_virtual_positions": [],
     "tournament_state_by_profile": {},
-    "tournament_health": {}
+    "tournament_health": {},
+    "market_session_open": None,
+    "market_session_status": "UNKNOWN",
+    "market_session_last_transition": "",
+    "market_closed_sleep_seconds": MARKET_CLOSED_SLEEP_SECONDS
 }
 TOURNAMENT_RUNTIME_STATES = {}
 TOURNAMENT_RUNTIME_STATES_LOADED = False
@@ -1035,8 +1040,32 @@ def update_last_trade_review(review):
 
 
 def option_market_is_open():
-    now = market_now().time()
-    return datetime_time(9, 30) <= now <= datetime_time(16, 0)
+    return tournament_market_is_open(time.time())
+
+
+def update_market_session_state(is_open, log_transition=True):
+    status = "OPEN" if is_open else "CLOSED"
+    message = None
+    with BOT_LOCK:
+        previous = BOT_STATE.get("market_session_open")
+        if previous is not is_open:
+            if log_transition:
+                if is_open:
+                    message = "Market open — scanner resumed"
+                else:
+                    message = "Market closed — scanner sleeping"
+            BOT_STATE["market_session_open"] = is_open
+            BOT_STATE["market_session_status"] = status
+            BOT_STATE["market_session_last_transition"] = market_now().isoformat()
+        else:
+            BOT_STATE["market_session_status"] = status
+    if message:
+        print(message)
+    return is_open
+
+
+def scanner_market_is_open(log_transition=True):
+    return update_market_session_state(option_market_is_open(), log_transition=log_transition)
 
 
 def submit_and_parse_option_order(option_symbol, qty, action, label):
@@ -1275,6 +1304,8 @@ def get_position():
 
 
 def get_expirations(symbol):
+    if not scanner_market_is_open():
+        return []
     try:
         r = requests.get(
             f"{BASE_URL}/markets/options/expirations",
@@ -1291,6 +1322,8 @@ def get_expirations(symbol):
 
 
 def get_option_chain(symbol, expiration):
+    if not scanner_market_is_open():
+        return []
     try:
         r = requests.get(
             f"{BASE_URL}/markets/options/chains",
@@ -1307,6 +1340,8 @@ def get_option_chain(symbol, expiration):
 
 
 def select_atm_contract(symbol, side):
+    if not scanner_market_is_open():
+        return None
     quote = get_market_quote(symbol)
     if not quote or quote.get("last") is None:
         return None
@@ -1332,6 +1367,8 @@ def select_atm_contract(symbol, side):
 
 
 def select_closest_contract_within_budget(symbol, side, maximum_position_cost_dollars, contracts):
+    if not scanner_market_is_open():
+        return None
     quote = get_market_quote(symbol)
     if not quote or quote.get("last") is None:
         return None
@@ -3291,6 +3328,11 @@ def run_tournament_pipeline_proof(config):
 
 
 def evaluate_tournament_decisions(config, signal, call_contract=None, put_contract=None):
+    if not scanner_market_is_open():
+        TOURNAMENT_HEALTH["tournament_entry_loop_alive"] = True
+        with BOT_LOCK:
+            BOT_STATE["tournament_health"] = dict(TOURNAMENT_HEALTH)
+        return None, {}
     profiles = build_tournament_profiles(config)
     signal = add_snapshot_option_fields(signal, call_contract, put_contract)
     snapshot = build_market_snapshot_from_signal(
@@ -3422,6 +3464,10 @@ def process_tournament_virtual_exit_poll():
     now_iso = market_now().isoformat()
     TOURNAMENT_HEALTH["tournament_last_exit_poll"] = now_iso
     TOURNAMENT_HEALTH["tournament_exit_loop_alive"] = True
+    if not scanner_market_is_open():
+        with BOT_LOCK:
+            BOT_STATE["tournament_health"] = dict(TOURNAMENT_HEALTH)
+        return False
     with TOURNAMENT_LOCK:
         states = ensure_tournament_runtime_states(profiles)
         daily_reset_changed = apply_daily_resets(profiles, states, time.time())
@@ -3460,15 +3506,22 @@ def process_tournament_virtual_exit_poll():
         print("exit_reason:", trade.exit_reason)
         print("pnl_dollars:", trade.pnl_dollars)
         print("pnl_percent:", trade.pnl_percent)
+    return True
 
 
 def tournament_virtual_exit_loop():
     traceback_logged = False
     while not TOURNAMENT_HEALTH.get("stopping"):
         try:
-            process_tournament_virtual_exit_poll()
-            config = load_config()
-            interval_ms = max(500, int(config.get("strategy", {}).get("exit_poll_interval_ms", 1000) or 1000))
+            if not scanner_market_is_open():
+                TOURNAMENT_HEALTH["tournament_exit_loop_alive"] = True
+                with BOT_LOCK:
+                    BOT_STATE["tournament_health"] = dict(TOURNAMENT_HEALTH)
+                interval_ms = MARKET_CLOSED_SLEEP_SECONDS * 1000
+            else:
+                process_tournament_virtual_exit_poll()
+                config = load_config()
+                interval_ms = max(500, int(config.get("strategy", {}).get("exit_poll_interval_ms", 1000) or 1000))
             traceback_logged = False
         except Exception as error:
             print("TOURNAMENT EXIT ERROR:", error)
@@ -3873,6 +3926,10 @@ def process_pending_entry(config):
     pending = get_pending_entry()
     if not pending.get("active"):
         return False
+    if not scanner_market_is_open():
+        with BOT_LOCK:
+            BOT_STATE["last_action"] = "Market closed — scanner sleeping"
+        return False
 
     decision = pending.get("decision", "DO NOTHING")
     side = pending.get("direction", "")
@@ -4067,6 +4124,8 @@ def try_surfer_exit(config, positions, market_context):
     if not positions:
         log_bot_audit("DO NOTHING", market_context.get("decision", "DO NOTHING"), config.get("symbol", ""), market_context, config, skip_reason="no open position")
         return False
+    if not scanner_market_is_open():
+        return False
 
     decision = market_context.get("decision", "DO NOTHING")
     if decision != "SELL":
@@ -4205,6 +4264,12 @@ def fast_exit_poll(config, positions):
     tick_started_at = time.perf_counter()
     set_last_error(None)
     if not positions:
+        record_tick_finished(tick_started_at)
+        return False
+    if not scanner_market_is_open():
+        with BOT_LOCK:
+            BOT_STATE["thread_alive"] = True
+            BOT_STATE["last_action"] = "Market closed — scanner sleeping"
         record_tick_finished(tick_started_at)
         return False
 
@@ -4499,6 +4564,13 @@ def surfer_bot_tick(allow_entry=True):
         record_tick_finished(tick_started_at)
         return
 
+    if not scanner_market_is_open():
+        with BOT_LOCK:
+            BOT_STATE["thread_alive"] = True
+            BOT_STATE["last_action"] = "Market closed — scanner sleeping"
+        record_tick_finished(tick_started_at)
+        return
+
     symbol = config.get("symbol", "SPY")
     quote = get_market_quote(symbol)
     price = get_quote_price(quote)
@@ -4611,6 +4683,14 @@ def surfer_bot_loop():
             config = load_config()
             interval = int(config.get("scanner", {}).get("interval_seconds", 60))
             exit_poll_interval_ms = clamp_int(config["strategy"].get("exit_poll_interval_ms", 1000), 100, 5000, 1000)
+            if not scanner_market_is_open():
+                idle_started_at = time.perf_counter()
+                with BOT_LOCK:
+                    BOT_STATE["thread_alive"] = True
+                    BOT_STATE["last_action"] = "Market closed — scanner sleeping"
+                record_tick_finished(idle_started_at)
+                time.sleep(MARKET_CLOSED_SLEEP_SECONDS)
+                continue
             positions = get_position()
             if positions:
                 active_pending = get_pending_entry()
@@ -4724,6 +4804,8 @@ def sell_all_positions():
 def api_expirations():
     config = load_config()
     symbol = request.args.get("symbol", config["symbol"]).upper()
+    if not scanner_market_is_open():
+        return jsonify({"dates": [], "market_open": False, "status": "MARKET_CLOSED"})
     return jsonify({"dates": get_expirations(symbol)})
 
 
@@ -4812,7 +4894,7 @@ def api_bot_state():
 @app.route("/api/developer-diagnostics")
 def api_developer_diagnostics():
     config = load_config()
-    positions = get_position()
+    positions = get_position() if scanner_market_is_open() else None
     with BOT_LOCK:
         bot_snapshot = {
             "current_signal": BOT_STATE["current_signal"],
@@ -4851,6 +4933,8 @@ def api_developer_diagnostics():
 
 @app.route("/api/current-position")
 def api_current_position():
+    if not scanner_market_is_open():
+        return jsonify({"positions": [], "market_open": False, "status": "MARKET_CLOSED"})
     positions = get_position()
     if not positions:
         return jsonify({"positions": []})
@@ -4864,13 +4948,16 @@ def api_current_position():
 def api_quote():
     config = load_config()
     symbol = request.args.get("symbol", config["symbol"]).upper()
+    if not scanner_market_is_open():
+        return jsonify({"quote": None, "market_open": False, "status": "MARKET_CLOSED", "symbol": symbol})
     quote = get_market_quote(symbol)
-    return jsonify({"quote": quote})
+    return jsonify({"quote": quote, "market_open": True, "symbol": symbol})
 
 
 @app.route("/api/market-structure")
 def api_market_structure():
-    quote = get_market_quote(load_config()["symbol"])
+    market_open = scanner_market_is_open()
+    quote = get_market_quote(load_config()["symbol"]) if market_open else None
 
     with BOT_LOCK:
         market_context = dict(BOT_STATE["market_context"])
@@ -4893,7 +4980,9 @@ def api_market_structure():
         "confidence": market_context.get("confidence"),
         "dominance_percent": market_context.get("dominance_percent"),
         "current_signal": market_context.get("current_signal"),
-        "reasons": market_context.get("decision_reasons") or market_context.get("reasons", [])
+        "reasons": market_context.get("decision_reasons") or market_context.get("reasons", []),
+        "market_open": market_open,
+        "status": "OPEN" if market_open else "MARKET_CLOSED"
     })
 
 
@@ -4906,6 +4995,9 @@ def api_chain():
 
     if not expiration:
         return jsonify({"options": []})
+
+    if not scanner_market_is_open():
+        return jsonify({"options": [], "market_open": False, "status": "MARKET_CLOSED"})
 
     chain = get_option_chain(symbol, expiration)
     filtered = []
@@ -6206,10 +6298,11 @@ def dashboard():
     s = config["strategy"]
     e = config["entry_rules"]
 
-    quote = get_market_quote(symbol)
-    positions = get_position()
-    call = select_atm_contract(symbol, "CALL")
-    put = select_atm_contract(symbol, "PUT")
+    market_open = scanner_market_is_open()
+    quote = get_market_quote(symbol) if market_open else None
+    positions = get_position() if market_open else None
+    call = select_atm_contract(symbol, "CALL") if market_open else None
+    put = select_atm_contract(symbol, "PUT") if market_open else None
     sync_trade_limits_from_file(config)
     tournament_health = tournament_health_snapshot()
 

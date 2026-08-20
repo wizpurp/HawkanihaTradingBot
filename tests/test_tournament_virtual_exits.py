@@ -252,7 +252,7 @@ class TournamentVirtualExitsTest(unittest.TestCase):
         self.open_position("BOT_B_MOMENTUM", symbol="SAMECALL")
         dashboard.TOURNAMENT_RUNTIME_STATES = self.states
         dashboard.TOURNAMENT_RUNTIME_STATES_LOADED = True
-        with patch.object(dashboard, "TOURNAMENT_TRADES_FILE", self.trades_path), patch.object(dashboard, "TOURNAMENT_STATE_FILE", os.path.join(self.tempdir.name, "state.json")), patch.object(dashboard, "get_market_quote", return_value={"bid": 1.01}) as quote_mock:
+        with patch.object(dashboard, "TOURNAMENT_TRADES_FILE", self.trades_path), patch.object(dashboard, "TOURNAMENT_STATE_FILE", os.path.join(self.tempdir.name, "state.json")), patch.object(dashboard, "option_market_is_open", return_value=True), patch.object(dashboard, "get_market_quote", return_value={"bid": 1.01}) as quote_mock:
             dashboard.process_tournament_virtual_exit_poll()
         self.assertEqual(quote_mock.call_count, 1)
 
