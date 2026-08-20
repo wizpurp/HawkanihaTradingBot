@@ -15,6 +15,8 @@ from tournament.state import create_all_initial_states, load_tournament_state
 
 class TournamentEvaluatorTest(unittest.TestCase):
     def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.profiles_path = os.path.join(self.tempdir.name, "missing_tournament_profiles.json")
         self.runtime_config = {
             "symbol": "SPY",
             "bot_enabled": True,
@@ -30,8 +32,11 @@ class TournamentEvaluatorTest(unittest.TestCase):
             },
             "bot_starting_account_balance": 1000.0,
         }
-        self.profiles = build_tournament_profiles(self.runtime_config)
+        self.profiles = build_tournament_profiles(self.runtime_config, settings_path=self.profiles_path)
         self.states = create_all_initial_states(self.profiles)
+
+    def tearDown(self):
+        self.tempdir.cleanup()
 
     def snapshot(self, **overrides):
         values = {

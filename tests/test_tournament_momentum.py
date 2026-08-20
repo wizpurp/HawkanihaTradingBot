@@ -1,3 +1,5 @@
+import os
+import tempfile
 import unittest
 from dataclasses import replace
 from datetime import datetime
@@ -114,8 +116,13 @@ def snapshot_with_put_symbol(symbol, put_mid=1.0, locked_quotes=None, quote_time
 
 class TournamentMomentumTest(unittest.TestCase):
     def setUp(self):
-        self.profiles = build_tournament_profiles(runtime_config())
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.profiles_path = os.path.join(self.tempdir.name, "missing_tournament_profiles.json")
+        self.profiles = build_tournament_profiles(runtime_config(), settings_path=self.profiles_path)
         self.states = create_all_initial_states(self.profiles)
+
+    def tearDown(self):
+        self.tempdir.cleanup()
 
     def decisions_with_momentum(self, snap, now_epoch):
         decisions = evaluate_all_profiles(self.profiles, self.states, snap)

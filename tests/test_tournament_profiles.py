@@ -11,6 +11,8 @@ from tournament.state import create_all_initial_states, load_tournament_state, s
 
 class TournamentProfilesTest(unittest.TestCase):
     def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.profiles_path = os.path.join(self.tempdir.name, "missing_tournament_profiles.json")
         self.runtime_config = {
             "symbol": "SPY",
             "minimum_confidence": 4,
@@ -36,7 +38,10 @@ class TournamentProfilesTest(unittest.TestCase):
             },
             "contract_selection_mode": "strict_atm",
         }
-        self.profiles = build_tournament_profiles(self.runtime_config)
+        self.profiles = build_tournament_profiles(self.runtime_config, settings_path=self.profiles_path)
+
+    def tearDown(self):
+        self.tempdir.cleanup()
 
     def test_exactly_four_profiles_are_created(self):
         self.assertEqual(
