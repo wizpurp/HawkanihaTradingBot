@@ -52,6 +52,12 @@ from tournament.trades import (
     save_tournament_trades,
     update_tournament_trade,
 )
+from shadow_research.recorder import (
+    SHADOW_CANDIDATES_FILE,
+    recover_shadow_candidates,
+    record_shadow_research,
+    shadow_summary,
+)
 
 load_dotenv()
 
@@ -237,7 +243,16 @@ BOT_STATE = {
     "market_session_open": None,
     "market_session_status": "UNKNOWN",
     "market_session_last_transition": "",
-    "market_closed_sleep_seconds": MARKET_CLOSED_SLEEP_SECONDS
+    "market_closed_sleep_seconds": MARKET_CLOSED_SLEEP_SECONDS,
+    "shadow_research": {
+        "candidates_today": 0,
+        "completed_candidates": 0,
+        "active_candidates": 0,
+        "plus_5_before_minus_5_success_rate": 0,
+        "average_5m_mfe": 0,
+        "average_5m_mae": 0,
+        "latest_candidates": [],
+    }
 }
 TOURNAMENT_RUNTIME_STATES = {}
 TOURNAMENT_RUNTIME_STATES_LOADED = False
@@ -1066,6 +1081,65 @@ def update_market_session_state(is_open, log_transition=True):
 
 def scanner_market_is_open(log_transition=True):
     return update_market_session_state(option_market_is_open(), log_transition=log_transition)
+
+
+def update_shadow_research(signal=None, call_contract=None, put_contract=None, spy_price=None):
+    if not scanner_market_is_open(log_transition=False):
+        return {"created": False, "updated": False, "active": 0, "completed": 0}
+
+    signal = dict(signal or {})
+    if not signal.get("symbol"):
+        signal["symbol"] = load_config().get("symbol", "SPY")
+    contracts_by_direction = {
+        "CALL": call_contract,
+        "PUT": put_contract,
+    }
+    summary = record_shadow_research(
+        signal,
+        contracts_by_direction,
+        get_market_quote,
+        spy_price,
+        True,
+        time.time(),
+        market_now(),
+        SHADOW_CANDIDATES_FILE,
+    )
+    with BOT_LOCK:
+        BOT_STATE["shadow_research"] = shadow_summary(
+            SHADOW_CANDIDATES_FILE,
+            today=market_now().date().isoformat(),
+            limit=20,
+        )
+    return summary
+
+
+def recover_shadow_research_on_startup():
+    if not scanner_market_is_open(log_transition=False):
+        with BOT_LOCK:
+            BOT_STATE["shadow_research"] = shadow_summary(
+                SHADOW_CANDIDATES_FILE,
+                today=market_now().date().isoformat(),
+                limit=20,
+            )
+        return False
+
+    def spy_price_provider(symbol):
+        return get_quote_price(get_market_quote(symbol))
+
+    changed = recover_shadow_candidates(
+        get_market_quote,
+        spy_price_provider,
+        True,
+        time.time(),
+        SHADOW_CANDIDATES_FILE,
+    )
+    with BOT_LOCK:
+        BOT_STATE["shadow_research"] = shadow_summary(
+            SHADOW_CANDIDATES_FILE,
+            today=market_now().date().isoformat(),
+            limit=20,
+        )
+    return changed
 
 
 def submit_and_parse_option_order(option_symbol, qty, action, label):
@@ -2420,6 +2494,14 @@ def empty_market_context(price=None):
         "ema_state": "NEUTRAL",
         "ma_state": "NEUTRAL",
         "macd_state": "NEUTRAL",
+        "ema_value": None,
+        "ema_slope": None,
+        "ma_value": None,
+        "ma_slope": None,
+        "macd_value": None,
+        "macd_signal_value": None,
+        "macd_histogram": None,
+        "macd_histogram_slope": None,
         "vwap_state": "NEUTRAL",
         "volume_state": "NEUTRAL",
         "opening_direction": "NEUTRAL",
@@ -2535,6 +2617,10 @@ def build_market_context(config, positions=None):
     ma_fast = moving_average(prices, s.get("ma_fast", 5))
     ma_medium = moving_average(prices, s.get("ma_medium", 10))
     ma_slow = moving_average(prices, s.get("ma_slow", 20))
+    previous_ema_fast = exponential_average(prices[:-1], s.get("ema_fast", 1)) if len(prices) > 1 else None
+    previous_ma_fast = moving_average(prices[:-1], s.get("ma_fast", 5)) if len(prices) > 1 else None
+    ema_slope = ema_fast - previous_ema_fast if ema_fast is not None and previous_ema_fast is not None else None
+    ma_slope = ma_fast - previous_ma_fast if ma_fast is not None and previous_ma_fast is not None else None
 
     ema_bullish = ema_fast > ema_medium > ema_slow
     ema_bearish = ema_fast < ema_medium < ema_slow
@@ -2555,6 +2641,10 @@ def build_market_context(config, positions=None):
         bullish_score, bearish_score = add_score(reasons, "bearish", "MA aligned bearish", bullish_score, bearish_score)
 
     macd_state = "NEUTRAL"
+    macd_value = None
+    macd_signal_value = None
+    macd_histogram = None
+    macd_histogram_slope = None
     if s.get("use_macd", False) and e.get("macd_confirmation", True):
         macd_fast = exponential_average(prices, 12)
         macd_slow = exponential_average(prices, 26)
@@ -2704,6 +2794,14 @@ def build_market_context(config, positions=None):
         "ema_state": ema_state,
         "ma_state": ma_state,
         "macd_state": macd_state,
+        "ema_value": ema_fast,
+        "ema_slope": ema_slope,
+        "ma_value": ma_fast,
+        "ma_slope": ma_slope,
+        "macd_value": macd_value,
+        "macd_signal_value": macd_signal_value,
+        "macd_histogram": macd_histogram,
+        "macd_histogram_slope": macd_histogram_slope,
         "vwap_state": vwap_state,
         "volume_state": volume_state,
         "opening_direction": opening_direction,
@@ -4625,6 +4723,10 @@ def surfer_bot_tick(allow_entry=True):
     signal = normalize_signal(signal)
     update_bot_signal_state(signal, call_cost, put_cost)
     try:
+        update_shadow_research(signal, call, put, price)
+    except Exception as error:
+        print("SHADOW RESEARCH ERROR:", error)
+    try:
         evaluate_tournament_decisions(config, signal, call, put)
     except Exception as error:
         print("TOURNAMENT ERROR:", error)
@@ -4881,6 +4983,11 @@ def api_bot_state():
             "tournament_virtual_positions": list(BOT_STATE["tournament_virtual_positions"]),
             "tournament_state_by_profile": dict(BOT_STATE["tournament_state_by_profile"]),
             "tournament_health": tournament_health,
+            "shadow_research": dict(BOT_STATE.get("shadow_research") or shadow_summary(
+                SHADOW_CANDIDATES_FILE,
+                today=market_now().date().isoformat(),
+                limit=20,
+            )),
             "history_limits": {
                 "pending_entry_limit": pending_history_limit,
                 "bot_trades_limit": bot_trades_limit,
@@ -5962,6 +6069,42 @@ Final Status: {escape_html(final_status)}
     return "".join(html)
 
 
+def render_shadow_research_panel(summary):
+    summary = summary or {}
+    rows = list(summary.get("latest_candidates") or [])[:20]
+    latest_html = []
+    for row in rows:
+        latest_html.append(f"""
+<div class="trade-card bot">
+{escape_html(row.get("timestamp", ""))}<br>
+{escape_html(row.get("direction", ""))} {escape_html(row.get("option_symbol", ""))}<br>
+Status: {escape_html(row.get("status", ""))}<br>
+SPY: {fmt_premium(row.get("spy_price"))}<br>
+Option Start: {fmt_premium(row.get("starting_option_price") or row.get("option_midpoint"))}<br>
+MFE 5m: {fmt_percent(row.get("maximum_favorable_excursion_5m") or row.get("mfe_percent"))}<br>
+MAE 5m: {fmt_percent(row.get("maximum_adverse_excursion_5m") or row.get("mae_percent"))}<br>
++5 Before -5: {escape_html(row.get("hit_plus_5_before_minus_5", ""))}<br>
+Class: {escape_html(row.get("classification", ""))}
+</div>
+""")
+    if not latest_html:
+        latest_html.append("No shadow candidates recorded.")
+
+    return f"""
+Candidates Today: <span id="shadow-candidates-today">{escape_html(summary.get("candidates_today", 0))}</span><br>
+Completed Candidates: <span id="shadow-completed-candidates">{escape_html(summary.get("completed_candidates", 0))}</span><br>
+Active Candidates: <span id="shadow-active-candidates">{escape_html(summary.get("active_candidates", 0))}</span><br>
++5 Before -5 Success Rate: <span id="shadow-plus5-rate">{fmt_percent(summary.get("plus_5_before_minus_5_success_rate"))}</span><br>
+Average 5m MFE: <span id="shadow-average-mfe">{fmt_percent(summary.get("average_5m_mfe"))}</span><br>
+Average 5m MAE: <span id="shadow-average-mae">{fmt_percent(summary.get("average_5m_mae"))}</span><br>
+<br>
+Latest 20 Candidates:
+<div class="history-panel shadow-research-panel" id="shadow-research-latest">
+{''.join(latest_html)}
+</div>
+"""
+
+
 def load_bot_audit_rows(limit=None):
     try:
         return load_bot_audit_view_rows(limit)
@@ -6359,6 +6502,11 @@ def dashboard():
             "tournament_virtual_positions": list(BOT_STATE["tournament_virtual_positions"]),
             "tournament_state_by_profile": dict(BOT_STATE["tournament_state_by_profile"]),
             "tournament_health": tournament_health,
+            "shadow_research": dict(BOT_STATE.get("shadow_research") or shadow_summary(
+                SHADOW_CANDIDATES_FILE,
+                today=market_now().date().isoformat(),
+                limit=20,
+            )),
             "config_strategy": dict(config.get("strategy", {}))
         }
 
@@ -7174,6 +7322,13 @@ Bot Reason Log:<br>
 </div>
 
 <div class="card">
+<h2>Shadow Research</h2>
+<div id="shadow-research-content">
+{render_shadow_research_panel(bot_snapshot.get("shadow_research"))}
+</div>
+</div>
+
+<div class="card">
 <h2>Pending Entry (LIVE)</h2>
 <div id="pending-entry-live-content">
 {render_current_pending_entry(bot_snapshot.get("pending_entry"))}
@@ -7692,6 +7847,38 @@ ${{cancelLine}}
     }}).join("");
 }}
 
+function renderShadowResearch(summary) {{
+    const el = document.getElementById("shadow-research-content");
+    if (!el) return;
+    summary = summary || {{}};
+    const rows = (summary.latest_candidates || []).slice(0, 20);
+    const latest = rows.length ? rows.map((row) => `
+<div class="trade-card bot">
+${{escapeHtml(row.timestamp || "")}}<br>
+${{escapeHtml(row.direction || "")}} ${{escapeHtml(row.option_symbol || "")}}<br>
+Status: ${{escapeHtml(row.status || "")}}<br>
+SPY: ${{fmtMoney(row.spy_price)}}<br>
+Option Start: ${{fmtMoney(row.starting_option_price || row.option_midpoint)}}<br>
+MFE 5m: ${{fmtPercent(row.maximum_favorable_excursion_5m || row.mfe_percent)}}<br>
+MAE 5m: ${{fmtPercent(row.maximum_adverse_excursion_5m || row.mae_percent)}}<br>
++5 Before -5: ${{escapeHtml(row.hit_plus_5_before_minus_5 || "")}}<br>
+Class: ${{escapeHtml(row.classification || "")}}
+</div>`).join("") : "No shadow candidates recorded.";
+
+    el.innerHTML = `
+Candidates Today: <span id="shadow-candidates-today">${{escapeHtml(summary.candidates_today ?? 0)}}</span><br>
+Completed Candidates: <span id="shadow-completed-candidates">${{escapeHtml(summary.completed_candidates ?? 0)}}</span><br>
+Active Candidates: <span id="shadow-active-candidates">${{escapeHtml(summary.active_candidates ?? 0)}}</span><br>
++5 Before -5 Success Rate: <span id="shadow-plus5-rate">${{fmtPercent(summary.plus_5_before_minus_5_success_rate)}}</span><br>
+Average 5m MFE: <span id="shadow-average-mfe">${{fmtPercent(summary.average_5m_mfe)}}</span><br>
+Average 5m MAE: <span id="shadow-average-mae">${{fmtPercent(summary.average_5m_mae)}}</span><br>
+<br>
+Latest 20 Candidates:
+<div class="history-panel shadow-research-panel" id="shadow-research-latest">
+${{latest}}
+</div>`;
+}}
+
 const TOURNAMENT_PROFILES = [
     ["BOT_A_BASELINE", "Bot A Baseline"],
     ["BOT_B_MOMENTUM", "Bot B Momentum"],
@@ -7940,6 +8127,7 @@ async function updateBotState() {{
     const pendingHistoryLimit = Number(data.history_limits?.pending_entry_limit || {DEFAULT_HISTORY_LIMIT});
     renderPendingEntry(data.pending_entry);
     renderPendingEntryHistory(data.pending_entry_history, pendingHistoryLimit);
+    renderShadowResearch(data.shadow_research);
     renderTournamentDecisions(data.tournament_decisions, data.tournament_decisions_evaluated_by_profile, data.tournament_profile_settings, data.tournament_state_by_profile);
     renderTournamentCandidateTransitions(data.tournament_state_by_profile);
     renderTournamentHealth(data.tournament_health);
@@ -8143,6 +8331,7 @@ document.addEventListener("DOMContentLoaded", async () => {{
 
 if __name__ == "__main__":
     initialize_pending_entry_history()
+    recover_shadow_research_on_startup()
     initialize_tournament_recovery()
     atexit.register(shutdown_tournament_monitors)
     threading.Thread(target=surfer_bot_loop, daemon=True).start()

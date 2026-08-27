@@ -44,4 +44,5 @@ Thumbs.db
 *.tmp
 *.bak
 data/tournament_profiles.backup.json
+data/shadow_candidates.csv
 config.backup.json

@@ -1,0 +1,1 @@
+"""Shadow candidate research recorder."""
