@@ -7,11 +7,9 @@ from datetime import datetime
 
 CHECKPOINT_SECONDS = (15, 30, 60, 120, 300)
 OBSERVATION_SECONDS = 300
-SHADOW_CANDIDATES_FILE = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "data",
-    "shadow_candidates.csv",
-)
+APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SHADOW_CANDIDATES_FILE = os.path.join(APP_DIR, "data", "shadow_candidates.csv")
+SHADOW_CANDIDATE_QUOTES_FILE = os.path.join(APP_DIR, "data", "shadow_candidate_quotes.csv")
 
 BASE_COLUMNS = [
     "candidate_id",
@@ -77,6 +75,15 @@ BASE_COLUMNS = [
     "first_minus_4_epoch",
     "first_plus_10_epoch",
     "first_minus_5_for_10_epoch",
+    "time_to_plus_3_seconds",
+    "time_to_minus_3_seconds",
+    "time_to_plus_5_seconds",
+    "time_to_minus_5_seconds",
+    "time_to_plus_8_seconds",
+    "time_to_minus_4_seconds",
+    "time_to_plus_10_seconds",
+    "time_to_maximum_favorable_excursion_seconds",
+    "time_to_maximum_adverse_excursion_seconds",
     "hit_plus_3_before_minus_3",
     "hit_plus_5_before_minus_5",
     "hit_plus_8_before_minus_4",
@@ -97,6 +104,14 @@ for checkpoint in CHECKPOINT_SECONDS:
     ])
 
 COLUMNS = BASE_COLUMNS + CHECKPOINT_COLUMNS
+QUOTE_PATH_COLUMNS = [
+    "candidate_id",
+    "timestamp",
+    "elapsed_seconds",
+    "option_symbol",
+    "option_price",
+    "spy_price",
+]
 
 
 def safe_float(value, default=None):
@@ -155,6 +170,34 @@ def save_candidates(rows, path=SHADOW_CANDIDATES_FILE):
     return rows
 
 
+def append_quote_path(candidate_id, timestamp, elapsed_seconds, option_symbol, option_price, spy_price, path=SHADOW_CANDIDATE_QUOTES_FILE):
+    if not candidate_id or option_price in (None, ""):
+        return None
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    exists = os.path.exists(path)
+    row = {
+        "candidate_id": candidate_id,
+        "timestamp": timestamp,
+        "elapsed_seconds": elapsed_seconds,
+        "option_symbol": option_symbol or "",
+        "option_price": option_price,
+        "spy_price": spy_price if spy_price is not None else "",
+    }
+    with open(path, "a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=QUOTE_PATH_COLUMNS, extrasaction="ignore")
+        if not exists:
+            writer.writeheader()
+        writer.writerow(row)
+    return row
+
+
+def load_quote_path(path=SHADOW_CANDIDATE_QUOTES_FILE):
+    if not os.path.exists(path):
+        return []
+    with open(path, "r", newline="", encoding="utf-8") as handle:
+        return list(csv.DictReader(handle))
+
+
 def normalize_row(row):
     normalized = {column: (row or {}).get(column, "") for column in COLUMNS}
     return normalized
@@ -174,7 +217,6 @@ def setup_fingerprint(signal, option_symbol):
     return "|".join([
         str((signal or {}).get("symbol") or "SPY").upper(),
         direction_from_decision(signal),
-        str(option_symbol or "").upper(),
         str(safe_int((signal or {}).get("bullish_score"))),
         str(safe_int((signal or {}).get("bearish_score"))),
         str(safe_int((signal or {}).get("confidence"))),
@@ -299,21 +341,27 @@ def percent_change(start, current):
     return ((current - start) / start) * 100
 
 
-def update_threshold_hits(row, now_epoch, mfe_percent, mae_percent):
-    if mfe_percent >= 3 and not row.get("first_plus_3_epoch"):
-        row["first_plus_3_epoch"] = now_epoch
-    if mae_percent >= 3 and not row.get("first_minus_3_epoch"):
-        row["first_minus_3_epoch"] = now_epoch
-    if mfe_percent >= 5 and not row.get("first_plus_5_epoch"):
-        row["first_plus_5_epoch"] = now_epoch
-    if mae_percent >= 5 and not row.get("first_minus_5_epoch"):
-        row["first_minus_5_epoch"] = now_epoch
-    if mfe_percent >= 8 and not row.get("first_plus_8_epoch"):
-        row["first_plus_8_epoch"] = now_epoch
-    if mae_percent >= 4 and not row.get("first_minus_4_epoch"):
-        row["first_minus_4_epoch"] = now_epoch
-    if mfe_percent >= 10 and not row.get("first_plus_10_epoch"):
-        row["first_plus_10_epoch"] = now_epoch
+def set_first_hit(row, epoch_key, seconds_key, now_epoch, created_epoch):
+    if not row.get(epoch_key):
+        row[epoch_key] = now_epoch
+        row[seconds_key] = max(0, int(round(now_epoch - created_epoch)))
+
+
+def update_threshold_hits(row, now_epoch, created_epoch, mfe_percent, mae_percent):
+    if mfe_percent >= 3:
+        set_first_hit(row, "first_plus_3_epoch", "time_to_plus_3_seconds", now_epoch, created_epoch)
+    if mae_percent >= 3:
+        set_first_hit(row, "first_minus_3_epoch", "time_to_minus_3_seconds", now_epoch, created_epoch)
+    if mfe_percent >= 5:
+        set_first_hit(row, "first_plus_5_epoch", "time_to_plus_5_seconds", now_epoch, created_epoch)
+    if mae_percent >= 5:
+        set_first_hit(row, "first_minus_5_epoch", "time_to_minus_5_seconds", now_epoch, created_epoch)
+    if mfe_percent >= 8:
+        set_first_hit(row, "first_plus_8_epoch", "time_to_plus_8_seconds", now_epoch, created_epoch)
+    if mae_percent >= 4:
+        set_first_hit(row, "first_minus_4_epoch", "time_to_minus_4_seconds", now_epoch, created_epoch)
+    if mfe_percent >= 10:
+        set_first_hit(row, "first_plus_10_epoch", "time_to_plus_10_seconds", now_epoch, created_epoch)
     if mae_percent >= 5 and not row.get("first_minus_5_for_10_epoch"):
         row["first_minus_5_for_10_epoch"] = now_epoch
 
@@ -324,19 +372,28 @@ def hit_before(row, plus_key, minus_key):
     return bool(plus is not None and (minus is None or plus <= minus))
 
 
+def threshold_was_hit(row, key):
+    return safe_float(row.get(key)) is not None
+
+
 def classify_candidate(row):
     mfe = safe_float(row.get("mfe_percent"), 0) or 0
     mae = safe_float(row.get("mae_percent"), 0) or 0
-    if mfe >= 8 and mae < 4:
-        return "STRONG_CONTINUATION"
-    if mfe >= 5:
-        return "WEAK_CONTINUATION"
+    plus_5_hit = threshold_was_hit(row, "first_plus_5_epoch")
+    minus_5_hit = threshold_was_hit(row, "first_minus_5_epoch")
+    plus_5_before_minus_5 = hit_before(row, "first_plus_5_epoch", "first_minus_5_epoch")
+
+    if minus_5_hit and not plus_5_before_minus_5:
+        if mfe >= 5:
+            return "ADVERSE_FIRST_RECOVERY"
+        return "IMMEDIATE_FAILURE"
+    if plus_5_hit and plus_5_before_minus_5:
+        if mfe >= 10:
+            return "CLEAN_STRONG_CONTINUATION"
+        return "CLEAN_WEAK_CONTINUATION"
     if mae >= 5 and mfe < 3:
         return "IMMEDIATE_FAILURE"
-    if mae >= 5 and mfe >= 5:
-        return "REVERSAL"
     return "CHOP"
-
 
 def finalize_candidate(row, now_epoch):
     row["status"] = "COMPLETED"
@@ -351,7 +408,7 @@ def finalize_candidate(row, now_epoch):
     return row
 
 
-def update_candidate(row, quote, spy_price, now_epoch):
+def update_candidate(row, quote, spy_price, now_epoch, quote_path=SHADOW_CANDIDATE_QUOTES_FILE, record_quote_path=True):
     row = normalize_row(row)
     created_epoch = safe_float(row.get("created_epoch"), now_epoch) or now_epoch
     age = now_epoch - created_epoch
@@ -362,20 +419,38 @@ def update_candidate(row, quote, spy_price, now_epoch):
         row["option_bid"] = safe_float((quote or {}).get("bid"), row.get("option_bid"))
         row["option_ask"] = safe_float((quote or {}).get("ask"), row.get("option_ask"))
         row["option_midpoint"] = option_price
-        highest = max(safe_float(row.get("highest_option_price_observed"), option_price) or option_price, option_price)
-        lowest = min(safe_float(row.get("lowest_option_price_observed"), option_price) or option_price, option_price)
-        row["highest_option_price_observed"] = highest
-        row["lowest_option_price_observed"] = lowest
-        start = safe_float(row.get("option_midpoint"), option_price) or option_price
-        original_start = safe_float(row.get("checkpoint_0_option_price"), None)
-        start_price = safe_float(row.get("starting_option_price"), None) or safe_float(row.get("option_midpoint"), option_price) or option_price
+        start_price = safe_float(row.get("starting_option_price"), None) or option_price
         if not row.get("starting_option_price"):
             row["starting_option_price"] = start_price
+        previous_high = safe_float(row.get("highest_option_price_observed"), start_price) or start_price
+        previous_low = safe_float(row.get("lowest_option_price_observed"), start_price) or start_price
+        if option_price > previous_high:
+            row["highest_option_price_observed"] = option_price
+            row["time_to_maximum_favorable_excursion_seconds"] = max(0, int(round(age)))
+        else:
+            row["highest_option_price_observed"] = previous_high
+        if option_price < previous_low:
+            row["lowest_option_price_observed"] = option_price
+            row["time_to_maximum_adverse_excursion_seconds"] = max(0, int(round(age)))
+        else:
+            row["lowest_option_price_observed"] = previous_low
+        highest = safe_float(row.get("highest_option_price_observed"), option_price) or option_price
+        lowest = safe_float(row.get("lowest_option_price_observed"), option_price) or option_price
         mfe_percent = max(0.0, percent_change(start_price, highest))
         mae_percent = max(0.0, -percent_change(start_price, lowest))
         row["mfe_percent"] = mfe_percent
         row["mae_percent"] = mae_percent
-        update_threshold_hits(row, now_epoch, mfe_percent, mae_percent)
+        update_threshold_hits(row, now_epoch, created_epoch, mfe_percent, mae_percent)
+        if record_quote_path:
+            append_quote_path(
+                row.get("candidate_id"),
+                iso_timestamp(datetime.fromtimestamp(now_epoch)),
+                max(0, int(round(age))),
+                row.get("option_symbol"),
+                option_price,
+                spy_price,
+                quote_path,
+            )
         for checkpoint in CHECKPOINT_SECONDS:
             if age >= checkpoint and not row.get(f"checkpoint_{checkpoint}_epoch"):
                 row[f"checkpoint_{checkpoint}_epoch"] = now_epoch
@@ -388,21 +463,21 @@ def update_candidate(row, quote, spy_price, now_epoch):
     return row
 
 
-def update_active_candidates(rows, quote_provider, spy_price, now_epoch):
+def update_active_candidates(rows, quote_provider, spy_price, now_epoch, quote_path=SHADOW_CANDIDATE_QUOTES_FILE):
     changed = False
     for index, row in enumerate(rows):
         if row.get("status") != "ACTIVE":
             continue
         symbol = row.get("option_symbol")
         quote = quote_provider(symbol) if symbol else None
-        updated = update_candidate(row, quote, spy_price, now_epoch)
+        updated = update_candidate(row, quote, spy_price, now_epoch, quote_path=quote_path)
         if updated != row:
             rows[index] = updated
             changed = True
     return changed
 
 
-def create_shadow_candidate_if_needed(signal, contract, now_epoch, now_dt, path=SHADOW_CANDIDATES_FILE):
+def create_shadow_candidate_if_needed(signal, contract, now_epoch, now_dt, path=SHADOW_CANDIDATES_FILE, quote_path=SHADOW_CANDIDATE_QUOTES_FILE, spy_price=None):
     direction = direction_from_decision(signal)
     if direction not in {"CALL", "PUT"} or not contract or not contract.get("symbol"):
         return None, False
@@ -423,26 +498,35 @@ def create_shadow_candidate_if_needed(signal, contract, now_epoch, now_dt, path=
     candidate["starting_option_price"] = candidate.get("option_midpoint", "")
     rows.append(candidate)
     save_candidates(rows, path)
+    append_quote_path(
+        candidate.get("candidate_id"),
+        candidate.get("timestamp"),
+        0,
+        candidate.get("option_symbol"),
+        candidate.get("starting_option_price"),
+        spy_price if spy_price is not None else candidate.get("spy_price"),
+        quote_path,
+    )
     return candidate, True
 
 
-def record_shadow_research(signal, contracts_by_direction, quote_provider, spy_price, market_open, now_epoch, now_dt, path=SHADOW_CANDIDATES_FILE):
+def record_shadow_research(signal, contracts_by_direction, quote_provider, spy_price, market_open, now_epoch, now_dt, path=SHADOW_CANDIDATES_FILE, quote_path=SHADOW_CANDIDATE_QUOTES_FILE):
     if not market_open:
         return {"created": False, "updated": False, "active": 0, "completed": 0}
     rows = load_candidates(path)
-    updated = update_active_candidates(rows, quote_provider, spy_price, now_epoch)
+    updated = update_active_candidates(rows, quote_provider, spy_price, now_epoch, quote_path=quote_path)
     if updated:
         save_candidates(rows, path)
     direction = direction_from_decision(signal)
     created = False
     if direction in {"CALL", "PUT"}:
         contract = (contracts_by_direction or {}).get(direction)
-        _, created = create_shadow_candidate_if_needed(signal, contract, now_epoch, now_dt, path)
+        _, created = create_shadow_candidate_if_needed(signal, contract, now_epoch, now_dt, path, quote_path, spy_price)
     summary = shadow_summary(path=path)
     return {"created": created, "updated": updated, **summary}
 
 
-def recover_shadow_candidates(quote_provider, spy_price_provider, market_open, now_epoch, path=SHADOW_CANDIDATES_FILE):
+def recover_shadow_candidates(quote_provider, spy_price_provider, market_open, now_epoch, path=SHADOW_CANDIDATES_FILE, quote_path=SHADOW_CANDIDATE_QUOTES_FILE):
     if not market_open:
         return False
     rows = load_candidates(path)
@@ -452,7 +536,7 @@ def recover_shadow_candidates(quote_provider, spy_price_provider, market_open, n
             continue
         spy_price = spy_price_provider(row.get("symbol"))
         quote = quote_provider(row.get("option_symbol")) if row.get("option_symbol") else None
-        updated = update_candidate(row, quote, spy_price, now_epoch)
+        updated = update_candidate(row, quote, spy_price, now_epoch, quote_path=quote_path)
         if updated != row:
             rows[index] = updated
             changed = True

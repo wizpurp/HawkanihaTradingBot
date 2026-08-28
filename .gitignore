@@ -45,4 +45,5 @@ Thumbs.db
 *.bak
 data/tournament_profiles.backup.json
 data/shadow_candidates.csv
+data/shadow_candidate_quotes.csv
 config.backup.json

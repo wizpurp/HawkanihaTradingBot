@@ -53,6 +53,7 @@ from tournament.trades import (
     update_tournament_trade,
 )
 from shadow_research.recorder import (
+    SHADOW_CANDIDATE_QUOTES_FILE,
     SHADOW_CANDIDATES_FILE,
     recover_shadow_candidates,
     record_shadow_research,
@@ -1103,6 +1104,7 @@ def update_shadow_research(signal=None, call_contract=None, put_contract=None, s
         time.time(),
         market_now(),
         SHADOW_CANDIDATES_FILE,
+        SHADOW_CANDIDATE_QUOTES_FILE,
     )
     with BOT_LOCK:
         BOT_STATE["shadow_research"] = shadow_summary(
@@ -1132,6 +1134,7 @@ def recover_shadow_research_on_startup():
         True,
         time.time(),
         SHADOW_CANDIDATES_FILE,
+        SHADOW_CANDIDATE_QUOTES_FILE,
     )
     with BOT_LOCK:
         BOT_STATE["shadow_research"] = shadow_summary(
@@ -5655,6 +5658,12 @@ def fmt_percent(value):
     return f"{safe_float(value):+.2f}%"
 
 
+def fmt_adverse_percent(value):
+    if value in (None, ""):
+        return "N/A"
+    return f"{-abs(safe_float(value)):.2f}%"
+
+
 def enrich_trade_rows(rows):
     open_buys = {}
     enriched = []
@@ -6080,9 +6089,11 @@ def render_shadow_research_panel(summary):
 {escape_html(row.get("direction", ""))} {escape_html(row.get("option_symbol", ""))}<br>
 Status: {escape_html(row.get("status", ""))}<br>
 SPY: {fmt_premium(row.get("spy_price"))}<br>
-Option Start: {fmt_premium(row.get("starting_option_price") or row.get("option_midpoint"))}<br>
-MFE 5m: {fmt_percent(row.get("maximum_favorable_excursion_5m") or row.get("mfe_percent"))}<br>
-MAE 5m: {fmt_percent(row.get("maximum_adverse_excursion_5m") or row.get("mae_percent"))}<br>
+Start: {fmt_premium(row.get("starting_option_price") or row.get("option_midpoint"))}<br>
+Best Move: {fmt_percent(row.get("maximum_favorable_excursion_5m") or row.get("mfe_percent"))} at {escape_html(row.get("time_to_maximum_favorable_excursion_seconds", ""))}s<br>
+Worst Move: {fmt_adverse_percent(row.get("maximum_adverse_excursion_5m") or row.get("mae_percent"))} at {escape_html(row.get("time_to_maximum_adverse_excursion_seconds", ""))}s<br>
+Time to +5%: {escape_html(row.get("time_to_plus_5_seconds", ""))}s<br>
+Time to -5%: {escape_html(row.get("time_to_minus_5_seconds", ""))}s<br>
 +5 Before -5: {escape_html(row.get("hit_plus_5_before_minus_5", ""))}<br>
 Class: {escape_html(row.get("classification", ""))}
 </div>
@@ -6096,7 +6107,7 @@ Completed Candidates: <span id="shadow-completed-candidates">{escape_html(summar
 Active Candidates: <span id="shadow-active-candidates">{escape_html(summary.get("active_candidates", 0))}</span><br>
 +5 Before -5 Success Rate: <span id="shadow-plus5-rate">{fmt_percent(summary.get("plus_5_before_minus_5_success_rate"))}</span><br>
 Average 5m MFE: <span id="shadow-average-mfe">{fmt_percent(summary.get("average_5m_mfe"))}</span><br>
-Average 5m MAE: <span id="shadow-average-mae">{fmt_percent(summary.get("average_5m_mae"))}</span><br>
+Average 5m MAE: <span id="shadow-average-mae">{fmt_adverse_percent(summary.get("average_5m_mae"))}</span><br>
 <br>
 Latest 20 Candidates:
 <div class="history-panel shadow-research-panel" id="shadow-research-latest">
@@ -7847,6 +7858,11 @@ ${{cancelLine}}
     }}).join("");
 }}
 
+function fmtAdversePercent(value) {{
+    if (value === null || value === undefined || value === "") return "N/A";
+    return `${{(-Math.abs(Number(value || 0))).toFixed(2)}}%`;
+}}
+
 function renderShadowResearch(summary) {{
     const el = document.getElementById("shadow-research-content");
     if (!el) return;
@@ -7858,9 +7874,11 @@ ${{escapeHtml(row.timestamp || "")}}<br>
 ${{escapeHtml(row.direction || "")}} ${{escapeHtml(row.option_symbol || "")}}<br>
 Status: ${{escapeHtml(row.status || "")}}<br>
 SPY: ${{fmtMoney(row.spy_price)}}<br>
-Option Start: ${{fmtMoney(row.starting_option_price || row.option_midpoint)}}<br>
-MFE 5m: ${{fmtPercent(row.maximum_favorable_excursion_5m || row.mfe_percent)}}<br>
-MAE 5m: ${{fmtPercent(row.maximum_adverse_excursion_5m || row.mae_percent)}}<br>
+Start: ${{fmtMoney(row.starting_option_price || row.option_midpoint)}}<br>
+Best Move: ${{fmtPercent(row.maximum_favorable_excursion_5m || row.mfe_percent)}} at ${{escapeHtml(row.time_to_maximum_favorable_excursion_seconds || "")}}s<br>
+Worst Move: ${{fmtAdversePercent(row.maximum_adverse_excursion_5m || row.mae_percent)}} at ${{escapeHtml(row.time_to_maximum_adverse_excursion_seconds || "")}}s<br>
+Time to +5%: ${{escapeHtml(row.time_to_plus_5_seconds || "")}}s<br>
+Time to -5%: ${{escapeHtml(row.time_to_minus_5_seconds || "")}}s<br>
 +5 Before -5: ${{escapeHtml(row.hit_plus_5_before_minus_5 || "")}}<br>
 Class: ${{escapeHtml(row.classification || "")}}
 </div>`).join("") : "No shadow candidates recorded.";
@@ -7871,7 +7889,7 @@ Completed Candidates: <span id="shadow-completed-candidates">${{escapeHtml(summa
 Active Candidates: <span id="shadow-active-candidates">${{escapeHtml(summary.active_candidates ?? 0)}}</span><br>
 +5 Before -5 Success Rate: <span id="shadow-plus5-rate">${{fmtPercent(summary.plus_5_before_minus_5_success_rate)}}</span><br>
 Average 5m MFE: <span id="shadow-average-mfe">${{fmtPercent(summary.average_5m_mfe)}}</span><br>
-Average 5m MAE: <span id="shadow-average-mae">${{fmtPercent(summary.average_5m_mae)}}</span><br>
+Average 5m MAE: <span id="shadow-average-mae">${{fmtAdversePercent(summary.average_5m_mae)}}</span><br>
 <br>
 Latest 20 Candidates:
 <div class="history-panel shadow-research-panel" id="shadow-research-latest">
