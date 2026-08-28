@@ -5664,6 +5664,12 @@ def fmt_adverse_percent(value):
     return f"{-abs(safe_float(value)):.2f}%"
 
 
+def fmt_seconds_or_na(value):
+    if value in (None, ""):
+        return "N/A"
+    return f"{escape_html(value)}s"
+
+
 def enrich_trade_rows(rows):
     open_buys = {}
     enriched = []
@@ -6088,12 +6094,15 @@ def render_shadow_research_panel(summary):
 {escape_html(row.get("timestamp", ""))}<br>
 {escape_html(row.get("direction", ""))} {escape_html(row.get("option_symbol", ""))}<br>
 Status: {escape_html(row.get("status", ""))}<br>
+Data Quality: {escape_html(row.get("data_quality_status") or "OK")}<br>
+Invalid Quotes: {escape_html(row.get("invalid_quote_count") or 0)}<br>
+Last Invalid Quote Reason: {escape_html(row.get("last_invalid_quote_reason") or "N/A")}<br>
 SPY: {fmt_premium(row.get("spy_price"))}<br>
 Start: {fmt_premium(row.get("starting_option_price") or row.get("option_midpoint"))}<br>
-Best Move: {fmt_percent(row.get("maximum_favorable_excursion_5m") or row.get("mfe_percent"))} at {escape_html(row.get("time_to_maximum_favorable_excursion_seconds", ""))}s<br>
-Worst Move: {fmt_adverse_percent(row.get("maximum_adverse_excursion_5m") or row.get("mae_percent"))} at {escape_html(row.get("time_to_maximum_adverse_excursion_seconds", ""))}s<br>
-Time to +5%: {escape_html(row.get("time_to_plus_5_seconds", ""))}s<br>
-Time to -5%: {escape_html(row.get("time_to_minus_5_seconds", ""))}s<br>
+Best Move: {fmt_percent(row.get("maximum_favorable_excursion_5m") or row.get("mfe_percent"))} at {fmt_seconds_or_na(row.get("time_to_maximum_favorable_excursion_seconds"))}<br>
+Worst Move: {fmt_adverse_percent(row.get("maximum_adverse_excursion_5m") or row.get("mae_percent"))} at {fmt_seconds_or_na(row.get("time_to_maximum_adverse_excursion_seconds"))}<br>
+Time to +5%: {fmt_seconds_or_na(row.get("time_to_plus_5_seconds"))}<br>
+Time to -5%: {fmt_seconds_or_na(row.get("time_to_minus_5_seconds"))}<br>
 +5 Before -5: {escape_html(row.get("hit_plus_5_before_minus_5", ""))}<br>
 Class: {escape_html(row.get("classification", ""))}
 </div>
@@ -7866,6 +7875,11 @@ function fmtAdversePercent(value) {{
     return `${{(-Math.abs(Number(value || 0))).toFixed(2)}}%`;
 }}
 
+function fmtSecondsOrNa(value) {{
+    if (value === null || value === undefined || value === "") return "N/A";
+    return `${{escapeHtml(value)}}s`;
+}}
+
 let shadowAutoRefreshPaused = false;
 let latestShadowResearchData = null;
 
@@ -7905,12 +7919,15 @@ function renderShadowResearchNow(summary) {{
 ${{escapeHtml(row.timestamp || "")}}<br>
 ${{escapeHtml(row.direction || "")}} ${{escapeHtml(row.option_symbol || "")}}<br>
 Status: ${{escapeHtml(row.status || "")}}<br>
+Data Quality: ${{escapeHtml(row.data_quality_status || "OK")}}<br>
+Invalid Quotes: ${{escapeHtml(row.invalid_quote_count || 0)}}<br>
+Last Invalid Quote Reason: ${{escapeHtml(row.last_invalid_quote_reason || "N/A")}}<br>
 SPY: ${{fmtMoney(row.spy_price)}}<br>
 Start: ${{fmtMoney(row.starting_option_price || row.option_midpoint)}}<br>
-Best Move: ${{fmtPercent(row.maximum_favorable_excursion_5m || row.mfe_percent)}} at ${{escapeHtml(row.time_to_maximum_favorable_excursion_seconds || "")}}s<br>
-Worst Move: ${{fmtAdversePercent(row.maximum_adverse_excursion_5m || row.mae_percent)}} at ${{escapeHtml(row.time_to_maximum_adverse_excursion_seconds || "")}}s<br>
-Time to +5%: ${{escapeHtml(row.time_to_plus_5_seconds || "")}}s<br>
-Time to -5%: ${{escapeHtml(row.time_to_minus_5_seconds || "")}}s<br>
+Best Move: ${{fmtPercent(row.maximum_favorable_excursion_5m || row.mfe_percent)}} at ${{fmtSecondsOrNa(row.time_to_maximum_favorable_excursion_seconds)}}<br>
+Worst Move: ${{fmtAdversePercent(row.maximum_adverse_excursion_5m || row.mae_percent)}} at ${{fmtSecondsOrNa(row.time_to_maximum_adverse_excursion_seconds)}}<br>
+Time to +5%: ${{fmtSecondsOrNa(row.time_to_plus_5_seconds)}}<br>
+Time to -5%: ${{fmtSecondsOrNa(row.time_to_minus_5_seconds)}}<br>
 +5 Before -5: ${{escapeHtml(row.hit_plus_5_before_minus_5 || "")}}<br>
 Class: ${{escapeHtml(row.classification || "")}}
 </div>`).join("") : "No shadow candidates recorded.";

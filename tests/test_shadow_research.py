@@ -256,6 +256,76 @@ class ShadowResearchRecorderTest(unittest.TestCase):
         self.assertNotIn("shadowAutoRefreshPaused = false; submit_option_order", source)
         self.assertNotIn("shadowAutoRefreshPaused && submit_option_order", source)
 
+    def test_bogus_500_option_quote_cannot_create_impossible_mfe(self):
+        recorder.record_shadow_research(signal(), {"CALL": contract(bid=0.62, ask=0.62)}, self.quote_provider(0.62), 500.0, True, 1000, self.now, self.path, self.quote_path)
+        recorder.record_shadow_research({"decision": "DO NOTHING"}, {}, lambda symbol: {"symbol": symbol, "bid": 499.0, "ask": 501.0, "last": 500.0}, 501.0, True, 1010, self.now, self.path, self.quote_path)
+        row = recorder.load_candidates(self.path)[0]
+        self.assertLess(float(row["mfe_percent"]), 100)
+        self.assertEqual(int(row["invalid_quote_count"]), 1)
+        self.assertEqual(row["last_invalid_quote_reason"], "implausible one-tick price jump")
+
+    def test_rejected_quotes_do_not_trigger_thresholds(self):
+        recorder.record_shadow_research(signal(), {"CALL": contract(bid=1.0, ask=1.0)}, self.quote_provider(1.0), 500.0, True, 1000, self.now, self.path, self.quote_path)
+        recorder.record_shadow_research({"decision": "DO NOTHING"}, {}, lambda symbol: {"symbol": symbol, "bid": 499.0, "ask": 501.0, "last": 500.0}, 501.0, True, 1010, self.now, self.path, self.quote_path)
+        row = recorder.load_candidates(self.path)[0]
+        self.assertEqual(row["first_plus_3_epoch"], "")
+        self.assertEqual(row["first_plus_5_epoch"], "")
+        self.assertEqual(row["first_plus_8_epoch"], "")
+        self.assertEqual(row["first_plus_10_epoch"], "")
+
+    def test_rejected_quotes_do_not_affect_mfe_mae_or_classification(self):
+        recorder.record_shadow_research(signal(), {"CALL": contract(bid=1.0, ask=1.0)}, self.quote_provider(1.0), 500.0, True, 1000, self.now, self.path, self.quote_path)
+        recorder.record_shadow_research({"decision": "DO NOTHING"}, {}, self.quote_provider(1.04), 501.0, True, 1010, self.now, self.path, self.quote_path)
+        recorder.record_shadow_research({"decision": "DO NOTHING"}, {}, lambda symbol: {"symbol": symbol, "bid": 499.0, "ask": 501.0, "last": 500.0}, 502.0, True, 1020, self.now, self.path, self.quote_path)
+        recorder.record_shadow_research({"decision": "DO NOTHING"}, {}, self.quote_provider(1.04), 501.0, True, 1300, self.now, self.path, self.quote_path)
+        row = recorder.load_candidates(self.path)[0]
+        self.assertAlmostEqual(float(row["mfe_percent"]), 4.0, places=3)
+        self.assertEqual(float(row["mae_percent"]), 0.0)
+        self.assertEqual(row["classification"], "CHOP")
+
+    def test_legitimate_fast_0dte_move_is_accepted(self):
+        recorder.record_shadow_research(signal(), {"CALL": contract(bid=0.20, ask=0.20)}, self.quote_provider(0.20), 500.0, True, 1000, self.now, self.path, self.quote_path)
+        recorder.record_shadow_research({"decision": "DO NOTHING"}, {}, self.quote_provider(1.50), 505.0, True, 1001, self.now, self.path, self.quote_path)
+        row = recorder.load_candidates(self.path)[0]
+        self.assertEqual(int(row["invalid_quote_count"]), 0)
+        self.assertGreater(float(row["mfe_percent"]), 600)
+
+    def test_first_valid_observation_after_rejected_quote_resumes_tracking(self):
+        recorder.record_shadow_research(signal(), {"CALL": contract(bid=1.0, ask=1.0)}, self.quote_provider(1.0), 500.0, True, 1000, self.now, self.path, self.quote_path)
+        recorder.record_shadow_research({"decision": "DO NOTHING"}, {}, lambda symbol: {"symbol": symbol, "bid": 499.0, "ask": 501.0, "last": 500.0}, 501.0, True, 1010, self.now, self.path, self.quote_path)
+        recorder.record_shadow_research({"decision": "DO NOTHING"}, {}, self.quote_provider(1.07), 502.0, True, 1020, self.now, self.path, self.quote_path)
+        row = recorder.load_candidates(self.path)[0]
+        self.assertAlmostEqual(float(row["mfe_percent"]), 7.0, places=3)
+        self.assertEqual(int(float(row["time_to_plus_5_seconds"])), 20)
+
+    def test_invalid_quote_path_rows_are_not_written(self):
+        recorder.record_shadow_research(signal(), {"CALL": contract(bid=1.0, ask=1.0)}, self.quote_provider(1.0), 500.0, True, 1000, self.now, self.path, self.quote_path)
+        recorder.record_shadow_research({"decision": "DO NOTHING"}, {}, lambda symbol: {"symbol": symbol, "bid": 499.0, "ask": 501.0, "last": 500.0}, 501.0, True, 1010, self.now, self.path, self.quote_path)
+        quote_rows = recorder.load_quote_path(self.quote_path)
+        self.assertEqual(len(quote_rows), 1)
+        self.assertEqual(quote_rows[0]["option_price"], "1.0")
+
+    def test_ask_below_bid_is_rejected(self):
+        recorder.record_shadow_research(signal(), {"CALL": contract(bid=1.0, ask=1.0)}, self.quote_provider(1.0), 500.0, True, 1000, self.now, self.path, self.quote_path)
+        recorder.record_shadow_research({"decision": "DO NOTHING"}, {}, lambda symbol: {"symbol": symbol, "bid": 1.20, "ask": 1.00, "last": 1.10}, 501.0, True, 1010, self.now, self.path, self.quote_path)
+        row = recorder.load_candidates(self.path)[0]
+        self.assertEqual(row["last_invalid_quote_reason"], "ask below bid")
+
+    def test_historical_missing_timing_displays_na(self):
+        self.assertEqual(dashboard.fmt_seconds_or_na(""), "N/A")
+        html = dashboard.render_shadow_research_panel({
+            "latest_candidates": [{
+                "timestamp": "2026-08-28T10:00:00",
+                "direction": "CALL",
+                "option_symbol": "SPYTESTCALL",
+                "status": "COMPLETED",
+                "mfe_percent": 5,
+                "mae_percent": 2,
+            }]
+        })
+        self.assertIn("Best Move: +5.00% at N/A", html)
+        self.assertIn("Time to +5%: N/A", html)
+
     def test_restart_recovery_finalizes_old_candidate(self):
         recorder.record_shadow_research(signal(), {"CALL": contract(bid=1.0, ask=1.0)}, self.quote_provider(1.0), 500.0, True, 1000, self.now, self.path, self.quote_path)
         changed = recorder.recover_shadow_candidates(

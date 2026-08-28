@@ -7,6 +7,10 @@ from datetime import datetime
 
 CHECKPOINT_SECONDS = (15, 30, 60, 120, 300)
 OBSERVATION_SECONDS = 300
+MAX_ONE_TICK_PRICE_JUMP_MULTIPLE = 10.0
+MAX_SPREAD_TO_PREVIOUS_PRICE_RATIO = 3.0
+MAX_SPREAD_TO_MIDPOINT_RATIO = 2.0
+MAX_HISTORICAL_EXCURSION_PERCENT = 1000.0
 APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SHADOW_CANDIDATES_FILE = os.path.join(APP_DIR, "data", "shadow_candidates.csv")
 SHADOW_CANDIDATE_QUOTES_FILE = os.path.join(APP_DIR, "data", "shadow_candidate_quotes.csv")
@@ -91,6 +95,9 @@ BASE_COLUMNS = [
     "maximum_favorable_excursion_5m",
     "maximum_adverse_excursion_5m",
     "classification",
+    "invalid_quote_count",
+    "last_invalid_quote_reason",
+    "data_quality_status",
 ]
 
 CHECKPOINT_COLUMNS = []
@@ -111,6 +118,8 @@ QUOTE_PATH_COLUMNS = [
     "option_symbol",
     "option_price",
     "spy_price",
+    "valid",
+    "reject_reason",
 ]
 
 
@@ -153,6 +162,72 @@ def option_midpoint(contract_or_quote):
     return None, "NONE"
 
 
+def validate_option_observation(quote_or_contract, previous_valid_price=None):
+    quote_or_contract = quote_or_contract or {}
+    bid = safe_float(quote_or_contract.get("bid"))
+    ask = safe_float(quote_or_contract.get("ask"))
+    last = safe_float(quote_or_contract.get("last"))
+
+    if bid is not None and bid <= 0:
+        return None, "NONE", "invalid bid"
+    if ask is not None and ask <= 0:
+        return None, "NONE", "invalid ask"
+    if bid is not None and ask is not None and ask < bid:
+        return None, "NONE", "ask below bid"
+
+    price, source = option_midpoint(quote_or_contract)
+    if price is None:
+        return None, source, "price unavailable"
+    if price <= 0:
+        return None, source, "price non-positive"
+
+    if previous_valid_price and previous_valid_price > 0:
+        higher = max(price, previous_valid_price)
+        lower = min(price, previous_valid_price)
+        if lower > 0 and higher / lower > MAX_ONE_TICK_PRICE_JUMP_MULTIPLE:
+            return None, source, "implausible one-tick price jump"
+
+    if source == "MIDPOINT":
+        spread = ask - bid
+        midpoint_spread_ratio = spread / price if price else 0
+        if midpoint_spread_ratio > MAX_SPREAD_TO_MIDPOINT_RATIO:
+            return None, source, "spread exceeds midpoint guard"
+        if previous_valid_price and spread / previous_valid_price > MAX_SPREAD_TO_PREVIOUS_PRICE_RATIO:
+            return None, source, "spread exceeds previous-price guard"
+
+    return price, source, ""
+
+
+def mark_invalid_quote(row, quote, raw_price, previous_valid_price, reason):
+    previous_reason = row.get("last_invalid_quote_reason")
+    row["invalid_quote_count"] = safe_int(row.get("invalid_quote_count"), 0) + 1
+    row["last_invalid_quote_reason"] = reason
+    row["data_quality_status"] = row.get("data_quality_status") or "OK"
+    if previous_reason != reason:
+        print("SHADOW QUOTE REJECTED")
+        print("candidate_id:", row.get("candidate_id"))
+        print("option_symbol:", row.get("option_symbol"))
+        print("raw_bid:", (quote or {}).get("bid"))
+        print("raw_ask:", (quote or {}).get("ask"))
+        print("raw_price:", raw_price)
+        print("previous_valid_price:", previous_valid_price)
+        print("reason:", reason)
+    return row
+
+
+def flag_contaminated_historical_row(row):
+    if row.get("data_quality_status"):
+        return row
+    excursions = [
+        safe_float(row.get("mfe_percent"), 0) or 0,
+        safe_float(row.get("mae_percent"), 0) or 0,
+        safe_float(row.get("maximum_favorable_excursion_5m"), 0) or 0,
+        safe_float(row.get("maximum_adverse_excursion_5m"), 0) or 0,
+    ]
+    row["data_quality_status"] = "CONTAMINATED" if max(excursions) > MAX_HISTORICAL_EXCURSION_PERCENT else "OK"
+    return row
+
+
 def load_candidates(path=SHADOW_CANDIDATES_FILE):
     if not os.path.exists(path):
         return []
@@ -182,6 +257,8 @@ def append_quote_path(candidate_id, timestamp, elapsed_seconds, option_symbol, o
         "option_symbol": option_symbol or "",
         "option_price": option_price,
         "spy_price": spy_price if spy_price is not None else "",
+        "valid": True,
+        "reject_reason": "",
     }
     with open(path, "a", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=QUOTE_PATH_COLUMNS, extrasaction="ignore")
@@ -200,6 +277,9 @@ def load_quote_path(path=SHADOW_CANDIDATE_QUOTES_FILE):
 
 def normalize_row(row):
     normalized = {column: (row or {}).get(column, "") for column in COLUMNS}
+    normalized.setdefault("invalid_quote_count", 0)
+    normalized.setdefault("last_invalid_quote_reason", "")
+    normalized = flag_contaminated_historical_row(normalized)
     return normalized
 
 
@@ -253,7 +333,12 @@ def create_candidate(signal, contract, now_epoch, now_dt):
     symbol = str((signal or {}).get("symbol") or "SPY").upper()
     direction = direction_from_decision(signal)
     option_symbol = (contract or {}).get("symbol") or ""
+    validation_price, validation_source, validation_reason = validate_option_observation(contract)
+    if validation_reason:
+        return None
     bid, ask, midpoint, source, spread, spread_percent = spread_fields(contract)
+    midpoint = validation_price
+    source = validation_source
     levels = (signal or {}).get("levels") or {}
     ticks = (signal or {}).get("tick_statistics") or {}
     spy_price = safe_float((signal or {}).get("price"))
@@ -322,6 +407,9 @@ def create_candidate(signal, contract, now_epoch, now_dt):
         "lowest_option_price_observed": midpoint if midpoint is not None else "",
         "mfe_percent": 0,
         "mae_percent": 0,
+        "invalid_quote_count": 0,
+        "last_invalid_quote_reason": "",
+        "data_quality_status": "OK",
     })
     return row
 
@@ -412,13 +500,18 @@ def update_candidate(row, quote, spy_price, now_epoch, quote_path=SHADOW_CANDIDA
     row = normalize_row(row)
     created_epoch = safe_float(row.get("created_epoch"), now_epoch) or now_epoch
     age = now_epoch - created_epoch
-    option_price, source = current_option_price(row, quote)
-    if option_price is not None:
+    previous_valid_price = safe_float(row.get("option_midpoint")) or safe_float(row.get("starting_option_price"))
+    option_price, source, validation_reason = validate_option_observation(quote, previous_valid_price)
+    raw_price, _ = option_midpoint(quote)
+    if validation_reason:
+        mark_invalid_quote(row, quote, raw_price, previous_valid_price, validation_reason)
+    else:
         row["option_price_source"] = source
         row["updated_epoch"] = now_epoch
         row["option_bid"] = safe_float((quote or {}).get("bid"), row.get("option_bid"))
         row["option_ask"] = safe_float((quote or {}).get("ask"), row.get("option_ask"))
         row["option_midpoint"] = option_price
+        row["data_quality_status"] = "OK"
         start_price = safe_float(row.get("starting_option_price"), None) or option_price
         if not row.get("starting_option_price"):
             row["starting_option_price"] = start_price
@@ -456,12 +549,11 @@ def update_candidate(row, quote, spy_price, now_epoch, quote_path=SHADOW_CANDIDA
                 row[f"checkpoint_{checkpoint}_epoch"] = now_epoch
                 row[f"checkpoint_{checkpoint}_option_price"] = option_price
                 row[f"checkpoint_{checkpoint}_spy_price"] = spy_price if spy_price is not None else ""
-                row[f"checkpoint_{checkpoint}_mfe_percent"] = mfe_percent
-                row[f"checkpoint_{checkpoint}_mae_percent"] = mae_percent
+                row[f"checkpoint_{checkpoint}_mfe_percent"] = row.get("mfe_percent", 0)
+                row[f"checkpoint_{checkpoint}_mae_percent"] = row.get("mae_percent", 0)
     if age >= OBSERVATION_SECONDS and row.get("status") == "ACTIVE":
         finalize_candidate(row, now_epoch)
     return row
-
 
 def update_active_candidates(rows, quote_provider, spy_price, now_epoch, quote_path=SHADOW_CANDIDATE_QUOTES_FILE):
     changed = False
@@ -481,8 +573,8 @@ def create_shadow_candidate_if_needed(signal, contract, now_epoch, now_dt, path=
     direction = direction_from_decision(signal)
     if direction not in {"CALL", "PUT"} or not contract or not contract.get("symbol"):
         return None, False
-    option_price, _ = option_midpoint(contract)
-    if option_price is None:
+    option_price, _, validation_reason = validate_option_observation(contract)
+    if validation_reason:
         return None, False
     signal = dict(signal or {})
     signal.setdefault("symbol", signal.get("underlying") or "SPY")
@@ -494,6 +586,8 @@ def create_shadow_candidate_if_needed(signal, contract, now_epoch, now_dt, path=
         if row.get("fingerprint") == fingerprint and safe_float(row.get("created_epoch"), 0) and now_epoch - safe_float(row.get("created_epoch"), 0) < OBSERVATION_SECONDS:
             return row, False
     candidate = create_candidate(signal, contract, now_epoch, now_dt)
+    if not candidate:
+        return None, False
     candidate["fingerprint"] = fingerprint
     candidate["starting_option_price"] = candidate.get("option_midpoint", "")
     rows.append(candidate)
