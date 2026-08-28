@@ -7334,6 +7334,9 @@ Bot Reason Log:<br>
 
 <div class="card">
 <h2>Shadow Research</h2>
+<button type="button" id="shadow-refresh-toggle" onclick="toggleShadowAutoRefresh()">Pause Shadow Auto-Refresh</button>
+<span style="margin-left:10px;">Last Shadow UI Update: <span id="shadow-last-ui-update">N/A</span></span>
+<br><br>
 <div id="shadow-research-content">
 {render_shadow_research_panel(bot_snapshot.get("shadow_research"))}
 </div>
@@ -7863,7 +7866,36 @@ function fmtAdversePercent(value) {{
     return `${{(-Math.abs(Number(value || 0))).toFixed(2)}}%`;
 }}
 
+let shadowAutoRefreshPaused = false;
+let latestShadowResearchData = null;
+
+function currentTimeString() {{
+    return new Date().toLocaleTimeString([], {{ hour12: false }});
+}}
+
+function setShadowRefreshButton() {{
+    const button = document.getElementById("shadow-refresh-toggle");
+    if (!button) return;
+    button.textContent = shadowAutoRefreshPaused ? "Resume Shadow Auto-Refresh" : "Pause Shadow Auto-Refresh";
+}}
+
+function toggleShadowAutoRefresh() {{
+    shadowAutoRefreshPaused = !shadowAutoRefreshPaused;
+    setShadowRefreshButton();
+    if (!shadowAutoRefreshPaused && latestShadowResearchData) {{
+        renderShadowResearch(latestShadowResearchData, true);
+    }}
+}}
+
 function renderShadowResearch(summary) {{
+    const el = document.getElementById("shadow-research-content");
+    if (!el) return;
+    latestShadowResearchData = summary || {{}};
+    if (shadowAutoRefreshPaused) return;
+    renderShadowResearchNow(latestShadowResearchData);
+}}
+
+function renderShadowResearchNow(summary) {{
     const el = document.getElementById("shadow-research-content");
     if (!el) return;
     summary = summary || {{}};
@@ -7895,6 +7927,7 @@ Latest 20 Candidates:
 <div class="history-panel shadow-research-panel" id="shadow-research-latest">
 ${{latest}}
 </div>`;
+    setText("shadow-last-ui-update", currentTimeString());
 }}
 
 const TOURNAMENT_PROFILES = [

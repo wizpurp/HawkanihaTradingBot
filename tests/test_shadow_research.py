@@ -2,6 +2,7 @@ import os
 import tempfile
 import unittest
 from datetime import datetime
+from pathlib import Path
 from unittest.mock import patch
 
 import dashboard
@@ -231,6 +232,29 @@ class ShadowResearchRecorderTest(unittest.TestCase):
         with patch.object(dashboard.requests, "post") as post_mock:
             recorder.record_shadow_research(signal(), {"CALL": contract()}, self.quote_provider(1.05), 500.0, True, 1000, self.now, self.path, self.quote_path)
         post_mock.assert_not_called()
+
+    def test_shadow_pause_button_exists_in_dashboard(self):
+        source = Path("dashboard.py").read_text(encoding="utf-8")
+        self.assertIn("Pause Shadow Auto-Refresh", source)
+        self.assertIn("Resume Shadow Auto-Refresh", source)
+        self.assertIn("Last Shadow UI Update", source)
+
+    def test_pause_state_prevents_shadow_dom_rerender(self):
+        source = Path("dashboard.py").read_text(encoding="utf-8")
+        self.assertIn("let shadowAutoRefreshPaused = false", source)
+        self.assertIn("if (shadowAutoRefreshPaused) return;", source)
+        self.assertIn("renderShadowResearchNow(latestShadowResearchData)", source)
+
+    def test_backend_shadow_collection_continues_regardless_of_ui_pause(self):
+        source = Path("dashboard.py").read_text(encoding="utf-8")
+        self.assertIn('const data = await getJson("/api/bot-state");', source)
+        self.assertIn("renderShadowResearch(data.shadow_research);", source)
+        self.assertIn("latestShadowResearchData = summary || {{}};", source)
+
+    def test_shadow_ui_pause_does_not_touch_trading_functions(self):
+        source = Path("dashboard.py").read_text(encoding="utf-8")
+        self.assertNotIn("shadowAutoRefreshPaused = false; submit_option_order", source)
+        self.assertNotIn("shadowAutoRefreshPaused && submit_option_order", source)
 
     def test_restart_recovery_finalizes_old_candidate(self):
         recorder.record_shadow_research(signal(), {"CALL": contract(bid=1.0, ask=1.0)}, self.quote_provider(1.0), 500.0, True, 1000, self.now, self.path, self.quote_path)
