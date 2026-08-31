@@ -264,6 +264,39 @@ class ShadowResearchRecorderTest(unittest.TestCase):
         self.assertEqual(int(row["invalid_quote_count"]), 1)
         self.assertEqual(row["last_invalid_quote_reason"], "implausible one-tick price jump")
 
+    def test_contaminated_record_is_excluded_from_aggregate_metrics(self):
+        recorder.save_candidates([
+            {
+                "candidate_id": "valid",
+                "status": "COMPLETED",
+                "timestamp": "2026-08-28T10:00:00",
+                "maximum_favorable_excursion_5m": 10,
+                "maximum_adverse_excursion_5m": 2,
+                "hit_plus_5_before_minus_5": True,
+                "data_quality_status": "OK",
+            },
+            {
+                "candidate_id": "contaminated",
+                "status": "COMPLETED",
+                "timestamp": "2026-08-28T10:01:00",
+                "maximum_favorable_excursion_5m": 80000,
+                "maximum_adverse_excursion_5m": 40000,
+                "hit_plus_5_before_minus_5": True,
+                "data_quality_status": "CONTAMINATED",
+            },
+        ], self.path)
+
+        summary = recorder.shadow_summary(path=self.path, today="2026-08-28")
+
+        self.assertEqual(summary["completed_candidates"], 2)
+        self.assertEqual(summary["valid_completed_candidates"], 1)
+        self.assertEqual(summary["contaminated_candidates"], 1)
+        self.assertEqual(summary["valid_plus_5_before_minus_5_success_rate"], 100)
+        self.assertEqual(summary["valid_average_5m_mfe"], 10)
+        self.assertEqual(summary["valid_average_5m_mae"], 2)
+        self.assertEqual(summary["average_5m_mfe"], 10)
+        self.assertEqual(summary["average_5m_mae"], 2)
+
     def test_rejected_quotes_do_not_trigger_thresholds(self):
         recorder.record_shadow_research(signal(), {"CALL": contract(bid=1.0, ask=1.0)}, self.quote_provider(1.0), 500.0, True, 1000, self.now, self.path, self.quote_path)
         recorder.record_shadow_research({"decision": "DO NOTHING"}, {}, lambda symbol: {"symbol": symbol, "bid": 499.0, "ask": 501.0, "last": 500.0}, 501.0, True, 1010, self.now, self.path, self.quote_path)

@@ -1716,6 +1716,38 @@ def write_pending_history_rows(rows, visible=True):
     write_json_history(path, rows)
 
 
+def is_test_pending_history_record(row):
+    if not isinstance(row, dict):
+        return False
+    symbols = [
+        row.get("option_symbol"),
+        row.get("symbol"),
+        row.get("contract", {}).get("symbol") if isinstance(row.get("contract"), dict) else None,
+    ]
+    if row.get("test_type") or row.get("is_test_record") is True:
+        return True
+    return any(str(symbol or "").upper().startswith("SPYTEST") for symbol in symbols)
+
+
+def cleanup_test_pending_history_records():
+    cleaned = {}
+    for path in [
+        PENDING_ENTRY_HISTORY_FILE,
+        PENDING_ENTRY_HISTORY_VISIBLE_FILE,
+        PENDING_ENTRY_HISTORY_BACKUP_FILE,
+    ]:
+        rows = load_json_history(path)
+        if not rows:
+            cleaned[path] = 0
+            continue
+        kept_rows = [row for row in rows if not is_test_pending_history_record(row)]
+        removed_count = len(rows) - len(kept_rows)
+        if removed_count:
+            write_json_history(path, kept_rows)
+        cleaned[path] = removed_count
+    return cleaned
+
+
 def upsert_history_record(rows, record):
     updated_rows = list(rows or [])
     existing_index = next((index for index, item in enumerate(updated_rows) if item.get("id") == record.get("id")), None)
@@ -1924,6 +1956,7 @@ def restore_pending_entry_history():
 
 
 def initialize_pending_entry_history():
+    cleanup_test_pending_history_records()
     with BOT_LOCK:
         BOT_STATE["pending_entry_history"] = load_pending_history_rows(visible=True)
 
@@ -6113,10 +6146,12 @@ Class: {escape_html(row.get("classification", ""))}
     return f"""
 Candidates Today: <span id="shadow-candidates-today">{escape_html(summary.get("candidates_today", 0))}</span><br>
 Completed Candidates: <span id="shadow-completed-candidates">{escape_html(summary.get("completed_candidates", 0))}</span><br>
+Valid Completed Candidates: <span id="shadow-valid-completed-candidates">{escape_html(summary.get("valid_completed_candidates", 0))}</span><br>
+Contaminated Candidates: <span id="shadow-contaminated-candidates">{escape_html(summary.get("contaminated_candidates", 0))}</span><br>
 Active Candidates: <span id="shadow-active-candidates">{escape_html(summary.get("active_candidates", 0))}</span><br>
-+5 Before -5 Success Rate: <span id="shadow-plus5-rate">{fmt_percent(summary.get("plus_5_before_minus_5_success_rate"))}</span><br>
-Average 5m MFE: <span id="shadow-average-mfe">{fmt_percent(summary.get("average_5m_mfe"))}</span><br>
-Average 5m MAE: <span id="shadow-average-mae">{fmt_adverse_percent(summary.get("average_5m_mae"))}</span><br>
+Valid +5 Before -5 Success Rate: <span id="shadow-plus5-rate">{fmt_percent(summary.get("valid_plus_5_before_minus_5_success_rate", summary.get("plus_5_before_minus_5_success_rate")))}</span><br>
+Valid Average 5m MFE: <span id="shadow-average-mfe">{fmt_percent(summary.get("valid_average_5m_mfe", summary.get("average_5m_mfe")))}</span><br>
+Valid Average 5m MAE: <span id="shadow-average-mae">{fmt_adverse_percent(summary.get("valid_average_5m_mae", summary.get("average_5m_mae")))}</span><br>
 <br>
 Latest 20 Candidates:
 <div class="history-panel shadow-research-panel" id="shadow-research-latest">
@@ -7935,10 +7970,12 @@ Class: ${{escapeHtml(row.classification || "")}}
     el.innerHTML = `
 Candidates Today: <span id="shadow-candidates-today">${{escapeHtml(summary.candidates_today ?? 0)}}</span><br>
 Completed Candidates: <span id="shadow-completed-candidates">${{escapeHtml(summary.completed_candidates ?? 0)}}</span><br>
+Valid Completed Candidates: <span id="shadow-valid-completed-candidates">${{escapeHtml(summary.valid_completed_candidates ?? 0)}}</span><br>
+Contaminated Candidates: <span id="shadow-contaminated-candidates">${{escapeHtml(summary.contaminated_candidates ?? 0)}}</span><br>
 Active Candidates: <span id="shadow-active-candidates">${{escapeHtml(summary.active_candidates ?? 0)}}</span><br>
-+5 Before -5 Success Rate: <span id="shadow-plus5-rate">${{fmtPercent(summary.plus_5_before_minus_5_success_rate)}}</span><br>
-Average 5m MFE: <span id="shadow-average-mfe">${{fmtPercent(summary.average_5m_mfe)}}</span><br>
-Average 5m MAE: <span id="shadow-average-mae">${{fmtAdversePercent(summary.average_5m_mae)}}</span><br>
+Valid +5 Before -5 Success Rate: <span id="shadow-plus5-rate">${{fmtPercent(summary.valid_plus_5_before_minus_5_success_rate ?? summary.plus_5_before_minus_5_success_rate)}}</span><br>
+Valid Average 5m MFE: <span id="shadow-average-mfe">${{fmtPercent(summary.valid_average_5m_mfe ?? summary.average_5m_mfe)}}</span><br>
+Valid Average 5m MAE: <span id="shadow-average-mae">${{fmtAdversePercent(summary.valid_average_5m_mae ?? summary.average_5m_mae)}}</span><br>
 <br>
 Latest 20 Candidates:
 <div class="history-panel shadow-research-panel" id="shadow-research-latest">

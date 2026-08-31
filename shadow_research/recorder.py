@@ -646,17 +646,25 @@ def shadow_summary(path=SHADOW_CANDIDATES_FILE, today=None, limit=20):
     else:
         today_rows = rows
     completed = [row for row in rows if row.get("status") == "COMPLETED"]
+    valid_completed = [row for row in completed if row.get("data_quality_status") == "OK"]
+    contaminated = [row for row in rows if row.get("data_quality_status") != "OK"]
     active = [row for row in rows if row.get("status") == "ACTIVE"]
-    successes = [row for row in completed if str(row.get("hit_plus_5_before_minus_5")).lower() == "true"]
-    avg_mfe = sum(safe_float(row.get("maximum_favorable_excursion_5m"), 0) or 0 for row in completed) / len(completed) if completed else 0
-    avg_mae = sum(safe_float(row.get("maximum_adverse_excursion_5m"), 0) or 0 for row in completed) / len(completed) if completed else 0
+    successes = [row for row in valid_completed if str(row.get("hit_plus_5_before_minus_5")).lower() == "true"]
+    avg_mfe = sum(safe_float(row.get("maximum_favorable_excursion_5m"), 0) or 0 for row in valid_completed) / len(valid_completed) if valid_completed else 0
+    avg_mae = sum(safe_float(row.get("maximum_adverse_excursion_5m"), 0) or 0 for row in valid_completed) / len(valid_completed) if valid_completed else 0
+    plus_5_success_rate = (len(successes) / len(valid_completed) * 100) if valid_completed else 0
     return {
         "candidates_today": len(today_rows),
         "completed_candidates": len(completed),
+        "valid_completed_candidates": len(valid_completed),
+        "contaminated_candidates": len(contaminated),
         "active_candidates": len(active),
-        "plus_5_before_minus_5_success_rate": (len(successes) / len(completed) * 100) if completed else 0,
+        "plus_5_before_minus_5_success_rate": plus_5_success_rate,
+        "valid_plus_5_before_minus_5_success_rate": plus_5_success_rate,
         "average_5m_mfe": avg_mfe,
         "average_5m_mae": avg_mae,
+        "valid_average_5m_mfe": avg_mfe,
+        "valid_average_5m_mae": avg_mae,
         "latest_candidates": list(reversed(rows[-limit:])),
         "active": len(active),
         "completed": len(completed),

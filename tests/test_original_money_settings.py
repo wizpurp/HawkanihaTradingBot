@@ -63,6 +63,19 @@ def market_context():
 
 class OriginalMoneySettingsTest(unittest.TestCase):
     def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.pending_file = os.path.join(self.tempdir.name, "pending_entry_history.json")
+        self.pending_visible_file = os.path.join(self.tempdir.name, "dashboard_pending_entry_history_visible.json")
+        self.pending_backup_file = os.path.join(self.tempdir.name, "dashboard_pending_entry_history_last_cleared.json")
+        self.pending_path_patches = [
+            patch.object(dashboard, "PENDING_ENTRY_HISTORY_FILE", self.pending_file),
+            patch.object(dashboard, "PENDING_ENTRY_HISTORY_VISIBLE_FILE", self.pending_visible_file),
+            patch.object(dashboard, "PENDING_ENTRY_HISTORY_BACKUP_FILE", self.pending_backup_file),
+        ]
+        for path_patch in self.pending_path_patches:
+            path_patch.start()
+            self.addCleanup(path_patch.stop)
+        self.addCleanup(self.tempdir.cleanup)
         dashboard.clear_pending_entry()
 
     def run_entry(self, ask, contracts=1, maximum_position_cost_dollars=150.0):
@@ -252,6 +265,28 @@ class OriginalMoneySettingsTest(unittest.TestCase):
         html = dashboard.render_current_pending_entry(pending)
         self.assertIn("Current Momentum Gain %", html)
         self.assertIn("0.50%", html)
+
+    def test_pending_history_tests_use_isolated_paths(self):
+        self.assertTrue(self.pending_file.startswith(self.tempdir.name))
+        self.assertTrue(self.pending_visible_file.startswith(self.tempdir.name))
+        self.assertTrue(self.pending_backup_file.startswith(self.tempdir.name))
+        self.assertEqual(dashboard.PENDING_ENTRY_HISTORY_FILE, self.pending_file)
+        self.assertEqual(dashboard.PENDING_ENTRY_HISTORY_VISIBLE_FILE, self.pending_visible_file)
+        self.assertEqual(dashboard.PENDING_ENTRY_HISTORY_BACKUP_FILE, self.pending_backup_file)
+
+    def test_cleanup_test_pending_history_only_removes_spytest_records(self):
+        real_record = {"id": "real", "option_symbol": "SPY260828C00500000", "final_status": "WAITING"}
+        test_record = {"id": "test", "option_symbol": "SPYTESTCALL", "final_status": "WAITING"}
+        for path in [self.pending_file, self.pending_visible_file, self.pending_backup_file]:
+            dashboard.write_json_history(path, [real_record, test_record])
+
+        cleaned = dashboard.cleanup_test_pending_history_records()
+
+        self.assertEqual(cleaned[self.pending_file], 1)
+        self.assertEqual(cleaned[self.pending_visible_file], 1)
+        self.assertEqual(cleaned[self.pending_backup_file], 1)
+        for path in [self.pending_file, self.pending_visible_file, self.pending_backup_file]:
+            self.assertEqual(dashboard.load_json_history(path), [real_record])
 
     def test_final_quote_is_evaluated_before_timeout(self):
         config = self.create_pending_for_momentum(0.97)
