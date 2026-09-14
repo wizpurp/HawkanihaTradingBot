@@ -98,6 +98,20 @@ BASE_COLUMNS = [
     "invalid_quote_count",
     "last_invalid_quote_reason",
     "data_quality_status",
+    "momentum_confirmation_state",
+    "momentum_percentage_observed",
+    "momentum_percentage_required",
+    "breakout_confirmation_state",
+    "breakout_progress_current_candles",
+    "breakout_progress_required_candles",
+    "pre_confirmation_max_observed_drawdown_percent",
+    "pre_confirmation_configured_max_drawdown_percent",
+    "pre_confirmation_drawdown_failed",
+    "confirmation_timed_out",
+    "confirmation_timeout_elapsed_seconds",
+    "retry_cooldown_active",
+    "retry_cooldown_remaining_seconds",
+    "final_live_gate_outcome",
 ]
 
 CHECKPOINT_COLUMNS = []
@@ -280,7 +294,87 @@ def normalize_row(row):
     normalized.setdefault("invalid_quote_count", 0)
     normalized.setdefault("last_invalid_quote_reason", "")
     normalized = flag_contaminated_historical_row(normalized)
+    for column in [
+        "momentum_confirmation_state",
+        "momentum_percentage_observed",
+        "momentum_percentage_required",
+        "breakout_confirmation_state",
+        "breakout_progress_current_candles",
+        "breakout_progress_required_candles",
+        "pre_confirmation_max_observed_drawdown_percent",
+        "pre_confirmation_configured_max_drawdown_percent",
+        "pre_confirmation_drawdown_failed",
+        "confirmation_timed_out",
+        "confirmation_timeout_elapsed_seconds",
+        "retry_cooldown_active",
+        "retry_cooldown_remaining_seconds",
+        "final_live_gate_outcome",
+    ]:
+        if normalized.get(column) in (None, ""):
+            normalized[column] = "N/A"
     return normalized
+
+
+def bool_text(value):
+    if isinstance(value, str):
+        text = value.strip().upper()
+        if text in {"TRUE", "YES", "1"}:
+            return True
+        if text in {"FALSE", "NO", "0"}:
+            return False
+    return bool(value)
+
+
+def normalize_gate_snapshot(snapshot):
+    snapshot = dict(snapshot or {})
+    momentum_state = str(snapshot.get("momentum_confirmation_state") or "N/A").upper()
+    breakout_state = str(snapshot.get("breakout_confirmation_state") or "N/A").upper()
+    drawdown_failed = bool_text(snapshot.get("pre_confirmation_drawdown_failed", False))
+    timed_out = bool_text(snapshot.get("confirmation_timed_out", False))
+    cooldown_active = bool_text(snapshot.get("retry_cooldown_active", False))
+
+    if snapshot.get("final_live_gate_outcome"):
+        outcome = str(snapshot.get("final_live_gate_outcome")).upper()
+    elif cooldown_active:
+        outcome = "REJECTED_COOLDOWN"
+    elif timed_out or momentum_state == "TIMEOUT":
+        outcome = "REJECTED_TIMEOUT"
+    elif drawdown_failed:
+        outcome = "REJECTED_DRAWDOWN"
+    elif momentum_state == "FAIL":
+        outcome = "REJECTED_MOMENTUM"
+    elif breakout_state == "FAIL":
+        outcome = "REJECTED_BREAKOUT"
+    elif momentum_state in {"PASS", "DISABLED"} and breakout_state in {"PASS", "DISABLED"}:
+        outcome = "WOULD_ENTER"
+    elif momentum_state == "N/A" and breakout_state == "N/A":
+        outcome = "N/A"
+    else:
+        outcome = "WAITING"
+
+    return {
+        "momentum_confirmation_state": momentum_state,
+        "momentum_percentage_observed": snapshot.get("momentum_percentage_observed", "N/A"),
+        "momentum_percentage_required": snapshot.get("momentum_percentage_required", "N/A"),
+        "breakout_confirmation_state": breakout_state,
+        "breakout_progress_current_candles": snapshot.get("breakout_progress_current_candles", "N/A"),
+        "breakout_progress_required_candles": snapshot.get("breakout_progress_required_candles", "N/A"),
+        "pre_confirmation_max_observed_drawdown_percent": snapshot.get("pre_confirmation_max_observed_drawdown_percent", "N/A"),
+        "pre_confirmation_configured_max_drawdown_percent": snapshot.get("pre_confirmation_configured_max_drawdown_percent", "N/A"),
+        "pre_confirmation_drawdown_failed": drawdown_failed,
+        "confirmation_timed_out": timed_out,
+        "confirmation_timeout_elapsed_seconds": snapshot.get("confirmation_timeout_elapsed_seconds", "N/A"),
+        "retry_cooldown_active": cooldown_active,
+        "retry_cooldown_remaining_seconds": snapshot.get("retry_cooldown_remaining_seconds", "N/A"),
+        "final_live_gate_outcome": outcome,
+    }
+
+
+def apply_gate_snapshot(row, gate_snapshot):
+    if not gate_snapshot:
+        return row
+    row.update(normalize_gate_snapshot(gate_snapshot))
+    return row
 
 
 def direction_from_decision(signal):
@@ -411,6 +505,7 @@ def create_candidate(signal, contract, now_epoch, now_dt):
         "last_invalid_quote_reason": "",
         "data_quality_status": "OK",
     })
+    apply_gate_snapshot(row, (signal or {}).get("entry_gate_snapshot"))
     return row
 
 
@@ -555,11 +650,18 @@ def update_candidate(row, quote, spy_price, now_epoch, quote_path=SHADOW_CANDIDA
         finalize_candidate(row, now_epoch)
     return row
 
-def update_active_candidates(rows, quote_provider, spy_price, now_epoch, quote_path=SHADOW_CANDIDATE_QUOTES_FILE):
+def update_active_candidates(rows, quote_provider, spy_price, now_epoch, quote_path=SHADOW_CANDIDATE_QUOTES_FILE, gate_snapshots_by_direction=None):
     changed = False
     for index, row in enumerate(rows):
         if row.get("status") != "ACTIVE":
             continue
+        gate_snapshot = (gate_snapshots_by_direction or {}).get(row.get("direction"))
+        if gate_snapshot and (
+            not gate_snapshot.get("option_symbol")
+            or gate_snapshot.get("option_symbol") == row.get("option_symbol")
+        ):
+            apply_gate_snapshot(row, gate_snapshot)
+            changed = True
         symbol = row.get("option_symbol")
         quote = quote_provider(symbol) if symbol else None
         updated = update_candidate(row, quote, spy_price, now_epoch, quote_path=quote_path)
@@ -569,7 +671,7 @@ def update_active_candidates(rows, quote_provider, spy_price, now_epoch, quote_p
     return changed
 
 
-def create_shadow_candidate_if_needed(signal, contract, now_epoch, now_dt, path=SHADOW_CANDIDATES_FILE, quote_path=SHADOW_CANDIDATE_QUOTES_FILE, spy_price=None):
+def create_shadow_candidate_if_needed(signal, contract, now_epoch, now_dt, path=SHADOW_CANDIDATES_FILE, quote_path=SHADOW_CANDIDATE_QUOTES_FILE, spy_price=None, gate_snapshot=None):
     direction = direction_from_decision(signal)
     if direction not in {"CALL", "PUT"} or not contract or not contract.get("symbol"):
         return None, False
@@ -585,7 +687,10 @@ def create_shadow_candidate_if_needed(signal, contract, now_epoch, now_dt, path=
             return row, False
         if row.get("fingerprint") == fingerprint and safe_float(row.get("created_epoch"), 0) and now_epoch - safe_float(row.get("created_epoch"), 0) < OBSERVATION_SECONDS:
             return row, False
-    candidate = create_candidate(signal, contract, now_epoch, now_dt)
+    signal_with_gate = dict(signal or {})
+    if gate_snapshot:
+        signal_with_gate["entry_gate_snapshot"] = gate_snapshot
+    candidate = create_candidate(signal_with_gate, contract, now_epoch, now_dt)
     if not candidate:
         return None, False
     candidate["fingerprint"] = fingerprint
@@ -604,20 +709,40 @@ def create_shadow_candidate_if_needed(signal, contract, now_epoch, now_dt, path=
     return candidate, True
 
 
-def record_shadow_research(signal, contracts_by_direction, quote_provider, spy_price, market_open, now_epoch, now_dt, path=SHADOW_CANDIDATES_FILE, quote_path=SHADOW_CANDIDATE_QUOTES_FILE):
+def record_shadow_research(signal, contracts_by_direction, quote_provider, spy_price, market_open, now_epoch, now_dt, path=SHADOW_CANDIDATES_FILE, quote_path=SHADOW_CANDIDATE_QUOTES_FILE, gate_snapshots_by_direction=None):
     if not market_open:
         return {"created": False, "updated": False, "active": 0, "completed": 0}
     rows = load_candidates(path)
-    updated = update_active_candidates(rows, quote_provider, spy_price, now_epoch, quote_path=quote_path)
+    updated = update_active_candidates(rows, quote_provider, spy_price, now_epoch, quote_path=quote_path, gate_snapshots_by_direction=gate_snapshots_by_direction)
     if updated:
         save_candidates(rows, path)
     direction = direction_from_decision(signal)
     created = False
     if direction in {"CALL", "PUT"}:
         contract = (contracts_by_direction or {}).get(direction)
-        _, created = create_shadow_candidate_if_needed(signal, contract, now_epoch, now_dt, path, quote_path, spy_price)
+        gate_snapshot = (gate_snapshots_by_direction or {}).get(direction)
+        _, created = create_shadow_candidate_if_needed(signal, contract, now_epoch, now_dt, path, quote_path, spy_price, gate_snapshot)
     summary = shadow_summary(path=path)
     return {"created": created, "updated": updated, **summary}
+
+
+def update_shadow_gate_snapshot(direction, option_symbol, gate_snapshot, now_epoch, path=SHADOW_CANDIDATES_FILE):
+    if direction not in {"CALL", "PUT"} or not option_symbol or not gate_snapshot:
+        return False
+    rows = load_candidates(path)
+    changed = False
+    for index in range(len(rows) - 1, -1, -1):
+        row = rows[index]
+        if row.get("direction") != direction or row.get("option_symbol") != option_symbol:
+            continue
+        created_epoch = safe_float(row.get("created_epoch"), 0) or 0
+        if row.get("status") == "ACTIVE" or (created_epoch and now_epoch - created_epoch <= OBSERVATION_SECONDS):
+            rows[index] = apply_gate_snapshot(row, gate_snapshot)
+            changed = True
+            break
+    if changed:
+        save_candidates(rows, path)
+    return changed
 
 
 def recover_shadow_candidates(quote_provider, spy_price_provider, market_open, now_epoch, path=SHADOW_CANDIDATES_FILE, quote_path=SHADOW_CANDIDATE_QUOTES_FILE):
@@ -639,6 +764,36 @@ def recover_shadow_candidates(quote_provider, spy_price_provider, market_open, n
     return changed
 
 
+def gate_outcome_statistics(valid_completed):
+    outcomes = [
+        "REJECTED_MOMENTUM",
+        "REJECTED_BREAKOUT",
+        "REJECTED_DRAWDOWN",
+        "REJECTED_TIMEOUT",
+        "REJECTED_COOLDOWN",
+        "WOULD_ENTER",
+        "WAITING",
+        "N/A",
+    ]
+    stats = {}
+    for outcome in outcomes:
+        rows = [row for row in valid_completed if (row.get("final_live_gate_outcome") or "N/A") == outcome]
+        winners = [row for row in rows if str(row.get("hit_plus_5_before_minus_5")).lower() == "true"]
+        losers = [row for row in rows if str(row.get("hit_plus_5_before_minus_5")).lower() != "true"]
+        total = len(rows)
+        rejected = outcome.startswith("REJECTED_")
+        stats[outcome] = {
+            "count": total,
+            "plus_5_before_minus_5_count": len(winners),
+            "plus_5_before_minus_5_rate": (len(winners) / total * 100) if total else 0,
+            "prevented_winner_count": len(winners) if rejected else 0,
+            "prevented_winner_rate": (len(winners) / total * 100) if total and rejected else 0,
+            "prevented_loser_count": len(losers) if rejected else 0,
+            "prevented_loser_rate": (len(losers) / total * 100) if total and rejected else 0,
+        }
+    return stats
+
+
 def shadow_summary(path=SHADOW_CANDIDATES_FILE, today=None, limit=20):
     rows = load_candidates(path)
     if today:
@@ -653,6 +808,7 @@ def shadow_summary(path=SHADOW_CANDIDATES_FILE, today=None, limit=20):
     avg_mfe = sum(safe_float(row.get("maximum_favorable_excursion_5m"), 0) or 0 for row in valid_completed) / len(valid_completed) if valid_completed else 0
     avg_mae = sum(safe_float(row.get("maximum_adverse_excursion_5m"), 0) or 0 for row in valid_completed) / len(valid_completed) if valid_completed else 0
     plus_5_success_rate = (len(successes) / len(valid_completed) * 100) if valid_completed else 0
+    gate_stats = gate_outcome_statistics(valid_completed)
     return {
         "candidates_today": len(today_rows),
         "completed_candidates": len(completed),
@@ -665,6 +821,7 @@ def shadow_summary(path=SHADOW_CANDIDATES_FILE, today=None, limit=20):
         "average_5m_mae": avg_mae,
         "valid_average_5m_mfe": avg_mfe,
         "valid_average_5m_mae": avg_mae,
+        "gate_outcome_statistics": gate_stats,
         "latest_candidates": list(reversed(rows[-limit:])),
         "active": len(active),
         "completed": len(completed),

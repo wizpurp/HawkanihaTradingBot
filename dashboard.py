@@ -58,6 +58,7 @@ from shadow_research.recorder import (
     recover_shadow_candidates,
     record_shadow_research,
     shadow_summary,
+    update_shadow_gate_snapshot,
 )
 
 load_dotenv()
@@ -1088,12 +1089,21 @@ def update_shadow_research(signal=None, call_contract=None, put_contract=None, s
     if not scanner_market_is_open(log_transition=False):
         return {"created": False, "updated": False, "active": 0, "completed": 0}
 
+    if spy_price is None and put_contract is not None and not isinstance(put_contract, dict):
+        spy_price = put_contract
+        put_contract = None
+
+    config = load_config()
     signal = dict(signal or {})
     if not signal.get("symbol"):
-        signal["symbol"] = load_config().get("symbol", "SPY")
+        signal["symbol"] = config.get("symbol", "SPY")
     contracts_by_direction = {
         "CALL": call_contract,
         "PUT": put_contract,
+    }
+    gate_snapshots_by_direction = {
+        "CALL": shadow_entry_gate_snapshot(config, "CALL", call_contract),
+        "PUT": shadow_entry_gate_snapshot(config, "PUT", put_contract),
     }
     summary = record_shadow_research(
         signal,
@@ -1105,6 +1115,7 @@ def update_shadow_research(signal=None, call_contract=None, put_contract=None, s
         market_now(),
         SHADOW_CANDIDATES_FILE,
         SHADOW_CANDIDATE_QUOTES_FILE,
+        gate_snapshots_by_direction,
     )
     with BOT_LOCK:
         BOT_STATE["shadow_research"] = shadow_summary(
@@ -1113,6 +1124,94 @@ def update_shadow_research(signal=None, call_contract=None, put_contract=None, s
             limit=20,
         )
     return summary
+
+
+def shadow_entry_gate_snapshot(config, direction, contract=None, pending_override=None):
+    contract = contract if isinstance(contract, dict) else {}
+    option_symbol = contract.get("symbol") or (pending_override or {}).get("option_symbol", "")
+    pending = dict(pending_override or get_pending_entry())
+    pending_matches = (
+        pending.get("option_symbol") == option_symbol
+        and pending.get("direction") == direction
+        and pending.get("status") not in ["NONE", ""]
+    )
+    momentum_enabled = bool(config.get("option_momentum_confirmation_enabled", True))
+    breakout_enabled = bool(config.get("two_candle_or_confirmation_enabled", True))
+    retry_remaining = pending_retry_cooldown_remaining(config, direction, option_symbol) if option_symbol else 0
+    momentum_state = "DISABLED" if not momentum_enabled else "WAITING"
+    breakout_state = "DISABLED" if not breakout_enabled else "WAITING"
+    observed = "N/A"
+    breakout_current = 0 if breakout_enabled else "N/A"
+    breakout_required = int(config.get("required_breakout_candles", 2)) if breakout_enabled else "N/A"
+    max_observed_drawdown = "N/A"
+    configured_max_drawdown = safe_float(config.get("pre_confirmation_max_drawdown_percent", 5.0), 5.0)
+    timed_out = False
+    timeout_elapsed = "N/A"
+    drawdown_failed = False
+    final_outcome = ""
+
+    if pending_matches:
+        momentum_state = "DISABLED" if not momentum_enabled else str(pending.get("momentum_status") or "WAITING").upper()
+        breakout_state = "DISABLED" if not breakout_enabled else str(pending.get("breakout_status") or "WAITING").upper()
+        observed = pending.get("current_momentum_gain_percent", "N/A")
+        breakout_current = pending.get("current_breakout_candle", breakout_current)
+        breakout_required = pending.get("required_breakout_candles", breakout_required)
+        max_observed_drawdown = pending.get("current_pre_confirmation_drawdown_percent", "N/A")
+        configured_max_drawdown = pending.get("maximum_allowed_drawdown_percent", configured_max_drawdown)
+        trigger = str(pending.get("final_cancellation_trigger") or pending.get("reason") or "").lower()
+        timed_out = "timeout" in trigger
+        drawdown_failed = "drawdown" in trigger
+        if timed_out:
+            timeout_elapsed = pending.get("elapsed_time_seconds", "N/A")
+            momentum_state = "TIMEOUT" if momentum_state != "PASS" else momentum_state
+
+    if retry_remaining > 0:
+        final_outcome = "REJECTED_COOLDOWN"
+    elif timed_out:
+        final_outcome = "REJECTED_TIMEOUT"
+    elif drawdown_failed:
+        final_outcome = "REJECTED_DRAWDOWN"
+    elif momentum_state == "FAIL":
+        final_outcome = "REJECTED_MOMENTUM"
+    elif breakout_state == "FAIL":
+        final_outcome = "REJECTED_BREAKOUT"
+    elif momentum_state in ["PASS", "DISABLED"] and breakout_state in ["PASS", "DISABLED"]:
+        final_outcome = "WOULD_ENTER"
+    elif option_symbol:
+        final_outcome = "WAITING"
+    else:
+        final_outcome = "N/A"
+
+    return {
+        "option_symbol": option_symbol,
+        "momentum_confirmation_state": momentum_state,
+        "momentum_percentage_observed": observed,
+        "momentum_percentage_required": safe_float(config.get("option_momentum_percent", 1.0), 1.0) if momentum_enabled else "N/A",
+        "breakout_confirmation_state": breakout_state,
+        "breakout_progress_current_candles": breakout_current,
+        "breakout_progress_required_candles": breakout_required,
+        "pre_confirmation_max_observed_drawdown_percent": max_observed_drawdown,
+        "pre_confirmation_configured_max_drawdown_percent": configured_max_drawdown,
+        "pre_confirmation_drawdown_failed": drawdown_failed,
+        "confirmation_timed_out": timed_out,
+        "confirmation_timeout_elapsed_seconds": timeout_elapsed,
+        "retry_cooldown_active": retry_remaining > 0,
+        "retry_cooldown_remaining_seconds": retry_remaining,
+        "final_live_gate_outcome": final_outcome,
+    }
+
+
+def record_shadow_gate_state_from_pending(config, pending):
+    try:
+        direction = pending.get("direction")
+        option_symbol = pending.get("option_symbol")
+        if direction not in ["CALL", "PUT"] or not option_symbol:
+            return False
+        snapshot = shadow_entry_gate_snapshot(config, direction, {"symbol": option_symbol}, pending_override=pending)
+        return update_shadow_gate_snapshot(direction, option_symbol, snapshot, time.time(), SHADOW_CANDIDATES_FILE)
+    except Exception as error:
+        print("SHADOW GATE SNAPSHOT ERROR:", error)
+        return False
 
 
 def recover_shadow_research_on_startup():
@@ -4084,6 +4183,7 @@ def process_pending_entry(config):
         pending["momentum_status"] = "FAIL"
         refresh_pending_time_remaining(pending)
         set_pending_entry(pending)
+        record_shadow_gate_state_from_pending(config, pending)
         upsert_pending_history(pending, final_status="CANCELLED", cancellation_reason=pending["reason"])
         add_bot_reason("PENDING BUY cancelled: bot disabled")
         log_bot_audit("SKIP", decision, config.get("symbol", ""), market_context, config, option_symbol=option_symbol, skip_reason="pending entry cancelled: bot disabled")
@@ -4097,6 +4197,7 @@ def process_pending_entry(config):
         pending["momentum_status"] = "FAIL"
         refresh_pending_time_remaining(pending)
         set_pending_entry(pending)
+        record_shadow_gate_state_from_pending(config, pending)
         upsert_pending_history(pending, final_status="CANCELLED", cancellation_reason=pending["reason"])
         add_bot_reason("PENDING BUY cancelled: options market closed")
         log_bot_audit("SKIP", decision, config.get("symbol", ""), market_context, config, option_symbol=option_symbol, skip_reason="pending entry cancelled: options market closed")
@@ -4131,6 +4232,7 @@ def process_pending_entry(config):
                 pending["breakout_status"] = "FAIL"
                 pending["breakout_confirmed"] = False
             set_pending_entry(pending)
+            record_shadow_gate_state_from_pending(config, pending)
             upsert_pending_history(pending, final_status="CANCELLED", cancellation_reason=pending["reason"])
             add_bot_reason("PENDING BUY cancelled: momentum confirmation timeout expired with no option quote")
             log_bot_audit("SKIP", decision, config.get("symbol", ""), market_context, config, option_symbol=option_symbol, current_price=current_price, skip_reason="pending entry cancelled: momentum confirmation timeout expired")
@@ -4138,6 +4240,7 @@ def process_pending_entry(config):
         pending["status"] = "WAITING FOR MOMENTUM" if pending.get("momentum_status") != "PASS" else "WAITING FOR BREAKOUT"
         pending["reason"] = "option quote unavailable"
         set_pending_entry(pending)
+        record_shadow_gate_state_from_pending(config, pending)
         upsert_pending_history(pending, final_status="WAITING")
         print("PENDING ENTRY")
         print("status:", pending["status"])
@@ -4176,6 +4279,7 @@ def process_pending_entry(config):
         pending["final_cancellation_trigger"] = "maximum pre-confirmation drawdown hit"
         pending["momentum_status"] = "FAIL"
         set_pending_entry(pending)
+        record_shadow_gate_state_from_pending(config, pending)
         upsert_pending_history(pending, final_status="CANCELLED", cancellation_reason=pending["reason"])
         add_bot_reason(
             f"PENDING BUY cancelled: drawdown {pending.get('current_pre_confirmation_drawdown_percent', 0):.2f}% "
@@ -4205,6 +4309,7 @@ def process_pending_entry(config):
         pending["reason"] = "option momentum and opening-range breakout confirmed"
         pending["active"] = False
         set_pending_entry(pending)
+        record_shadow_gate_state_from_pending(config, pending)
         add_bot_reason(
             f"PENDING BUY confirmed: momentum {current_price:.2f} >= {confirmation_price:.2f}; "
             f"breakout {pending.get('current_breakout_candle')}/{pending.get('required_breakout_candles')}"
@@ -4233,6 +4338,7 @@ def process_pending_entry(config):
             pending["breakout_status"] = "FAIL"
             pending["breakout_confirmed"] = False
         set_pending_entry(pending)
+        record_shadow_gate_state_from_pending(config, pending)
         upsert_pending_history(pending, final_status="CANCELLED", cancellation_reason=pending["reason"])
         add_bot_reason(
             f"PENDING BUY cancelled: {pending['reason']} "
@@ -4250,6 +4356,7 @@ def process_pending_entry(config):
         pending["status"] = "WAITING FOR BREAKOUT"
         pending["reason"] = breakout.get("reason") or "waiting for two completed opening-range breakout candles"
     set_pending_entry(pending)
+    record_shadow_gate_state_from_pending(config, pending)
     upsert_pending_history(pending, final_status="WAITING")
     return True
 
@@ -6120,6 +6227,17 @@ Final Status: {escape_html(final_status)}
 def render_shadow_research_panel(summary):
     summary = summary or {}
     rows = list(summary.get("latest_candidates") or [])[:20]
+    gate_stats = summary.get("gate_outcome_statistics") or {}
+    gate_rows = []
+    for outcome in ["WOULD_ENTER", "REJECTED_MOMENTUM", "REJECTED_BREAKOUT", "REJECTED_DRAWDOWN", "REJECTED_TIMEOUT", "REJECTED_COOLDOWN", "WAITING", "N/A"]:
+        stats = gate_stats.get(outcome) or {}
+        gate_rows.append(
+            f"{escape_html(outcome)}: "
+            f"{escape_html(stats.get('count', 0))} candidates | "
+            f"+5 before -5: {fmt_percent(stats.get('plus_5_before_minus_5_rate'))} | "
+            f"Prevented Winners: {escape_html(stats.get('prevented_winner_count', 0))} ({fmt_percent(stats.get('prevented_winner_rate'))}) | "
+            f"Prevented Losers: {escape_html(stats.get('prevented_loser_count', 0))} ({fmt_percent(stats.get('prevented_loser_rate'))})"
+        )
     latest_html = []
     for row in rows:
         latest_html.append(f"""
@@ -6137,7 +6255,13 @@ Worst Move: {fmt_adverse_percent(row.get("maximum_adverse_excursion_5m") or row.
 Time to +5%: {fmt_seconds_or_na(row.get("time_to_plus_5_seconds"))}<br>
 Time to -5%: {fmt_seconds_or_na(row.get("time_to_minus_5_seconds"))}<br>
 +5 Before -5: {escape_html(row.get("hit_plus_5_before_minus_5", ""))}<br>
-Class: {escape_html(row.get("classification", ""))}
+Class: {escape_html(row.get("classification", ""))}<br>
+Momentum Gate: {escape_html(row.get("momentum_confirmation_state") or "N/A")} ({escape_html(row.get("momentum_percentage_observed") or "N/A")} / {escape_html(row.get("momentum_percentage_required") or "N/A")}%)<br>
+Breakout Gate: {escape_html(row.get("breakout_confirmation_state") or "N/A")} ({escape_html(row.get("breakout_progress_current_candles") or "N/A")} / {escape_html(row.get("breakout_progress_required_candles") or "N/A")})<br>
+Pre-Confirmation Drawdown: {escape_html(row.get("pre_confirmation_max_observed_drawdown_percent") or "N/A")} / {escape_html(row.get("pre_confirmation_configured_max_drawdown_percent") or "N/A")}% | Failed: {escape_html(row.get("pre_confirmation_drawdown_failed") or "N/A")}<br>
+Timeout: {escape_html(row.get("confirmation_timed_out") or "N/A")} at {escape_html(row.get("confirmation_timeout_elapsed_seconds") or "N/A")}s<br>
+Retry Cooldown: {escape_html(row.get("retry_cooldown_active") or "N/A")} | Remaining: {escape_html(row.get("retry_cooldown_remaining_seconds") or "N/A")}s<br>
+Live Gate Outcome: {escape_html(row.get("final_live_gate_outcome") or "N/A")}
 </div>
 """)
     if not latest_html:
@@ -6152,6 +6276,9 @@ Active Candidates: <span id="shadow-active-candidates">{escape_html(summary.get(
 Valid +5 Before -5 Success Rate: <span id="shadow-plus5-rate">{fmt_percent(summary.get("valid_plus_5_before_minus_5_success_rate", summary.get("plus_5_before_minus_5_success_rate")))}</span><br>
 Valid Average 5m MFE: <span id="shadow-average-mfe">{fmt_percent(summary.get("valid_average_5m_mfe", summary.get("average_5m_mfe")))}</span><br>
 Valid Average 5m MAE: <span id="shadow-average-mae">{fmt_adverse_percent(summary.get("valid_average_5m_mae", summary.get("average_5m_mae")))}</span><br>
+<br>
+Gate Outcome Research:<br>
+{"<br>".join(gate_rows)}<br>
 <br>
 Latest 20 Candidates:
 <div class="history-panel shadow-research-panel" id="shadow-research-latest">
@@ -7949,6 +8076,12 @@ function renderShadowResearchNow(summary) {{
     if (!el) return;
     summary = summary || {{}};
     const rows = (summary.latest_candidates || []).slice(0, 20);
+    const gateStats = summary.gate_outcome_statistics || {{}};
+    const gateOutcomes = ["WOULD_ENTER", "REJECTED_MOMENTUM", "REJECTED_BREAKOUT", "REJECTED_DRAWDOWN", "REJECTED_TIMEOUT", "REJECTED_COOLDOWN", "WAITING", "N/A"];
+    const gateRows = gateOutcomes.map((outcome) => {{
+        const stats = gateStats[outcome] || {{}};
+        return `${{escapeHtml(outcome)}}: ${{escapeHtml(stats.count ?? 0)}} candidates | +5 before -5: ${{fmtPercent(stats.plus_5_before_minus_5_rate)}} | Prevented Winners: ${{escapeHtml(stats.prevented_winner_count ?? 0)}} (${{fmtPercent(stats.prevented_winner_rate)}}) | Prevented Losers: ${{escapeHtml(stats.prevented_loser_count ?? 0)}} (${{fmtPercent(stats.prevented_loser_rate)}})`;
+    }}).join("<br>");
     const latest = rows.length ? rows.map((row) => `
 <div class="trade-card bot">
 ${{escapeHtml(row.timestamp || "")}}<br>
@@ -7964,7 +8097,13 @@ Worst Move: ${{fmtAdversePercent(row.maximum_adverse_excursion_5m || row.mae_per
 Time to +5%: ${{fmtSecondsOrNa(row.time_to_plus_5_seconds)}}<br>
 Time to -5%: ${{fmtSecondsOrNa(row.time_to_minus_5_seconds)}}<br>
 +5 Before -5: ${{escapeHtml(row.hit_plus_5_before_minus_5 || "")}}<br>
-Class: ${{escapeHtml(row.classification || "")}}
+Class: ${{escapeHtml(row.classification || "")}}<br>
+Momentum Gate: ${{escapeHtml(row.momentum_confirmation_state || "N/A")}} (${{escapeHtml(row.momentum_percentage_observed || "N/A")}} / ${{escapeHtml(row.momentum_percentage_required || "N/A")}}%)<br>
+Breakout Gate: ${{escapeHtml(row.breakout_confirmation_state || "N/A")}} (${{escapeHtml(row.breakout_progress_current_candles || "N/A")}} / ${{escapeHtml(row.breakout_progress_required_candles || "N/A")}})<br>
+Pre-Confirmation Drawdown: ${{escapeHtml(row.pre_confirmation_max_observed_drawdown_percent || "N/A")}} / ${{escapeHtml(row.pre_confirmation_configured_max_drawdown_percent || "N/A")}}% | Failed: ${{escapeHtml(row.pre_confirmation_drawdown_failed || "N/A")}}<br>
+Timeout: ${{escapeHtml(row.confirmation_timed_out || "N/A")}} at ${{escapeHtml(row.confirmation_timeout_elapsed_seconds || "N/A")}}s<br>
+Retry Cooldown: ${{escapeHtml(row.retry_cooldown_active || "N/A")}} | Remaining: ${{escapeHtml(row.retry_cooldown_remaining_seconds || "N/A")}}s<br>
+Live Gate Outcome: ${{escapeHtml(row.final_live_gate_outcome || "N/A")}}
 </div>`).join("") : "No shadow candidates recorded.";
 
     el.innerHTML = `
@@ -7976,6 +8115,9 @@ Active Candidates: <span id="shadow-active-candidates">${{escapeHtml(summary.act
 Valid +5 Before -5 Success Rate: <span id="shadow-plus5-rate">${{fmtPercent(summary.valid_plus_5_before_minus_5_success_rate ?? summary.plus_5_before_minus_5_success_rate)}}</span><br>
 Valid Average 5m MFE: <span id="shadow-average-mfe">${{fmtPercent(summary.valid_average_5m_mfe ?? summary.average_5m_mfe)}}</span><br>
 Valid Average 5m MAE: <span id="shadow-average-mae">${{fmtAdversePercent(summary.valid_average_5m_mae ?? summary.average_5m_mae)}}</span><br>
+<br>
+Gate Outcome Research:<br>
+${{gateRows}}<br>
 <br>
 Latest 20 Candidates:
 <div class="history-panel shadow-research-panel" id="shadow-research-latest">

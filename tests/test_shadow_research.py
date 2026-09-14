@@ -61,6 +61,25 @@ def contract(symbol="SPY260820C00500000", bid=1.0, ask=1.1, last=1.05):
     }
 
 
+def gate_snapshot(outcome="WAITING", momentum="WAITING", breakout="WAITING"):
+    return {
+        "momentum_confirmation_state": momentum,
+        "momentum_percentage_observed": 0.5,
+        "momentum_percentage_required": 1.0,
+        "breakout_confirmation_state": breakout,
+        "breakout_progress_current_candles": 1,
+        "breakout_progress_required_candles": 2,
+        "pre_confirmation_max_observed_drawdown_percent": 2.0,
+        "pre_confirmation_configured_max_drawdown_percent": 5.0,
+        "pre_confirmation_drawdown_failed": outcome == "REJECTED_DRAWDOWN",
+        "confirmation_timed_out": outcome == "REJECTED_TIMEOUT",
+        "confirmation_timeout_elapsed_seconds": 60 if outcome == "REJECTED_TIMEOUT" else "N/A",
+        "retry_cooldown_active": outcome == "REJECTED_COOLDOWN",
+        "retry_cooldown_remaining_seconds": 30 if outcome == "REJECTED_COOLDOWN" else 0,
+        "final_live_gate_outcome": outcome,
+    }
+
+
 class ShadowResearchRecorderTest(unittest.TestCase):
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
@@ -98,6 +117,7 @@ class ShadowResearchRecorderTest(unittest.TestCase):
             self.now,
             self.path,
             self.quote_path,
+            {"CALL": gate_snapshot("WAITING")},
         )
         self.assertEqual(copied["decision"], original["decision"])
         self.assertEqual(copied["current_signal"], original["current_signal"])
@@ -114,8 +134,81 @@ class ShadowResearchRecorderTest(unittest.TestCase):
                 1000,
                 self.now,
                 self.path,
+                self.quote_path,
+                {"CALL": gate_snapshot("WAITING")},
             )
             self.assertEqual(dashboard.BOT_STATE["tournament_decisions"], original_decisions)
+
+    def test_gate_instrumentation_cannot_place_broker_orders(self):
+        with patch.object(dashboard.requests, "post") as post_mock:
+            recorder.record_shadow_research(
+                signal(),
+                {"CALL": contract()},
+                self.quote_provider(1.05),
+                500.0,
+                True,
+                1000,
+                self.now,
+                self.path,
+                self.quote_path,
+                {"CALL": gate_snapshot("WOULD_ENTER", "PASS", "PASS")},
+            )
+        post_mock.assert_not_called()
+
+    def test_candidate_records_live_gate_snapshot_fields(self):
+        recorder.record_shadow_research(
+            signal(),
+            {"CALL": contract()},
+            self.quote_provider(1.05),
+            500.0,
+            True,
+            1000,
+            self.now,
+            self.path,
+            self.quote_path,
+            {"CALL": gate_snapshot("WAITING")},
+        )
+
+        row = recorder.load_candidates(self.path)[0]
+
+        self.assertEqual(row["momentum_confirmation_state"], "WAITING")
+        self.assertEqual(float(row["momentum_percentage_observed"]), 0.5)
+        self.assertEqual(float(row["momentum_percentage_required"]), 1.0)
+        self.assertEqual(row["breakout_confirmation_state"], "WAITING")
+        self.assertEqual(int(float(row["breakout_progress_current_candles"])), 1)
+        self.assertEqual(int(float(row["breakout_progress_required_candles"])), 2)
+        self.assertEqual(float(row["pre_confirmation_max_observed_drawdown_percent"]), 2.0)
+        self.assertEqual(float(row["pre_confirmation_configured_max_drawdown_percent"]), 5.0)
+        self.assertEqual(row["final_live_gate_outcome"], "WAITING")
+
+    def test_each_gate_rejection_reason_is_classified(self):
+        cases = [
+            ("REJECTED_MOMENTUM", {"momentum_confirmation_state": "FAIL"}),
+            ("REJECTED_BREAKOUT", {"momentum_confirmation_state": "PASS", "breakout_confirmation_state": "FAIL"}),
+            ("REJECTED_DRAWDOWN", {"pre_confirmation_drawdown_failed": True}),
+            ("REJECTED_TIMEOUT", {"confirmation_timed_out": True}),
+            ("REJECTED_COOLDOWN", {"retry_cooldown_active": True}),
+            ("WOULD_ENTER", {"momentum_confirmation_state": "PASS", "breakout_confirmation_state": "DISABLED"}),
+            ("WAITING", {"momentum_confirmation_state": "WAITING", "breakout_confirmation_state": "PASS"}),
+        ]
+        for expected, overrides in cases:
+            with self.subTest(expected=expected):
+                snapshot = recorder.normalize_gate_snapshot(overrides)
+                self.assertEqual(snapshot["final_live_gate_outcome"], expected)
+
+    def test_missing_historical_gate_data_stays_na(self):
+        recorder.save_candidates([{
+            "candidate_id": "old",
+            "status": "COMPLETED",
+            "timestamp": "2026-08-28T10:00:00",
+            "data_quality_status": "OK",
+        }], self.path)
+
+        row = recorder.load_candidates(self.path)[0]
+
+        self.assertEqual(row["momentum_confirmation_state"], "N/A")
+        self.assertEqual(row["breakout_confirmation_state"], "N/A")
+        self.assertEqual(row["final_live_gate_outcome"], "N/A")
 
     def test_same_setup_is_deduplicated(self):
         first = recorder.record_shadow_research(signal(), {"CALL": contract()}, self.quote_provider(1.05), 500.0, True, 1000, self.now, self.path, self.quote_path)
@@ -274,6 +367,7 @@ class ShadowResearchRecorderTest(unittest.TestCase):
                 "maximum_adverse_excursion_5m": 2,
                 "hit_plus_5_before_minus_5": True,
                 "data_quality_status": "OK",
+                "final_live_gate_outcome": "WOULD_ENTER",
             },
             {
                 "candidate_id": "contaminated",
@@ -283,6 +377,7 @@ class ShadowResearchRecorderTest(unittest.TestCase):
                 "maximum_adverse_excursion_5m": 40000,
                 "hit_plus_5_before_minus_5": True,
                 "data_quality_status": "CONTAMINATED",
+                "final_live_gate_outcome": "REJECTED_MOMENTUM",
             },
         ], self.path)
 
@@ -296,6 +391,8 @@ class ShadowResearchRecorderTest(unittest.TestCase):
         self.assertEqual(summary["valid_average_5m_mae"], 2)
         self.assertEqual(summary["average_5m_mfe"], 10)
         self.assertEqual(summary["average_5m_mae"], 2)
+        self.assertEqual(summary["gate_outcome_statistics"]["WOULD_ENTER"]["count"], 1)
+        self.assertEqual(summary["gate_outcome_statistics"]["REJECTED_MOMENTUM"]["count"], 0)
 
     def test_rejected_quotes_do_not_trigger_thresholds(self):
         recorder.record_shadow_research(signal(), {"CALL": contract(bid=1.0, ask=1.0)}, self.quote_provider(1.0), 500.0, True, 1000, self.now, self.path, self.quote_path)
