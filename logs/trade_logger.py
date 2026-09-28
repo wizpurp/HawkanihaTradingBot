@@ -28,8 +28,30 @@ TRADE_COLUMNS = [
     "PnLPercent", "ExitReason", "EntryPriceSource", "EstimatedEntryPrice",
     "EntryMarketState", "EntryBullishScore", "EntryBearishScore",
     "EntryConfidence", "EntryDominancePercent", "EntryDecision", "EntryReasonLog",
-    "EntryIndicatorBreakdown"
+    "EntryIndicatorBreakdown",
+    "EntrySpyPrice", "EntrySpyQuoteTimestamp", "EntrySpyQuoteAgeSeconds",
+    "EntryOptionBid", "EntryOptionAsk", "EntryOptionMidpoint", "EntryOptionLast",
+    "EntryOptionQuoteTimestamp", "EntryOptionQuoteAgeSeconds",
+    "EntrySpreadDollars", "EntrySpreadPercent",
+    "EntryRequestedOrderType", "EntryRequestedOrderPrice",
+    "EntryBrokerOrderStatus", "EntryBrokerFillPrice", "EntryBrokerFillTimestamp",
+    "EntrySlippageFromMidpoint",
+    "ExitTriggerOptionBid", "ExitTriggerOptionAsk", "ExitTriggerOptionMidpoint", "ExitTriggerOptionLast",
+    "ExitTriggerQuoteTimestamp", "ExitTriggerQuoteAgeSeconds",
+    "ExitHardStopPrice", "ExitTrailingStopPrice", "ExitEffectiveStopPrice",
+    "ExitStopPriceSource", "ExitTriggerPrice", "ExitTriggerSpyPrice",
+    "ExitOptionBid", "ExitOptionAsk", "ExitOptionMidpoint", "ExitOptionLast",
+    "ExitOptionQuoteTimestamp", "ExitOptionQuoteAgeSeconds",
+    "ExitRequestedOrderType", "ExitRequestedOrderPrice",
+    "ExitBrokerOrderStatus", "ExitBrokerFillPrice", "ExitBrokerFillTimestamp",
+    "ExitSlippageFromTrigger", "ExitSpyPrice", "SpyChangeDollars", "SpyChangePercent"
 ]
+
+ENTRY_EXECUTION_COLUMNS = [column for column in TRADE_COLUMNS if column.startswith("Entry") and column not in {
+    "EntryGrade", "EntryPriceSource", "EntryMarketState", "EntryBullishScore",
+    "EntryBearishScore", "EntryConfidence", "EntryDominancePercent", "EntryDecision",
+    "EntryReasonLog", "EntryIndicatorBreakdown"
+}]
 
 _CALLBACKS = {}
 
@@ -152,7 +174,8 @@ def log_trade(
     source="HUMAN",
     market_context=None,
     entry_price_source="",
-    estimated_entry_price=""
+    estimated_entry_price="",
+    execution_diagnostics=None
 ):
     current_market_context_snapshot = _callback("current_market_context_snapshot")
     grade_entry_setup = _callback("grade_entry_setup")
@@ -193,6 +216,7 @@ def log_trade(
     entry_decision = ""
     entry_reason_log = ""
     entry_indicator_breakdown_json = ""
+    last_buy = None
 
     if action == "BUY" and grade_entry_setup:
         entry_grade, trade_score, grade_reason = grade_entry_setup(market_context)
@@ -249,6 +273,12 @@ def log_trade(
                 )
             exit_reason = "\n".join(trailing_lines + [str(reason) for reason in (market_context.get("decision_reasons") or [])])
 
+    execution_diagnostics = dict(execution_diagnostics or {})
+    if action == "SELL" and last_buy:
+        for column in ENTRY_EXECUTION_COLUMNS:
+            if column not in execution_diagnostics:
+                execution_diagnostics[column] = last_buy.get(column, "")
+
     row = {
         "Time": market_now().strftime("%Y-%m-%d %H:%M:%S"),
         "Action": action,
@@ -291,6 +321,16 @@ def log_trade(
         "EntryReasonLog": entry_reason_log,
         "EntryIndicatorBreakdown": entry_indicator_breakdown_json
     }
+    for column in TRADE_COLUMNS:
+        if column not in row:
+            row[column] = execution_diagnostics.get(column, "")
+
+    print("BROKER EXECUTION DIAGNOSTICS")
+    print("action:", action)
+    print("symbol:", symbol)
+    for key in TRADE_COLUMNS:
+        if key in execution_diagnostics:
+            print(f"{key}:", execution_diagnostics.get(key, ""))
 
     append_trade_row(TRADES_FILE, row)
     append_trade_row(VISIBLE_TRADES_FILE, row)

@@ -1,4 +1,5 @@
 import re
+import math
 import copy
 from flask import Flask, request, redirect, jsonify
 import requests
@@ -1686,6 +1687,195 @@ def get_option_confirmation_price(quote_or_contract):
     return None, "NONE"
 
 
+def broker_timestamp(value):
+    if value in (None, ""):
+        return None
+    try:
+        epoch = float(value)
+        if epoch > 10_000_000_000:
+            epoch /= 1000
+        return datetime.fromtimestamp(epoch, MARKET_TZ)
+    except:
+        pass
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=MARKET_TZ)
+        return parsed.astimezone(MARKET_TZ)
+    except:
+        return None
+
+
+def quote_execution_snapshot(quote):
+    quote = quote if isinstance(quote, dict) else {}
+    bid = valid_price(quote.get("bid"))
+    ask = valid_price(quote.get("ask"))
+    last = valid_price(quote.get("last"))
+    midpoint = (bid + ask) / 2 if bid is not None and ask is not None else None
+    spread_dollars = ask - bid if bid is not None and ask is not None and ask >= bid else None
+    spread_percent = (spread_dollars / midpoint) * 100 if spread_dollars is not None and midpoint else None
+    price_source = "NONE"
+    selected_price = None
+    for key, label in [("last", "LAST"), ("bid", "BID"), ("ask", "ASK")]:
+        try:
+            selected_price = float(quote[key])
+            price_source = label
+            break
+        except (KeyError, TypeError, ValueError):
+            selected_price = None
+    timestamp_key = {"LAST": "trade_date", "BID": "bid_date", "ASK": "ask_date"}.get(price_source)
+    parsed_timestamp = broker_timestamp(quote.get(timestamp_key)) if timestamp_key else None
+    age_seconds = (market_now() - parsed_timestamp).total_seconds() if parsed_timestamp else None
+    return {
+        "bid": bid,
+        "ask": ask,
+        "midpoint": midpoint,
+        "last": last,
+        "spread_dollars": spread_dollars,
+        "spread_percent": spread_percent,
+        "quote_timestamp": parsed_timestamp.isoformat() if parsed_timestamp else "",
+        "quote_age_seconds": age_seconds if age_seconds is not None else "",
+        "selected_price": selected_price,
+        "price_source": price_source,
+    }
+
+
+def parse_broker_order_execution(payload):
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except:
+            payload = {}
+    payload = payload if isinstance(payload, dict) else {}
+    order = payload.get("order", payload)
+    order = order if isinstance(order, dict) else {}
+    fill_price = valid_price(order.get("avg_fill_price"))
+    if fill_price is not None and not math.isfinite(fill_price):
+        fill_price = None
+    if order.get("status") not in ["filled", "partially_filled"]:
+        fill_price = None
+    fill_timestamp = order.get("transaction_date") if fill_price is not None and order.get("status") == "filled" else ""
+    return {
+        "order_status": order.get("status") or "",
+        "fill_price": fill_price,
+        "fill_timestamp": fill_timestamp or "",
+        "order_type": order.get("type") or "",
+        "requested_price": order.get("price") if order.get("price") not in (None, 0, "0") else "",
+    }
+
+
+def fetch_broker_order_execution(order_id, initial_response="", retries=4, delay_seconds=0.25):
+    execution = parse_broker_order_execution(initial_response)
+    if execution.get("fill_price") is not None or not order_id:
+        return execution
+
+    for attempt in range(max(1, retries)):
+        try:
+            response = requests.get(
+                f"{BASE_URL}/accounts/{ACCOUNT}/orders/{order_id}",
+                headers=headers(),
+                timeout=3,
+            )
+            if response.status_code == 200:
+                execution = parse_broker_order_execution(response.json())
+                if execution.get("fill_price") is not None:
+                    return execution
+                if execution.get("order_status") in ["rejected", "canceled", "expired", "error"]:
+                    return execution
+        except Exception as exc:
+            print("BROKER EXECUTION LOOKUP ERROR:", exc)
+        if attempt < retries - 1:
+            time.sleep(delay_seconds)
+    return execution
+
+
+def market_context_spy_snapshot(market_context):
+    market_context = market_context or {}
+    timestamp = market_context.get("spy_quote_timestamp") or ""
+    parsed_timestamp = broker_timestamp(timestamp)
+    age_seconds = max(0.0, (market_now() - parsed_timestamp).total_seconds()) if parsed_timestamp else ""
+    return {
+        "price": valid_price(market_context.get("price")),
+        "quote_timestamp": parsed_timestamp.isoformat() if parsed_timestamp else "",
+        "quote_age_seconds": age_seconds,
+    }
+
+
+def entry_execution_diagnostics(market_context, contract, order_execution=None):
+    spy = market_context_spy_snapshot(market_context)
+    option = quote_execution_snapshot(contract)
+    order_execution = order_execution or {}
+    fill_price = order_execution.get("fill_price")
+    slippage = fill_price - option["midpoint"] if fill_price is not None and option["midpoint"] is not None else ""
+    return {
+        "EntrySpyPrice": spy["price"] if spy["price"] is not None else "",
+        "EntrySpyQuoteTimestamp": spy["quote_timestamp"],
+        "EntrySpyQuoteAgeSeconds": spy["quote_age_seconds"],
+        "EntryOptionBid": option["bid"] if option["bid"] is not None else "",
+        "EntryOptionAsk": option["ask"] if option["ask"] is not None else "",
+        "EntryOptionMidpoint": option["midpoint"] if option["midpoint"] is not None else "",
+        "EntryOptionLast": option["last"] if option["last"] is not None else "",
+        "EntryOptionQuoteTimestamp": option["quote_timestamp"],
+        "EntryOptionQuoteAgeSeconds": option["quote_age_seconds"],
+        "EntrySpreadDollars": option["spread_dollars"] if option["spread_dollars"] is not None else "",
+        "EntrySpreadPercent": option["spread_percent"] if option["spread_percent"] is not None else "",
+        "EntryRequestedOrderType": "market",
+        "EntryRequestedOrderPrice": "",
+        "EntryBrokerOrderStatus": order_execution.get("order_status", ""),
+        "EntryBrokerFillPrice": fill_price if fill_price is not None else "",
+        "EntryBrokerFillTimestamp": order_execution.get("fill_timestamp", ""),
+        "EntrySlippageFromMidpoint": slippage,
+    }
+
+
+def exit_trigger_diagnostics(quote, spy_price, hard_stop_price, trailing_stop_price, effective_stop_price):
+    option = quote_execution_snapshot(quote)
+    return {
+        "ExitTriggerOptionBid": option["bid"] if option["bid"] is not None else "",
+        "ExitTriggerOptionAsk": option["ask"] if option["ask"] is not None else "",
+        "ExitTriggerOptionMidpoint": option["midpoint"] if option["midpoint"] is not None else "",
+        "ExitTriggerOptionLast": option["last"] if option["last"] is not None else "",
+        "ExitTriggerQuoteTimestamp": option["quote_timestamp"],
+        "ExitTriggerQuoteAgeSeconds": option["quote_age_seconds"],
+        "ExitHardStopPrice": hard_stop_price if hard_stop_price is not None else "",
+        "ExitTrailingStopPrice": trailing_stop_price if trailing_stop_price is not None else "",
+        "ExitEffectiveStopPrice": effective_stop_price if effective_stop_price is not None else "",
+        "ExitStopPriceSource": option["price_source"],
+        "ExitTriggerPrice": option["selected_price"] if option["selected_price"] is not None else "",
+        "ExitTriggerSpyPrice": spy_price if spy_price is not None else "",
+    }
+
+
+def exit_execution_diagnostics(trigger_diagnostics, pre_exit_quote, spy_exit_price, entry_row, order_execution=None):
+    diagnostics = dict(trigger_diagnostics or {})
+    pre_exit = quote_execution_snapshot(pre_exit_quote)
+    order_execution = order_execution or {}
+    fill_price = order_execution.get("fill_price")
+    trigger_price = valid_price(diagnostics.get("ExitTriggerPrice"))
+    entry_spy_price = valid_price((entry_row or {}).get("EntrySpyPrice"))
+    exit_spy_price = valid_price(spy_exit_price)
+    spy_change = exit_spy_price - entry_spy_price if exit_spy_price is not None and entry_spy_price is not None else None
+    spy_change_percent = (spy_change / entry_spy_price) * 100 if spy_change is not None and entry_spy_price else None
+    diagnostics.update({
+        "ExitOptionBid": pre_exit["bid"] if pre_exit["bid"] is not None else "",
+        "ExitOptionAsk": pre_exit["ask"] if pre_exit["ask"] is not None else "",
+        "ExitOptionMidpoint": pre_exit["midpoint"] if pre_exit["midpoint"] is not None else "",
+        "ExitOptionLast": pre_exit["last"] if pre_exit["last"] is not None else "",
+        "ExitOptionQuoteTimestamp": pre_exit["quote_timestamp"],
+        "ExitOptionQuoteAgeSeconds": pre_exit["quote_age_seconds"],
+        "ExitRequestedOrderType": "market",
+        "ExitRequestedOrderPrice": "",
+        "ExitBrokerOrderStatus": order_execution.get("order_status", ""),
+        "ExitBrokerFillPrice": fill_price if fill_price is not None else "",
+        "ExitBrokerFillTimestamp": order_execution.get("fill_timestamp", ""),
+        "ExitSlippageFromTrigger": fill_price - trigger_price if fill_price is not None and trigger_price is not None else "",
+        "ExitSpyPrice": exit_spy_price if exit_spy_price is not None else "",
+        "SpyChangeDollars": spy_change if spy_change is not None else "",
+        "SpyChangePercent": spy_change_percent if spy_change_percent is not None else "",
+    })
+    return diagnostics
+
+
 def default_pending_entry():
     return {
         "active": False,
@@ -2973,6 +3163,7 @@ def build_market_context(config, positions=None):
 
 
 def decide_surfer_action(config, positions, market_context):
+    original_market_context = market_context if isinstance(market_context, dict) else None
     market_context = normalize_signal(market_context)
     minimum_signals = int(config["entry_rules"].get("minimum_signals", 3))
     minimum_confidence = int(config.get("minimum_confidence", 2))
@@ -2997,14 +3188,35 @@ def decide_surfer_action(config, positions, market_context):
 
         pnl_percent = ((current_price - entry_price) / entry_price) * 100 if current_price and entry_price else 0
         stop_values = calculate_stop_state(symbol, entry_price, current_price, config)
+        hard_stop_price = entry_price * (1 - hard_stop_percent / 100) if entry_price else None
         trailing_stop_price = stop_values.get("effective_trailing_stop") or 0
         trailing_drawdown = ((peak - current_price) / peak) * 100 if current_price and peak else 0
         trailing_stop_active = bool(stop_values.get("stop_armed"))
         stop_control_rule = stop_values.get("stop_control_rule", "HARD STOP")
 
         if pnl_percent <= -hard_stop_percent:
+            trigger_snapshot = exit_trigger_diagnostics(
+                quote,
+                market_context.get("price"),
+                hard_stop_price,
+                stop_values.get("percentage_trailing_stop"),
+                trailing_stop_price,
+            )
+            market_context["exit_trigger_diagnostics"] = trigger_snapshot
+            if original_market_context is not None:
+                original_market_context["exit_trigger_diagnostics"] = trigger_snapshot
             return "SELL", ["Hard stop hit", f"P/L {pnl_percent:.2f}%"]
         if trailing_stop_active and current_price is not None and current_price <= trailing_stop_price:
+            trigger_snapshot = exit_trigger_diagnostics(
+                quote,
+                market_context.get("price"),
+                hard_stop_price,
+                stop_values.get("percentage_trailing_stop"),
+                trailing_stop_price,
+            )
+            market_context["exit_trigger_diagnostics"] = trigger_snapshot
+            if original_market_context is not None:
+                original_market_context["exit_trigger_diagnostics"] = trigger_snapshot
             return "SELL", ["Trailing stop hit", f"Current {current_price:.2f} <= effective stop {trailing_stop_price:.2f}", f"Rule: {stop_control_rule}"]
 
         trailing_reason = "Trailing stop not hit" if trailing_stop_active else "Trailing stop inactive"
@@ -3969,6 +4181,7 @@ def execute_entry_buy(config, decision, side, contract, contracts, reference_pri
         )
         return False
 
+    entry_diagnostics = entry_execution_diagnostics(market_context, contract)
     ok, order_status, status, text = submit_and_parse_option_order(
         contract["symbol"],
         contracts,
@@ -3978,6 +4191,15 @@ def execute_entry_buy(config, decision, side, contract, contracts, reference_pri
     order_id = extract_order_id(text)
 
     if ok:
+        order_execution = fetch_broker_order_execution(order_id, text)
+        fill_price = order_execution.get("fill_price")
+        midpoint = valid_price(entry_diagnostics.get("EntryOptionMidpoint"))
+        entry_diagnostics.update({
+            "EntryBrokerOrderStatus": order_execution.get("order_status", ""),
+            "EntryBrokerFillPrice": fill_price if fill_price is not None else "",
+            "EntryBrokerFillTimestamp": order_execution.get("fill_timestamp", ""),
+            "EntrySlippageFromMidpoint": fill_price - midpoint if fill_price is not None and midpoint is not None else "",
+        })
         entry_price, entry_price_source, estimated_entry_price = resolve_actual_entry_price(
             contract["symbol"],
             contracts,
@@ -3991,7 +4213,8 @@ def execute_entry_buy(config, decision, side, contract, contracts, reference_pri
             source="BOT",
             market_context=market_context,
             entry_price_source=entry_price_source,
-            estimated_entry_price=estimated_entry_price
+            estimated_entry_price=estimated_entry_price,
+            execution_diagnostics=entry_diagnostics
         )
         log_bot_audit(
             decision,
@@ -4314,7 +4537,11 @@ def process_pending_entry(config):
             f"PENDING BUY confirmed: momentum {current_price:.2f} >= {confirmation_price:.2f}; "
             f"breakout {pending.get('current_breakout_candle')}/{pending.get('required_breakout_candles')}"
         )
-        buy_submitted = execute_entry_buy(config, decision, side, contract, contracts, current_price, market_context, label="MOMENTUM ENTRY")
+        entry_contract = dict(contract)
+        if isinstance(quote, dict):
+            entry_contract.update(quote)
+            entry_contract["symbol"] = option_symbol
+        buy_submitted = execute_entry_buy(config, decision, side, entry_contract, contracts, current_price, market_context, label="MOMENTUM ENTRY")
         upsert_pending_history(
             pending,
             final_status="BUY SUBMITTED" if buy_submitted else "CONFIRMED",
@@ -4384,6 +4611,7 @@ def try_surfer_exit(config, positions, market_context):
         entry_price = option_entry_price(cost_basis, qty)
         quote = get_market_quote(symbol)
         current_price = get_quote_price(quote) or entry_price
+        trigger_diagnostics = dict(market_context.get("exit_trigger_diagnostics") or {})
 
         exit_reasons = market_context.get("decision_reasons", [])
         reason = "; ".join(exit_reasons)
@@ -4403,9 +4631,26 @@ def try_surfer_exit(config, positions, market_context):
         order_id = extract_order_id(text)
 
         if ok:
-            pnl = option_pnl(current_price, cost_basis, qty)
             entry_row = find_last_buy(symbol)
-            trade_row = log_trade("SELL", symbol, qty, current_price, pnl, source="BOT", market_context=market_context)
+            order_execution = fetch_broker_order_execution(order_id, text)
+            execution_diagnostics = exit_execution_diagnostics(
+                trigger_diagnostics,
+                quote,
+                market_context.get("price"),
+                entry_row,
+                order_execution,
+            )
+            pnl = option_pnl(current_price, cost_basis, qty)
+            trade_row = log_trade(
+                "SELL",
+                symbol,
+                qty,
+                current_price,
+                pnl,
+                source="BOT",
+                market_context=market_context,
+                execution_diagnostics=execution_diagnostics,
+            )
             pnl_percent = ((current_price - entry_price) / entry_price) * 100 if entry_price else 0
             with BOT_LOCK:
                 max_profit = BOT_STATE["position_max_profit"].get(symbol, pnl)
@@ -4602,11 +4847,21 @@ def fast_exit_poll(config, positions):
             ] + reasons
 
     market_context = current_market_context_snapshot()
+    trigger_diagnostics = {}
+    if decision == "SELL":
+        trigger_diagnostics = exit_trigger_diagnostics(
+            quote,
+            market_context.get("price"),
+            hard_stop_price,
+            percentage_trailing_stop,
+            trailing_stop_price,
+        )
     market_context.update({
         "decision": decision,
         "decision_reasons": reasons,
         "current_pl": pnl,
-        "distance_to_trailing_stop": distance_to_trailing_stop
+        "distance_to_trailing_stop": distance_to_trailing_stop,
+        "exit_trigger_diagnostics": trigger_diagnostics,
     })
 
     with BOT_LOCK:
@@ -4704,7 +4959,24 @@ def fast_exit_poll(config, positions):
 
     if ok:
         entry_row = find_last_buy(symbol)
-        trade_row = log_trade("SELL", symbol, qty, current_price, pnl, source="BOT", market_context=market_context)
+        order_execution = fetch_broker_order_execution(order_id, text)
+        execution_diagnostics = exit_execution_diagnostics(
+            trigger_diagnostics,
+            quote,
+            market_context.get("price"),
+            entry_row,
+            order_execution,
+        )
+        trade_row = log_trade(
+            "SELL",
+            symbol,
+            qty,
+            current_price,
+            pnl,
+            source="BOT",
+            market_context=market_context,
+            execution_diagnostics=execution_diagnostics,
+        )
         with BOT_LOCK:
             max_profit = BOT_STATE["position_max_profit"].get(symbol, pnl)
             max_drawdown = BOT_STATE["position_max_drawdown"].get(symbol, pnl)
@@ -4864,6 +5136,9 @@ def surfer_bot_tick(allow_entry=True):
     market_scan_ms = int((time.perf_counter() - market_scan_started_at) * 1000)
     signal_started_at = time.perf_counter()
     signal = normalize_signal(signal)
+    spy_quote_diagnostics = quote_execution_snapshot(quote)
+    signal["spy_quote_timestamp"] = spy_quote_diagnostics.get("quote_timestamp", "")
+    signal["spy_quote_age_seconds"] = spy_quote_diagnostics.get("quote_age_seconds", "")
     update_bot_signal_state(signal, call_cost, put_cost)
     try:
         update_shadow_research(signal, call, put, price)
@@ -5810,6 +6085,19 @@ def fmt_seconds_or_na(value):
     return f"{escape_html(value)}s"
 
 
+def fmt_seconds_value(value):
+    if value in (None, ""):
+        return "N/A"
+    return f"{safe_float(value):.2f}s"
+
+
+def fmt_signed_money_value(value):
+    if value in (None, ""):
+        return "N/A"
+    number = safe_float(value)
+    return f"{number:+.2f}"
+
+
 def enrich_trade_rows(rows):
     open_buys = {}
     enriched = []
@@ -6018,6 +6306,16 @@ Entry Grade: {escape_html(trade_entry_grade(trade))}<br>
 Overall Grade: {escape_html(trade_grade(trade))}<br>
 Timestamp: {escape_html(trade.get("Time", ""))}<br>
 <br>
+Execution Diagnostics<br>
+SPY Entry Price: {fmt_trade_price(trade.get("EntrySpyPrice"))}<br>
+SPY Quote Timestamp / Age: {escape_html(trade.get("EntrySpyQuoteTimestamp") or "N/A")} / {fmt_seconds_value(trade.get("EntrySpyQuoteAgeSeconds"))}<br>
+Option Bid / Ask / Mid / Last: {fmt_trade_price(trade.get("EntryOptionBid"))} / {fmt_trade_price(trade.get("EntryOptionAsk"))} / {fmt_trade_price(trade.get("EntryOptionMidpoint"))} / {fmt_trade_price(trade.get("EntryOptionLast"))}<br>
+Option Quote Timestamp / Age: {escape_html(trade.get("EntryOptionQuoteTimestamp") or "N/A")} / {fmt_seconds_value(trade.get("EntryOptionQuoteAgeSeconds"))}<br>
+Entry Spread: {fmt_trade_price(trade.get("EntrySpreadDollars"))} ({fmt_percent(trade.get("EntrySpreadPercent"))})<br>
+Requested Order: {escape_html(trade.get("EntryRequestedOrderType") or "N/A")} @ {fmt_trade_price(trade.get("EntryRequestedOrderPrice"))}<br>
+Broker Fill: {fmt_trade_price(trade.get("EntryBrokerFillPrice"))} at {escape_html(trade.get("EntryBrokerFillTimestamp") or "N/A")} ({escape_html(trade.get("EntryBrokerOrderStatus") or "N/A")})<br>
+Entry Slippage vs Midpoint: {fmt_signed_money_value(trade.get("EntrySlippageFromMidpoint"))}<br>
+<br>
 Market State: {escape_html(market_state)}<br>
 Bullish Score: {escape_html(entry_bullish_score)} / 10<br>
 Bearish Score: {escape_html(entry_bearish_score)} / 10<br>
@@ -6057,6 +6355,18 @@ Symbol: {escape_html(trade.get("Symbol", ""))}<br>
 Qty: {escape_html(trade.get("Qty", ""))}<br>
 Entry: {fmt_trade_price(trade.get("Entry"))}{entry_source_label(trade)}<br>
 Exit: {fmt_trade_price(trade.get("Exit"))}<br>
+Broker Exit Fill: {fmt_trade_price(trade.get("ExitBrokerFillPrice"))} ({escape_html(trade.get("ExitBrokerOrderStatus") or "N/A")})<br>
+Broker Fill Timestamp: {escape_html(trade.get("ExitBrokerFillTimestamp") or "N/A")}<br>
+Requested Exit Order: {escape_html(trade.get("ExitRequestedOrderType") or "N/A")} @ {fmt_trade_price(trade.get("ExitRequestedOrderPrice"))}<br>
+Trigger Bid / Ask / Mid / Last: {fmt_trade_price(trade.get("ExitTriggerOptionBid"))} / {fmt_trade_price(trade.get("ExitTriggerOptionAsk"))} / {fmt_trade_price(trade.get("ExitTriggerOptionMidpoint"))} / {fmt_trade_price(trade.get("ExitTriggerOptionLast"))}<br>
+Trigger Quote Timestamp / Age: {escape_html(trade.get("ExitTriggerQuoteTimestamp") or "N/A")} / {fmt_seconds_value(trade.get("ExitTriggerQuoteAgeSeconds"))}<br>
+Stop Trigger Price / Source: {fmt_trade_price(trade.get("ExitTriggerPrice"))} / {escape_html(trade.get("ExitStopPriceSource") or "N/A")}<br>
+Hard / Trailing / Effective Stop: {fmt_trade_price(trade.get("ExitHardStopPrice"))} / {fmt_trade_price(trade.get("ExitTrailingStopPrice"))} / {fmt_trade_price(trade.get("ExitEffectiveStopPrice"))}<br>
+Pre-Exit Bid / Ask / Mid / Last: {fmt_trade_price(trade.get("ExitOptionBid"))} / {fmt_trade_price(trade.get("ExitOptionAsk"))} / {fmt_trade_price(trade.get("ExitOptionMidpoint"))} / {fmt_trade_price(trade.get("ExitOptionLast"))}<br>
+Exit Quote Timestamp / Age: {escape_html(trade.get("ExitOptionQuoteTimestamp") or "N/A")} / {fmt_seconds_value(trade.get("ExitOptionQuoteAgeSeconds"))}<br>
+Exit Slippage vs Trigger: {fmt_signed_money_value(trade.get("ExitSlippageFromTrigger"))}<br>
+SPY Entry / Exit: {fmt_trade_price(trade.get("EntrySpyPrice"))} / {fmt_trade_price(trade.get("ExitSpyPrice"))}<br>
+Underlying Movement During Trade: {fmt_signed_money_value(trade.get("SpyChangeDollars"))} ({fmt_percent(trade.get("SpyChangePercent"))})<br>
 Peak Price: {fmt_trade_price(trade.get("PeakPrice"))}<br>
 Hard Stop Price: {fmt_trade_price(trade.get("HardStopPrice"))}<br>
 Trailing Stop Price: {fmt_trade_price(trade.get("TrailingStopPrice"))}<br>
@@ -6889,6 +7199,89 @@ Contracts: {tournament_input(profile_id, row, "contracts", minimum=1)}<br>
 """)
         return "".join(rows)
 
+    def render_tournament_decision_cards(decisions):
+        decisions = decisions or {}
+        cards = []
+        for profile_id in PROFILE_ORDER:
+            row = decisions.get(profile_id, {})
+            settings_row = tournament_settings.get(profile_id, {})
+            state = TOURNAMENT_RUNTIME_STATES.get(profile_id)
+            counters = tournament_pipeline_counters(state) if state else {}
+            block_reasons = counters.get("entry_block_reasons") or {}
+            block_reason_rows = "".join(
+                f'<div class="debug-row"><span>{escape_html(reason)}</span><strong>{escape_html(count)}</strong></div>'
+                for reason, count in block_reasons.items()
+            ) or '<div class="debug-row"><span>Entry Block Reasons</span><strong>None</strong></div>'
+            counter_rows = "".join(
+                f'<div class="debug-row"><span>{escape_html(key.replace("_", " ").title())}</span><strong>{escape_html(value)}</strong></div>'
+                for key, value in counters.items()
+                if key != "entry_block_reasons"
+            )
+            dominant_side = row.get("preliminary_direction") or "NONE"
+            final_direction = row.get("final_direction") or row.get("direction") or "NONE"
+            accepted = bool(row.get("accepted"))
+            accepted_class = "good" if accepted else "bad"
+            rejection_reason = row.get("rejection_reason") or "None"
+            entry_block_reason = row.get("entry_block_reason") or "None"
+            position = state.virtual_position if state else None
+            position_source = tournament_position_source(position)
+            or_required = bool(row.get("or_confirmation_required"))
+            or_progress = (
+                f'{"PASS" if row.get("two_candle_or_passed") else "WAITING"} / '
+                f'{escape_html(settings_row.get("required_breakout_candles", 2))} candles required'
+                if or_required else "Not required"
+            )
+            cards.append(f"""
+<article class="tournament-decision-card" data-profile-id="{escape_html(profile_id)}">
+<div class="tournament-card-header">
+<div><div class="profile-kicker">{escape_html(profile_id)}</div><h3>{escape_html(settings_row.get("display_name", profile_id))}</h3></div>
+<div class="status-badges"><span class="status-pill">{"Enabled" if settings_row.get("enabled", True) else "Disabled"}</span><span class="status-pill">{escape_html(row.get("status", "N/A"))}</span></div>
+</div>
+<section class="decision-highlight">
+<div><span>Final Direction</span><strong>{escape_html(final_direction)}</strong></div>
+<div><span>Accepted</span><strong class="{accepted_class}">{escape_html(accepted)}</strong></div>
+<div><span>Entry Status</span><strong>{escape_html(row.get("entry_status") or "N/A")}</strong></div>
+<div class="wide"><span>Entry Block Reason</span><strong>{escape_html(entry_block_reason)}</strong></div>
+<div class="wide"><span>Rejection Reason</span><strong>{escape_html(rejection_reason)}</strong></div>
+</section>
+<div class="tournament-section-grid">
+<section class="tournament-section"><h4>Signal</h4>
+<div class="kv-grid"><span>Bullish Score</span><strong>{escape_html(row.get("bullish_score", 0))}</strong><span>Bearish Score</span><strong>{escape_html(row.get("bearish_score", 0))}</strong><span>Confidence</span><strong>{escape_html(row.get("confidence", 0))}</strong><span>Dominant Side</span><strong>{escape_html(dominant_side)}</strong><span>Dominance</span><strong>{safe_float(row.get("dominance_percent")):.1f}%</strong><span>Direction Threshold</span><strong>{safe_float(row.get("direction_threshold")):.1f}%</strong><span>Minimum Dominance</span><strong>{safe_float(row.get("minimum_dominance")):.1f}%</strong></div>
+</section>
+<section class="tournament-section"><h4>Contract</h4>
+<div class="kv-grid"><span>Call Contract</span><strong>{escape_html(row.get("call_contract") or "N/A")}</strong><span>Put Contract</span><strong>{escape_html(row.get("put_contract") or "N/A")}</strong><span>Candidate Direction</span><strong>{escape_html(row.get("momentum_candidate_direction") or "N/A")}</strong><span>Candidate Option</span><strong>{escape_html(row.get("momentum_candidate_option_symbol") or "N/A")}</strong><span>Direction Match</span><strong>{escape_html(row.get("contract_direction_match") if row.get("contract_direction_match") is not None else "N/A")}</strong><span>Starting Price</span><strong>{fmt_trade_price(row.get("momentum_starting_price"))}</strong><span>Current Price</span><strong>{fmt_trade_price(row.get("momentum_current_price"))}</strong><span>Option Premium</span><strong>{fmt_trade_price(row.get("option_premium"))}</strong><span>Contracts</span><strong>{escape_html(row.get("contracts") or settings_row.get("contracts", "N/A"))}</strong><span>Total Position Cost</span><strong>{fmt_money(row.get("total_position_cost"))}</strong><span>Maximum Position Cost</span><strong>{fmt_money(row.get("maximum_position_cost_dollars"))}</strong></div>
+</section>
+<section class="tournament-section"><h4>Momentum</h4>
+<div class="kv-grid"><span>Result</span><strong>{escape_html(row.get("momentum_status", "N/A"))}</strong><span>Movement Observed</span><strong>{safe_float(row.get("momentum_observed_percent")):.2f}%</strong><span>Movement Required</span><strong>{safe_float(row.get("momentum_required_percent")):.2f}%</strong><span>Candidate Age</span><strong>{safe_float(row.get("momentum_candidate_age_seconds")):.0f}s</strong><span>Time Remaining</span><strong>{safe_float(row.get("momentum_time_remaining_seconds")):.0f}s</strong><span>Block Reason</span><strong>{escape_html(row.get("momentum_block_reason") or "None")}</strong></div>
+</section>
+<section class="tournament-section"><h4>Opening Range</h4>
+<div class="kv-grid"><span>OR Result</span><strong>{escape_html(row.get("or_confirmation_status", "N/A"))}</strong><span>Required</span><strong>{escape_html(or_required)}</strong><span>Progress</span><strong>{or_progress}</strong></div>
+</section>
+</div>
+<section class="final-decision-section"><h4>Final Decision</h4><div class="final-decision-grid"><div><span>Direction</span><strong>{escape_html(final_direction)}</strong></div><div><span>Accepted</span><strong class="{accepted_class}">{escape_html(accepted)}</strong></div><div><span>Entry Status</span><strong>{escape_html(row.get("entry_status") or "N/A")}</strong></div><div><span>Entry Block Reason</span><strong>{escape_html(entry_block_reason)}</strong></div><div><span>Rejection Reason</span><strong>{escape_html(rejection_reason)}</strong></div></div></section>
+<details class="pipeline-debug"><summary>Show Advanced Pipeline Debug</summary><div class="debug-grid">{counter_rows}{block_reason_rows}<div class="debug-row"><span>Decisions Evaluated</span><strong>{escape_html(state.decisions_evaluated if state else 0)}</strong></div><div class="debug-row"><span>Position Status</span><strong>{escape_html(position.status if position else "NONE")}</strong></div><div class="debug-row"><span>Position Source</span><strong>{escape_html(position_source)}</strong></div><div class="debug-row"><span>Position Option</span><strong>{escape_html(position.option_symbol if position else "N/A")}</strong></div></div></details>
+</article>
+""")
+        return "".join(cards)
+
+    def render_tournament_candidate_transition_cards(state_by_profile):
+        rows = []
+        for profile_id in ["BOT_B_MOMENTUM", "BOT_D_COMBINED"]:
+            state_row = (state_by_profile or {}).get(profile_id, {})
+            rows.extend(state_row.get("candidate_transitions") or [])
+        rows.sort(key=lambda row: safe_float(row.get("time")), reverse=True)
+        if not rows:
+            return "No candidate transitions yet."
+        cards = []
+        for row in rows[:20]:
+            cards.append(f"""
+<article class="candidate-transition-card">
+<div class="transition-header"><strong>{escape_html(row.get("profile_name") or row.get("profile_id") or "")}</strong><span>{escape_html(row.get("time") or "")}</span><span class="status-pill">{escape_html(row.get("status") or "N/A")}</span></div>
+<div class="transition-grid"><span>Direction</span><strong>{escape_html(row.get("old_direction") or "NONE")} &rarr; {escape_html(row.get("new_direction") or "NONE")}</strong><span>Option</span><strong>{escape_html(row.get("old_option") or "N/A")} &rarr; {escape_html(row.get("new_option") or "N/A")}</strong><span>Candidate Age</span><strong>{safe_float(row.get("candidate_age")):.1f}s</strong><span>Reason</span><strong>{escape_html(row.get("reason") or "None")}</strong></div>
+</article>
+""")
+        return "".join(cards)
+
     def render_tournament_trades_table_rows(trades):
         if not trades:
             return '<tr><td colspan="14">No tournament trades yet.</td></tr>'
@@ -7037,6 +7430,87 @@ button {{
     padding: 6px;
     text-align: left;
 }}
+.tournament-decision-grid {{
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 16px;
+}}
+.tournament-decision-card {{
+    min-width: 0;
+    background: #181a1b;
+    border: 1px solid #4b4f52;
+    border-top: 4px solid #00b7ff;
+    border-radius: 10px;
+    padding: 16px;
+}}
+.tournament-card-header,
+.transition-header {{
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+}}
+.tournament-card-header h3 {{ margin: 3px 0 0; font-size: 20px; }}
+.profile-kicker {{ color: #8f969b; font-size: 11px; letter-spacing: .08em; }}
+.status-badges {{ display: flex; gap: 6px; flex-wrap: wrap; }}
+.status-pill {{
+    display: inline-block;
+    border: 1px solid #596066;
+    background: #25282a;
+    border-radius: 999px;
+    padding: 4px 8px;
+    font-size: 12px;
+}}
+.decision-highlight,
+.final-decision-grid {{
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 8px;
+}}
+.decision-highlight {{ margin: 14px 0; }}
+.decision-highlight > div,
+.final-decision-grid > div {{ background: #242729; border-radius: 7px; padding: 9px; min-width: 0; }}
+.decision-highlight .wide {{ grid-column: span 3; }}
+.decision-highlight span,
+.final-decision-grid span {{ display: block; color: #9ca3a8; font-size: 12px; margin-bottom: 4px; }}
+.decision-highlight strong,
+.final-decision-grid strong {{ overflow-wrap: anywhere; }}
+.tournament-section-grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }}
+.tournament-section {{ background: #202325; border-radius: 8px; padding: 11px; min-width: 0; }}
+.tournament-section h4,
+.final-decision-section h4 {{ margin: 0 0 9px; color: #00d994; }}
+.kv-grid {{ display: grid; grid-template-columns: minmax(125px, .8fr) minmax(0, 1.2fr); gap: 6px 10px; }}
+.kv-grid span {{ color: #a9afb3; }}
+.kv-grid strong {{ overflow-wrap: anywhere; }}
+.final-decision-section {{ margin-top: 12px; padding: 12px; border: 1px solid #00b7ff; border-radius: 8px; background: #16242a; }}
+.pipeline-debug {{ margin-top: 12px; background: #202325; border-radius: 8px; padding: 10px; }}
+.pipeline-debug summary {{ cursor: pointer; font-weight: bold; color: #ffd166; }}
+.debug-grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px 14px; margin-top: 10px; }}
+.debug-row {{ display: flex; justify-content: space-between; gap: 12px; border-bottom: 1px solid #383c3f; padding: 5px 0; min-width: 0; }}
+.debug-row span {{ color: #a9afb3; overflow-wrap: anywhere; }}
+.debug-row strong {{ text-align: right; overflow-wrap: anywhere; }}
+.candidate-transition-list {{ display: grid; gap: 10px; }}
+.candidate-transition-card {{ background: #1b1b1b; border-left: 4px solid #ffd166; border-radius: 8px; padding: 12px; }}
+.transition-header {{ margin-bottom: 9px; }}
+.transition-header > span:not(.status-pill) {{ color: #a9afb3; }}
+.transition-grid {{ display: grid; grid-template-columns: 105px minmax(0, 1fr); gap: 6px 10px; }}
+.transition-grid span {{ color: #a9afb3; }}
+.transition-grid strong {{ overflow-wrap: anywhere; }}
+.compact-raw-table {{ margin-top: 14px; }}
+.compact-raw-table summary {{ cursor: pointer; font-weight: bold; }}
+.compact-raw-table .history-panel {{ margin-top: 10px; }}
+@media (max-width: 1050px) {{
+    .tournament-decision-grid {{ grid-template-columns: 1fr; }}
+}}
+@media (max-width: 700px) {{
+    body {{ margin: 12px; }}
+    .tournament-section-grid,
+    .decision-highlight,
+    .final-decision-grid,
+    .debug-grid {{ grid-template-columns: 1fr; }}
+    .decision-highlight .wide {{ grid-column: span 1; }}
+}}
 </style>
 </head>
 <body>
@@ -7094,6 +7568,12 @@ Bot Reason Log:<br>
 
 <div class="card">
 <h2>Tournament Decisions</h2>
+<div class="tournament-decision-grid" id="tournament-decision-cards">
+{render_tournament_decision_cards(bot_snapshot.get("tournament_decisions"))}
+</div>
+<details class="compact-raw-table">
+<summary>Compact Raw Table</summary>
+<div class="history-panel">
 <table class="decision-table">
 <thead>
 <tr>
@@ -7146,33 +7626,18 @@ Bot Reason Log:<br>
 <th>Profit Floor</th>
 </tr>
 </thead>
-<tbody id="tournament-decisions-body">
+<tbody id="tournament-decisions-raw-body">
 {render_tournament_decisions_table(bot_snapshot.get("tournament_decisions"))}
 </tbody>
 </table>
 </div>
+</details>
+</div>
 
 <div class="card">
 <h2>Bot B / Bot D Momentum Candidate Transitions (Last 20)</h2>
-<div class="history-panel">
-<table class="decision-table">
-<thead>
-<tr>
-<th>Time</th>
-<th>Profile</th>
-<th>Old Direction</th>
-<th>New Direction</th>
-<th>Old Option</th>
-<th>New Option</th>
-<th>Status</th>
-<th>Reason</th>
-<th>Candidate Age</th>
-</tr>
-</thead>
-<tbody id="tournament-candidate-transitions-body">
-<tr><td colspan="9">No candidate transitions yet.</td></tr>
-</tbody>
-</table>
+<div class="history-panel candidate-transition-list" id="tournament-candidate-transitions">
+{render_tournament_candidate_transition_cards(bot_snapshot.get("tournament_state_by_profile"))}
 </div>
 </div>
 
@@ -8134,14 +8599,71 @@ const TOURNAMENT_PROFILES = [
 ];
 
 function renderTournamentDecisions(decisions, evaluatedByProfile, settings, stateByProfile) {{
-    const el = document.getElementById("tournament-decisions-body");
-    if (!el) return;
+    const cardsEl = document.getElementById("tournament-decision-cards");
+    const rawEl = document.getElementById("tournament-decisions-raw-body");
+    if (!cardsEl && !rawEl) return;
 
     decisions = decisions || {{}};
     evaluatedByProfile = evaluatedByProfile || {{}};
     settings = settings || {{}};
     stateByProfile = stateByProfile || {{}};
-    el.innerHTML = TOURNAMENT_PROFILES.map(([profileId, label]) => {{
+    if (cardsEl) {{
+        cardsEl.innerHTML = TOURNAMENT_PROFILES.map(([profileId, label]) => {{
+            const row = decisions[profileId] || {{}};
+            const profileSettings = settings[profileId] || {{}};
+            const state = stateByProfile[profileId] || {{}};
+            const counters = state.pipeline_counters || {{}};
+            const blockReasons = counters.entry_block_reasons || {{}};
+            const finalDirection = row.final_direction || row.direction || "NONE";
+            const dominantSide = row.preliminary_direction || "NONE";
+            const accepted = Boolean(row.accepted);
+            const acceptedClass = accepted ? "good" : "bad";
+            const orRequired = Boolean(row.or_confirmation_required);
+            const orProgress = orRequired
+                ? `${{row.two_candle_or_passed ? "PASS" : "WAITING"}} / ${{escapeHtml(profileSettings.required_breakout_candles ?? 2)}} candles required`
+                : "Not required";
+            const counterRows = Object.entries(counters)
+                .filter(([key]) => key !== "entry_block_reasons")
+                .map(([key, value]) => `<div class="debug-row"><span>${{escapeHtml(key.replaceAll("_", " "))}}</span><strong>${{escapeHtml(value)}}</strong></div>`)
+                .join("");
+            const blockRows = Object.entries(blockReasons).length
+                ? Object.entries(blockReasons).map(([reason, count]) => `<div class="debug-row"><span>${{escapeHtml(reason)}}</span><strong>${{escapeHtml(count)}}</strong></div>`).join("")
+                : '<div class="debug-row"><span>Entry Block Reasons</span><strong>None</strong></div>';
+            const position = state.virtual_position || null;
+            const positionSource = position?.position_source || state.position_source || "NONE";
+            return `
+<article class="tournament-decision-card" data-profile-id="${{escapeHtml(profileId)}}">
+<div class="tournament-card-header">
+<div><div class="profile-kicker">${{escapeHtml(profileId)}}</div><h3>${{escapeHtml(label)}}</h3></div>
+<div class="status-badges"><span class="status-pill">${{profileSettings.enabled === false ? "Disabled" : "Enabled"}}</span><span class="status-pill">${{escapeHtml(row.status || "N/A")}}</span></div>
+</div>
+<section class="decision-highlight">
+<div><span>Final Direction</span><strong>${{escapeHtml(finalDirection)}}</strong></div>
+<div><span>Accepted</span><strong class="${{acceptedClass}}">${{escapeHtml(accepted)}}</strong></div>
+<div><span>Entry Status</span><strong>${{escapeHtml(row.entry_status || "N/A")}}</strong></div>
+<div class="wide"><span>Entry Block Reason</span><strong>${{escapeHtml(row.entry_block_reason || "None")}}</strong></div>
+<div class="wide"><span>Rejection Reason</span><strong>${{escapeHtml(row.rejection_reason || "None")}}</strong></div>
+</section>
+<div class="tournament-section-grid">
+<section class="tournament-section"><h4>Signal</h4><div class="kv-grid">
+<span>Bullish Score</span><strong>${{escapeHtml(row.bullish_score ?? 0)}}</strong><span>Bearish Score</span><strong>${{escapeHtml(row.bearish_score ?? 0)}}</strong><span>Confidence</span><strong>${{escapeHtml(row.confidence ?? 0)}}</strong><span>Dominant Side</span><strong>${{escapeHtml(dominantSide)}}</strong><span>Dominance</span><strong>${{Number(row.dominance_percent || 0).toFixed(1)}}%</strong><span>Direction Threshold</span><strong>${{Number(row.direction_threshold || 0).toFixed(1)}}%</strong><span>Minimum Dominance</span><strong>${{Number(row.minimum_dominance || 0).toFixed(1)}}%</strong>
+</div></section>
+<section class="tournament-section"><h4>Contract</h4><div class="kv-grid">
+<span>Call Contract</span><strong>${{escapeHtml(row.call_contract || "N/A")}}</strong><span>Put Contract</span><strong>${{escapeHtml(row.put_contract || "N/A")}}</strong><span>Candidate Direction</span><strong>${{escapeHtml(row.momentum_candidate_direction || "N/A")}}</strong><span>Candidate Option</span><strong>${{escapeHtml(row.momentum_candidate_option_symbol || "N/A")}}</strong><span>Direction Match</span><strong>${{escapeHtml(row.contract_direction_match ?? "N/A")}}</strong><span>Starting Price</span><strong>${{fmtMoney(row.momentum_starting_price)}}</strong><span>Current Price</span><strong>${{fmtMoney(row.momentum_current_price)}}</strong><span>Option Premium</span><strong>${{fmtMoney(row.option_premium)}}</strong><span>Contracts</span><strong>${{escapeHtml(row.contracts || profileSettings.contracts || "N/A")}}</strong><span>Total Position Cost</span><strong>${{fmtMoney(row.total_position_cost)}}</strong><span>Maximum Position Cost</span><strong>${{fmtMoney(row.maximum_position_cost_dollars)}}</strong>
+</div></section>
+<section class="tournament-section"><h4>Momentum</h4><div class="kv-grid">
+<span>Result</span><strong>${{escapeHtml(row.momentum_status || "N/A")}}</strong><span>Movement Observed</span><strong>${{Number(row.momentum_observed_percent || 0).toFixed(2)}}%</strong><span>Movement Required</span><strong>${{Number(row.momentum_required_percent || 0).toFixed(2)}}%</strong><span>Candidate Age</span><strong>${{Number(row.momentum_candidate_age_seconds || 0).toFixed(0)}}s</strong><span>Time Remaining</span><strong>${{Number(row.momentum_time_remaining_seconds || 0).toFixed(0)}}s</strong><span>Block Reason</span><strong>${{escapeHtml(row.momentum_block_reason || "None")}}</strong>
+</div></section>
+<section class="tournament-section"><h4>Opening Range</h4><div class="kv-grid">
+<span>OR Result</span><strong>${{escapeHtml(row.or_confirmation_status || "N/A")}}</strong><span>Required</span><strong>${{escapeHtml(orRequired)}}</strong><span>Progress</span><strong>${{orProgress}}</strong>
+</div></section>
+</div>
+<section class="final-decision-section"><h4>Final Decision</h4><div class="final-decision-grid"><div><span>Direction</span><strong>${{escapeHtml(finalDirection)}}</strong></div><div><span>Accepted</span><strong class="${{acceptedClass}}">${{escapeHtml(accepted)}}</strong></div><div><span>Entry Status</span><strong>${{escapeHtml(row.entry_status || "N/A")}}</strong></div><div><span>Entry Block Reason</span><strong>${{escapeHtml(row.entry_block_reason || "None")}}</strong></div><div><span>Rejection Reason</span><strong>${{escapeHtml(row.rejection_reason || "None")}}</strong></div></div></section>
+<details class="pipeline-debug"><summary>Show Advanced Pipeline Debug</summary><div class="debug-grid">${{counterRows}}${{blockRows}}<div class="debug-row"><span>Decisions Evaluated</span><strong>${{escapeHtml(evaluatedByProfile[profileId] || 0)}}</strong></div><div class="debug-row"><span>Position Status</span><strong>${{escapeHtml(position?.status || "NONE")}}</strong></div><div class="debug-row"><span>Position Source</span><strong>${{escapeHtml(positionSource)}}</strong></div><div class="debug-row"><span>Position Option</span><strong>${{escapeHtml(position?.option_symbol || "N/A")}}</strong></div></div></details>
+</article>`;
+        }}).join("");
+    }}
+    if (rawEl) rawEl.innerHTML = TOURNAMENT_PROFILES.map(([profileId, label]) => {{
         const row = decisions[profileId] || {{}};
         const enabled = settings[profileId]?.enabled;
         const state = stateByProfile[profileId] || {{}};
@@ -8212,7 +8734,7 @@ C:${{escapeHtml(counters.candidates_started || 0)}}
 }}
 
 function renderTournamentCandidateTransitions(stateByProfile) {{
-    const el = document.getElementById("tournament-candidate-transitions-body");
+    const el = document.getElementById("tournament-candidate-transitions");
     if (!el) return;
     stateByProfile = stateByProfile || {{}};
     const rows = [];
@@ -8225,21 +8747,14 @@ function renderTournamentCandidateTransitions(stateByProfile) {{
     rows.sort((a, b) => Number(b.time || 0) - Number(a.time || 0));
     const latest = rows.slice(0, 20);
     if (!latest.length) {{
-        el.innerHTML = '<tr><td colspan="9">No candidate transitions yet.</td></tr>';
+        el.innerHTML = 'No candidate transitions yet.';
         return;
     }}
     el.innerHTML = latest.map((row) => `
-<tr>
-<td>${{escapeHtml(row.time || "")}}</td>
-<td>${{escapeHtml(row.profile_name || row.profile_id || "")}}</td>
-<td>${{escapeHtml(row.old_direction || "")}}</td>
-<td>${{escapeHtml(row.new_direction || "")}}</td>
-<td>${{escapeHtml(row.old_option || "")}}</td>
-<td>${{escapeHtml(row.new_option || "")}}</td>
-<td>${{escapeHtml(row.status || "")}}</td>
-<td>${{escapeHtml(row.reason || "")}}</td>
-<td>${{Number(row.candidate_age || 0).toFixed(1)}}s</td>
-</tr>`).join("");
+<article class="candidate-transition-card">
+<div class="transition-header"><strong>${{escapeHtml(row.profile_name || row.profile_id || "")}}</strong><span>${{escapeHtml(row.time || "")}}</span><span class="status-pill">${{escapeHtml(row.status || "N/A")}}</span></div>
+<div class="transition-grid"><span>Direction</span><strong>${{escapeHtml(row.old_direction || "NONE")}} &rarr; ${{escapeHtml(row.new_direction || "NONE")}}</strong><span>Option</span><strong>${{escapeHtml(row.old_option || "N/A")}} &rarr; ${{escapeHtml(row.new_option || "N/A")}}</strong><span>Candidate Age</span><strong>${{Number(row.candidate_age || 0).toFixed(1)}}s</strong><span>Reason</span><strong>${{escapeHtml(row.reason || "None")}}</strong></div>
+</article>`).join("");
 }}
 
 function fmtSignedMoney(value) {{
