@@ -367,6 +367,9 @@ def load_config():
     })
 
     config.setdefault("bot_enabled", False)
+    config.setdefault("require_realtime_entry_quotes", False)
+    config.setdefault("allow_delayed_sandbox_entries", False)
+    config.setdefault("max_entry_quote_age_seconds", 30)
     config.setdefault("strategy_mode", "SURFER")
     config.setdefault("scanner", {"interval_seconds": 60})
     config.setdefault("strategy", {})
@@ -806,6 +809,9 @@ def grade_exit_trade(symbol, qty, sell_price, pnl, market_context):
             pnl_percent = (float(pnl or 0) / entry_cost) * 100 if entry_cost else 0
         except:
             pass
+
+    if market_context.get("broker_realized_pnl_percent") is not None:
+        pnl_percent = market_context["broker_realized_pnl_percent"]
 
     score = 70
     reasons = []
@@ -1826,6 +1832,31 @@ def entry_execution_diagnostics(market_context, contract, order_execution=None):
         "EntryBrokerFillTimestamp": order_execution.get("fill_timestamp", ""),
         "EntrySlippageFromMidpoint": slippage,
     }
+
+
+def market_data_environment():
+    from urllib.parse import urlparse
+    host = urlparse(BASE_URL).hostname
+    return {"sandbox.tradier.com": "SANDBOX_DELAYED", "api.tradier.com": "PRODUCTION_REALTIME"}.get(host, "UNKNOWN")
+
+
+def entry_quote_freshness(config, contract, context):
+    environment = market_data_environment()
+    if not config.get("require_realtime_entry_quotes", False):
+        return True, "Freshness guard disabled"
+    if environment == "SANDBOX_DELAYED" and config.get("allow_delayed_sandbox_entries", False):
+        return True, "Delayed sandbox research override enabled"
+    limit = max(1, min(3600, safe_float(config.get("max_entry_quote_age_seconds"), 30)))
+    ages = {
+        "option": quote_execution_snapshot(contract)["quote_age_seconds"],
+        "SPY": market_context_spy_snapshot(context)["quote_age_seconds"],
+    }
+    for label, age in ages.items():
+        if age in (None, "") or not math.isfinite(float(age)) or float(age) < 0:
+            return False, f"ENTRY blocked: {label} quote timestamp unavailable/invalid ({environment})"
+        if float(age) > limit:
+            return False, f"ENTRY blocked: {label} quote age {float(age):.1f}s exceeds {limit:g}s ({environment})"
+    return True, "Entry quotes fresh"
 
 
 def exit_trigger_diagnostics(quote, spy_price, hard_stop_price, trailing_stop_price, effective_stop_price):
@@ -4182,6 +4213,12 @@ def execute_entry_buy(config, decision, side, contract, contracts, reference_pri
         return False
 
     entry_diagnostics = entry_execution_diagnostics(market_context, contract)
+    fresh, freshness_reason = entry_quote_freshness(config, contract, market_context)
+    if not fresh:
+        add_bot_reason(freshness_reason)
+        log_bot_audit("SKIP", decision, config.get("symbol", ""), market_context, config,
+                      option_symbol=contract.get("symbol", ""), skip_reason=freshness_reason)
+        return False
     ok, order_status, status, text = submit_and_parse_option_order(
         contract["symbol"],
         contracts,
@@ -4652,6 +4689,9 @@ def try_surfer_exit(config, positions, market_context):
                 execution_diagnostics=execution_diagnostics,
             )
             pnl_percent = ((current_price - entry_price) / entry_price) * 100 if entry_price else 0
+            if trade_row.get("PnLSource") == "BROKER_FILLS":
+                pnl = trade_row["PnL"]
+                pnl_percent = trade_row["PnLPercent"]
             with BOT_LOCK:
                 max_profit = BOT_STATE["position_max_profit"].get(symbol, pnl)
                 max_drawdown = BOT_STATE["position_max_drawdown"].get(symbol, pnl)
@@ -4977,6 +5017,9 @@ def fast_exit_poll(config, positions):
             market_context=market_context,
             execution_diagnostics=execution_diagnostics,
         )
+        if trade_row.get("PnLSource") == "BROKER_FILLS":
+            pnl = trade_row["PnL"]
+            pnl_percent = trade_row["PnLPercent"]
         with BOT_LOCK:
             max_profit = BOT_STATE["position_max_profit"].get(symbol, pnl)
             max_drawdown = BOT_STATE["position_max_drawdown"].get(symbol, pnl)
@@ -5476,7 +5519,9 @@ def api_quote():
     if not scanner_market_is_open():
         return jsonify({"quote": None, "market_open": False, "status": "MARKET_CLOSED", "symbol": symbol})
     quote = get_market_quote(symbol)
-    return jsonify({"quote": quote, "market_open": True, "symbol": symbol})
+    return jsonify({"quote": quote, "market_open": True, "symbol": symbol,
+                    "market_data_environment": market_data_environment(),
+                    "quote_age_seconds": quote_execution_snapshot(quote)["quote_age_seconds"]})
 
 
 @app.route("/api/market-structure")
@@ -5952,6 +5997,12 @@ def api_tournament_position_test_price():
 @app.route("/save-settings", methods=["POST"])
 def save_settings():
     config = load_config()
+    freshness_limit = safe_float(request.form.get("max_entry_quote_age_seconds", 30), None)
+    if freshness_limit is None or not math.isfinite(freshness_limit) or not 1 <= freshness_limit <= 3600:
+        return "Maximum entry quote age must be between 1 and 3600 seconds", 400
+    config["require_realtime_entry_quotes"] = request.form.get("require_realtime_entry_quotes") == "on"
+    config["allow_delayed_sandbox_entries"] = request.form.get("allow_delayed_sandbox_entries") == "on"
+    config["max_entry_quote_age_seconds"] = freshness_limit
 
     symbol_choice = request.form.get("symbol_choice", "SPY")
     custom_symbol = request.form.get("custom_symbol", "").strip().upper()
@@ -6121,6 +6172,7 @@ def enrich_trade_rows(rows):
         elif action == "SELL":
             matching_buys = open_buys.get(key, [])
             buy_row = matching_buys.pop(0) if matching_buys else None
+            display = broker_realized_values(display, buy_row)
             display["Entry"] = buy_row.get("Price", "") if buy_row else ""
             if buy_row:
                 display["EntryPriceSource"] = buy_row.get("EntryPriceSource", "")
@@ -6128,6 +6180,19 @@ def enrich_trade_rows(rows):
                 if not display.get("EntryGrade"):
                     display["EntryGrade"] = buy_row.get("EntryGrade", "")
             display["Exit"] = price
+            if display.get("PnLSource") == "BROKER_FILLS":
+                display["Entry"] = display["EntryBrokerFillPrice"]
+                display["Exit"] = display["ExitBrokerFillPrice"]
+                if row.get("PnLSource") != "BROKER_FILLS":
+                    exit_grade, score, reason, _ = grade_exit_trade(symbol, row.get("Qty"), display["Exit"], display["PnL"], {
+                        "broker_realized_pnl_percent": display["PnLPercent"],
+                        "decision": "SELL",
+                        "decision_reasons": (row.get("ExitReason") or "").splitlines(),
+                    })
+                    entry_grade = display.get("EntryGrade")
+                    overall = grade_from_score((grade_score(entry_grade) + grade_score(exit_grade)) / 2) if entry_grade else exit_grade
+                    display.update(ExitGrade=exit_grade, OverallGrade=overall, BotGrade=overall,
+                                   Grade=overall, TradeScore=score, GradeReason=reason)
             if not display["Entry"]:
                 exit_price = safe_float(price, None)
                 pnl = safe_float(row.get("PnL"), None)
@@ -6380,6 +6445,10 @@ Effective Trailing Stop: {fmt_trade_price(trade.get("EffectiveTrailingStop"))}<b
 Stop Control Rule: {escape_html(trade.get("StopControlRule", ""))}<br>
 Max Drawdown From Peak: {fmt_percent(trade.get("MaxDrawdownFromPeakPercent"))}<br>
 PnL: <span class="{pnl_class}">{pnl_display} ({fmt_percent(pnl_percent)})</span><br>
+P/L Source: {escape_html(trade.get("PnLSource") or "QUOTE / LEGACY")}<br>
+Trigger P/L: {fmt_money(trade.get("TriggerPnL"))} ({fmt_percent(trade.get("TriggerPnLPercent"))})<br>
+Quote P/L: {fmt_money(trade.get("QuotePnL"))}<br>
+Broker Realized P/L: {fmt_money(trade.get("BrokerRealizedPnL"))} ({fmt_percent(trade.get("BrokerRealizedPnLPercent"))})<br>
 Hold Time: {escape_html(trade.get("HoldTime") or "N/A")}<br>
 Entry Grade: {escape_html(trade_entry_grade(trade))}<br>
 Exit Grade: {escape_html(trade_exit_grade(trade))}<br>
@@ -7758,6 +7827,8 @@ Open Interest: <span id="open_interest">N/A</span>
 <div class="item"><div class="label">Ask</div><div class="value" id="quote-ask">{fmt_money(quote.get("ask"))}</div></div>
 <div class="item"><div class="label">Volume</div><div class="value" id="quote-volume">{fmt_int(quote.get("volume"))}</div></div>
 <div class="item"><div class="label">Avg Volume</div><div class="value" id="quote-average-volume">{fmt_int(quote.get("average_volume"))}</div></div>
+<div class="item"><div class="label">Market Data Environment</div><div class="value" id="quote-environment">{market_data_environment()}</div></div>
+<div class="item"><div class="label">Broker Quote Age (seconds)</div><div class="value" id="quote-broker-age">{fmt_seconds_value(quote_execution_snapshot(quote)["quote_age_seconds"])}</div></div>
 </div>
 """
     else:
@@ -8062,6 +8133,15 @@ Bot Reason Log:<br>
 <form method="POST" action="/save-settings" id="settings-form">
 
 <h3>General</h3>
+<h4>Market Data / Entry Freshness</h4>
+Environment: <strong>{market_data_environment()}</strong><br>
+Sandbox quotes are delayed approximately 15 minutes. Quote ages below are broker data ages.<br>
+Require fresh quotes for original BOT entries:
+<input type="checkbox" name="require_realtime_entry_quotes" {checked(config.get("require_realtime_entry_quotes", False))}><br>
+Maximum Entry Quote Age (seconds):
+<input type="number" name="max_entry_quote_age_seconds" min="1" max="3600" value="{config.get("max_entry_quote_age_seconds", 30)}"><br>
+Allow delayed sandbox entries for research (explicit override):
+<input type="checkbox" name="allow_delayed_sandbox_entries" {checked(config.get("allow_delayed_sandbox_entries", False))}><br>
 
 Bot Enabled:
 <input type="checkbox" name="bot_enabled" {checked(bot_enabled)}><br>
@@ -8908,6 +8988,8 @@ async function updateQuote() {{
     setText("quote-ask", fmtMoney(quote.ask));
     setText("quote-volume", fmtInt(quote.volume));
     setText("quote-average-volume", fmtInt(quote.average_volume));
+    setText("quote-environment", data.market_data_environment || "UNKNOWN");
+    setText("quote-broker-age", data.quote_age_seconds === "" || data.quote_age_seconds == null ? "N/A" : `${{Number(data.quote_age_seconds).toFixed(1)}}s`);
 }}
 
 async function updateCurrentPosition() {{

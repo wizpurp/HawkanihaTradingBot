@@ -1,5 +1,6 @@
 import csv
 import json
+import math
 import os
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -44,7 +45,9 @@ TRADE_COLUMNS = [
     "ExitOptionQuoteTimestamp", "ExitOptionQuoteAgeSeconds",
     "ExitRequestedOrderType", "ExitRequestedOrderPrice",
     "ExitBrokerOrderStatus", "ExitBrokerFillPrice", "ExitBrokerFillTimestamp",
-    "ExitSlippageFromTrigger", "ExitSpyPrice", "SpyChangeDollars", "SpyChangePercent"
+    "ExitSlippageFromTrigger", "ExitSpyPrice", "SpyChangeDollars", "SpyChangePercent",
+    "PnLSource", "QuotePnL", "TriggerPnL", "TriggerPnLPercent",
+    "BrokerRealizedPnL", "BrokerRealizedPnLPercent"
 ]
 
 ENTRY_EXECUTION_COLUMNS = [column for column in TRADE_COLUMNS if column.startswith("Entry") and column not in {
@@ -152,7 +155,7 @@ def write_trade_header(path):
         writer.writerow(TRADE_COLUMNS)
 
 
-def find_last_buy(symbol):
+def find_last_buy(symbol, source=None):
     try:
         with open(TRADES_FILE, "r", newline="") as f:
             rows = list(csv.DictReader(f))
@@ -160,9 +163,42 @@ def find_last_buy(symbol):
         return None
 
     for row in reversed(rows):
-        if row.get("Symbol") == symbol and row.get("Action") == "BUY":
+        if row.get("Symbol") == symbol and row.get("Action") == "BUY" and (source is None or (row.get("Source") or "HUMAN") == source):
             return row
     return None
+
+
+def broker_realized_values(row, buy_row=None):
+    result = dict(row)
+    if row.get("Action") != "SELL" or (row.get("Source") or "HUMAN") != "BOT":
+        return result
+    for column in ENTRY_EXECUTION_COLUMNS:
+        if result.get(column) in (None, ""):
+            result[column] = (buy_row or {}).get(column, "")
+    if result.get("QuotePnL") in (None, "") and row.get("PnLSource") != "BROKER_FILLS":
+        result["QuotePnL"] = row.get("PnL", "")
+    result["PnLSource"] = "QUOTE / LEGACY"
+    result["BrokerRealizedPnL"] = ""
+    result["BrokerRealizedPnLPercent"] = ""
+    try:
+        entry = float(result["EntryBrokerFillPrice"])
+        exit_price = float(result["ExitBrokerFillPrice"])
+        quantity = float(result["Qty"])
+        if not all(math.isfinite(value) and value > 0 for value in (entry, exit_price, quantity)):
+            return result
+        if any(result.get(key) not in (None, "", "filled") for key in ("EntryBrokerOrderStatus", "ExitBrokerOrderStatus")):
+            return result
+    except (KeyError, TypeError, ValueError):
+        return result
+    pnl = round((exit_price - entry) * 100 * quantity, 10)
+    percent = (exit_price - entry) / entry * 100
+    result.update(PnL=pnl, PnLPercent=percent, PnLSource="BROKER_FILLS",
+                  BrokerRealizedPnL=pnl, BrokerRealizedPnLPercent=percent)
+    trigger = safe_float(result.get("ExitTriggerPrice"), None)
+    if trigger is not None and math.isfinite(trigger):
+        result["TriggerPnL"] = (trigger - entry) * 100 * quantity
+        result["TriggerPnLPercent"] = (trigger - entry) / entry * 100
+    return result
 
 
 def log_trade(
@@ -186,6 +222,15 @@ def log_trade(
 
     if market_context is None:
         market_context = current_market_context_snapshot() if current_market_context_snapshot else {}
+    market_context = dict(market_context)
+    execution_diagnostics = dict(execution_diagnostics or {})
+    realized = broker_realized_values(dict(execution_diagnostics, Action=action, Source=source,
+                                         Qty=qty, PnL=pnl), find_last_buy(symbol, source) if action == "SELL" else None)
+    if action == "SELL" and source == "BOT":
+        pnl = realized.get("PnL", pnl)
+        execution_diagnostics.update({key: value for key, value in realized.items() if key in TRADE_COLUMNS})
+        if realized.get("PnLSource") == "BROKER_FILLS":
+            market_context["broker_realized_pnl_percent"] = realized["PnLPercent"]
 
     entry_grade = ""
     exit_grade = ""
@@ -234,7 +279,7 @@ def log_trade(
         entry_indicator_breakdown_json = json.dumps(entry_indicator_breakdown(entry_reasons))
     elif action == "SELL" and grade_exit_trade:
         exit_grade, trade_score, grade_reason, hold_time = grade_exit_trade(symbol, qty, price, pnl, market_context)
-        last_buy = find_last_buy(symbol)
+        last_buy = find_last_buy(symbol, source)
         entry_grade = last_buy.get("EntryGrade", "") if last_buy else ""
         if entry_grade and exit_grade:
             bot_grade = grade_from_score((grade_score(entry_grade) + grade_score(exit_grade)) / 2)
@@ -245,6 +290,8 @@ def log_trade(
         qty_value = safe_float(qty, 1)
         entry_cost = entry_price * qty_value * 100
         pnl_percent = (safe_float(pnl) / entry_cost) * 100 if entry_cost else ""
+        if realized.get("PnLSource") == "BROKER_FILLS":
+            pnl_percent = realized["PnLPercent"]
         if stop_debug_values:
             stop_values = stop_debug_values(symbol, entry_price, sell_price)
             peak_price = stop_values["peak_price"]
@@ -324,6 +371,8 @@ def log_trade(
     for column in TRADE_COLUMNS:
         if column not in row:
             row[column] = execution_diagnostics.get(column, "")
+    if realized.get("PnLSource") == "BROKER_FILLS":
+        row["PnLPercent"] = realized["PnLPercent"]
 
     print("BROKER EXECUTION DIAGNOSTICS")
     print("action:", action)
