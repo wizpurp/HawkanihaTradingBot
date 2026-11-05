@@ -47,7 +47,9 @@ TRADE_COLUMNS = [
     "ExitBrokerOrderStatus", "ExitBrokerFillPrice", "ExitBrokerFillTimestamp",
     "ExitSlippageFromTrigger", "ExitSpyPrice", "SpyChangeDollars", "SpyChangePercent",
     "PnLSource", "QuotePnL", "TriggerPnL", "TriggerPnLPercent",
-    "BrokerRealizedPnL", "BrokerRealizedPnLPercent"
+    "BrokerRealizedPnL", "BrokerRealizedPnLPercent",
+    "EntryFillVsAskPercent", "EntryFillVsMidPercent", "ExecutionAnomalyThresholdPercent",
+    "ExecutionQuality", "StrategyPerformanceEligible", "ExecutionExclusionReason"
 ]
 
 ENTRY_EXECUTION_COLUMNS = [column for column in TRADE_COLUMNS if column.startswith("Entry") and column not in {
@@ -199,6 +201,53 @@ def broker_realized_values(row, buy_row=None):
         result["TriggerPnL"] = (trigger - entry) * 100 * quantity
         result["TriggerPnLPercent"] = (trigger - entry) / entry * 100
     return result
+
+
+def execution_quality_values(row, threshold=15.0):
+    result = dict(row)
+    if row.get("Action") != "SELL" or row.get("Source") != "BOT":
+        return result
+    threshold = safe_float(row.get("ExecutionAnomalyThresholdPercent"), threshold)
+    if not math.isfinite(threshold) or threshold < 0:
+        threshold = 15.0
+    result.update(EntryFillVsAskPercent="", EntryFillVsMidPercent="",
+                  ExecutionAnomalyThresholdPercent=threshold, ExecutionQuality="UNKNOWN",
+                  StrategyPerformanceEligible="N/A", ExecutionExclusionReason="N/A")
+    fill = safe_float(row.get("EntryBrokerFillPrice"), None)
+    if fill is None or not math.isfinite(fill) or fill <= 0:
+        return result
+    if row.get("EntryBrokerOrderStatus") not in (None, "", "filled"):
+        return result
+    for quote_key, output_key in (("EntryOptionAsk", "EntryFillVsAskPercent"),
+                                  ("EntryOptionMidpoint", "EntryFillVsMidPercent")):
+        quote = safe_float(row.get(quote_key), None)
+        if quote is not None and math.isfinite(quote) and quote > 0:
+            result[output_key] = (fill - quote) / quote * 100
+    comparisons = [result["EntryFillVsAskPercent"], result["EntryFillVsMidPercent"]]
+    if "" in comparisons:
+        return result
+    anomaly = all(value > threshold and not math.isclose(value, threshold, rel_tol=1e-12, abs_tol=1e-12)
+                  for value in comparisons)
+    result.update(ExecutionQuality="EXECUTION_ANOMALY" if anomaly else "NORMAL",
+                  StrategyPerformanceEligible="NO" if anomaly else "YES",
+                  ExecutionExclusionReason="ENTRY_EXECUTION_ANOMALY" if anomaly else "N/A")
+    return result
+
+
+def execution_performance_summary(rows):
+    broker_rows = [row for row in rows if row.get("Source") == "BOT" and row.get("Action") == "SELL"
+                   and row.get("PnLSource") == "BROKER_FILLS"]
+    def summarize(selected):
+        values = [float(row["BrokerRealizedPnL"]) for row in selected]
+        winners = [value for value in values if value > 0]
+        losers = [value for value in values if value < 0]
+        return {"count": len(values), "wins": len(winners), "losses": len(losers),
+                "realized_pnl": sum(values), "win_rate": len(winners) / len(values) * 100 if values else 0,
+                "average_winner": sum(winners) / len(winners) if winners else None,
+                "average_loser": sum(losers) / len(losers) if losers else None}
+    return {"all_broker_trades": summarize(broker_rows),
+            "clean_strategy_trades": summarize([row for row in broker_rows if row.get("ExecutionQuality") == "NORMAL"]),
+            "unknown_execution_count": sum(row.get("ExecutionQuality") == "UNKNOWN" for row in broker_rows)}
 
 
 def log_trade(
@@ -373,6 +422,10 @@ def log_trade(
             row[column] = execution_diagnostics.get(column, "")
     if realized.get("PnLSource") == "BROKER_FILLS":
         row["PnLPercent"] = realized["PnLPercent"]
+
+    if action == "SELL" and source == "BOT":
+        config = load_config() if load_config else {}
+        row = execution_quality_values(row, config.get("execution_anomaly_threshold_percent", 15.0))
 
     print("BROKER EXECUTION DIAGNOSTICS")
     print("action:", action)

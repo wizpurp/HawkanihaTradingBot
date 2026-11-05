@@ -370,6 +370,7 @@ def load_config():
     config.setdefault("require_realtime_entry_quotes", False)
     config.setdefault("allow_delayed_sandbox_entries", False)
     config.setdefault("max_entry_quote_age_seconds", 30)
+    config.setdefault("execution_anomaly_threshold_percent", 15.0)
     config.setdefault("strategy_mode", "SURFER")
     config.setdefault("scanner", {"interval_seconds": 60})
     config.setdefault("strategy", {})
@@ -5997,6 +5998,10 @@ def api_tournament_position_test_price():
 @app.route("/save-settings", methods=["POST"])
 def save_settings():
     config = load_config()
+    anomaly_threshold = safe_float(request.form.get("execution_anomaly_threshold_percent", config.get("execution_anomaly_threshold_percent", 15.0)), None)
+    if anomaly_threshold is None or not math.isfinite(anomaly_threshold) or anomaly_threshold < 0:
+        return "Execution anomaly threshold must be a finite non-negative percentage", 400
+    config["execution_anomaly_threshold_percent"] = anomaly_threshold
     freshness_limit = safe_float(request.form.get("max_entry_quote_age_seconds", 30), None)
     if freshness_limit is None or not math.isfinite(freshness_limit) or not 1 <= freshness_limit <= 3600:
         return "Maximum entry quote age must be between 1 and 3600 seconds", 400
@@ -6149,7 +6154,9 @@ def fmt_signed_money_value(value):
     return f"{number:+.2f}"
 
 
-def enrich_trade_rows(rows):
+def enrich_trade_rows(rows, execution_threshold=None):
+    if execution_threshold is None:
+        execution_threshold = load_config().get("execution_anomaly_threshold_percent", 15.0)
     open_buys = {}
     enriched = []
 
@@ -6173,6 +6180,7 @@ def enrich_trade_rows(rows):
             matching_buys = open_buys.get(key, [])
             buy_row = matching_buys.pop(0) if matching_buys else None
             display = broker_realized_values(display, buy_row)
+            display = execution_quality_values(display, execution_threshold)
             display["Entry"] = buy_row.get("Price", "") if buy_row else ""
             if buy_row:
                 display["EntryPriceSource"] = buy_row.get("EntryPriceSource", "")
@@ -6211,7 +6219,7 @@ def summarize_ledger(rows, source, config):
     today_budget_key = "bot_budget" if source == "BOT" else "human_daily_trading_budget"
     today_budget = safe_float(config.get(today_budget_key), 100.0 if source == "BOT" else 500.0)
     source_rows = [row for row in rows if trade_source(row) == source]
-    enriched_rows = enrich_trade_rows(source_rows)
+    enriched_rows = enrich_trade_rows(source_rows, config.get("execution_anomaly_threshold_percent", 15.0))
     sell_rows = [row for row in enriched_rows if row.get("Action") == "SELL"]
     pnl_values = [safe_float(row.get("PnL")) for row in sell_rows]
     total_pnl = sum(pnl_values)
@@ -6254,7 +6262,8 @@ def summarize_ledger(rows, source, config):
         "win_rate": (len(wins) / len(sell_rows) * 100) if sell_rows else 0,
         "overall_grade": overall_grade_for_trades(sell_rows),
         "number_of_trades": len(sell_rows),
-        "trade_list": trade_list
+        "trade_list": trade_list,
+        "execution_performance": execution_performance_summary(enriched_rows)
     }
 
 
@@ -6449,6 +6458,11 @@ P/L Source: {escape_html(trade.get("PnLSource") or "QUOTE / LEGACY")}<br>
 Trigger P/L: {fmt_money(trade.get("TriggerPnL"))} ({fmt_percent(trade.get("TriggerPnLPercent"))})<br>
 Quote P/L: {fmt_money(trade.get("QuotePnL"))}<br>
 Broker Realized P/L: {fmt_money(trade.get("BrokerRealizedPnL"))} ({fmt_percent(trade.get("BrokerRealizedPnLPercent"))})<br>
+Entry Fill vs Ask: {fmt_percent(trade.get("EntryFillVsAskPercent"))}<br>
+Entry Fill vs Mid: {fmt_percent(trade.get("EntryFillVsMidPercent"))}<br>
+Execution Quality: {escape_html(trade.get("ExecutionQuality") or "UNKNOWN")}<br>
+Strategy Performance Eligible: {escape_html(trade.get("StrategyPerformanceEligible") or "N/A")}<br>
+Exclusion Reason: {escape_html(trade.get("ExecutionExclusionReason") or "N/A")}<br>
 Hold Time: {escape_html(trade.get("HoldTime") or "N/A")}<br>
 Entry Grade: {escape_html(trade_entry_grade(trade))}<br>
 Exit Grade: {escape_html(trade_exit_grade(trade))}<br>
@@ -6718,6 +6732,19 @@ def render_trade_list(summary, limit):
     return "".join(lines)
 
 
+def render_execution_performance(summary):
+    sections = []
+    for key, title in (("all_broker_trades", "ALL BROKER TRADES"), ("clean_strategy_trades", "CLEAN STRATEGY TRADES")):
+        values = summary.get(key)
+        if values is None:
+            continue
+        sections.append(f'<h4>{title}</h4>Count: {values["count"]}<br>Wins / Losses: {values["wins"]} / {values["losses"]}<br>Broker Realized P/L: {fmt_money(values["realized_pnl"])}<br>')
+        if key == "clean_strategy_trades":
+            sections.append(f'Win Rate: {values["win_rate"]:.2f}%<br>Average Winner: {fmt_trade_price(values["average_winner"])}<br>Average Loser: {fmt_trade_price(values["average_loser"])}<br>')
+    sections.append(f'Unknown execution quality (excluded from clean stats): {summary.get("unknown_execution_count", 0)}<br>Confirmed broker fills only; legacy quote-only P/L remains in the account panel.<br>')
+    return "".join(sections)
+
+
 def render_performance_panel(label, summary, limit):
     panel_class = label.lower()
     clear_action = "/clear-bot-trades" if label == "BOT" else "/clear-human-trades"
@@ -6765,6 +6792,7 @@ Number of Trades: {summary["number_of_trades"]}<br>
 </form>
 <br><br>
 {stats_html}
+{render_execution_performance(summary.get("execution_performance", {})) if label == "BOT" else ""}
 {trade_list_label}:<br>
 <div class="history-panel bot-trades-panel">
 {render_trade_list(summary, limit)}
@@ -8134,6 +8162,9 @@ Bot Reason Log:<br>
 
 <h3>General</h3>
 <h4>Market Data / Entry Freshness</h4>
+Execution Anomaly Threshold (%):
+<input type="number" name="execution_anomaly_threshold_percent" min="0" step="0.1" value="{config.get("execution_anomaly_threshold_percent", 15.0)}"><br>
+Reporting only; does not block orders.<br>
 Environment: <strong>{market_data_environment()}</strong><br>
 Sandbox quotes are delayed approximately 15 minutes. Quote ages below are broker data ages.<br>
 Require fresh quotes for original BOT entries:
