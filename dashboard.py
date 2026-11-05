@@ -6276,6 +6276,92 @@ def get_trade_performance():
     }
 
 
+def reporting_trade_statistics(values):
+    values = [value for value in values if value is not None and math.isfinite(value)]
+    winners = [value for value in values if value > 0]
+    losers = [value for value in values if value < 0]
+    return {
+        "Trades": len(values), "Wins": len(winners), "Losses": len(losers),
+        "Win Rate": f"{len(winners) / len(values) * 100 if values else 0:.2f}%",
+        "Total Realized P/L": fmt_money(sum(values)),
+        "Average Winner": fmt_trade_price(sum(winners) / len(winners) if winners else None),
+        "Average Loser": fmt_trade_price(sum(losers) / len(losers) if losers else None),
+        "Largest Winner": fmt_trade_price(max(winners) if winners else None),
+        "Largest Loser": fmt_trade_price(min(losers) if losers else None),
+    }
+
+
+def render_reporting_metrics(metrics):
+    return '<div class="kv-grid">' + ''.join(
+        f'<span>{escape_html(key)}</span><strong>{escape_html(value) if value != 0 else "0"}</strong>'
+        for key, value in metrics.items()) + '</div>'
+
+
+def render_human_bot_comparison(rows, config):
+    cards = []
+    for source, title in (("HUMAN", "HUMAN"), ("BOT", "ORIGINAL BOT")):
+        completed = [row for row in enrich_trade_rows(rows, config.get("execution_anomaly_threshold_percent", 15))
+                     if trade_source(row) == source and row.get("Action") == "SELL"]
+        metrics = reporting_trade_statistics([safe_float(row.get("PnL"), None) for row in completed])
+        legacy = sum(row.get("PnLSource") != "BROKER_FILLS" for row in completed)
+        note = f'Broker fills used where available. Quote / legacy results: {legacy}.' if source == "BOT" else 'Recorded completed human trades.'
+        cards.append(f'<article class="performance-panel {source.lower()}"><h3>{title}</h3>{render_reporting_metrics(metrics)}<p>{note}</p></article>')
+    return '<div class="performance-grid">' + ''.join(cards) + '</div>'
+
+
+def render_strategy_research_cards(trades, settings, states):
+    names = ("BOT A — BASELINE", "BOT B — MOMENTUM", "BOT C — BREAKOUT", "BOT D — COMBINED")
+    cards = []
+    for profile_id, title in zip(PROFILE_ORDER, names):
+        profile = settings.get(profile_id, {})
+        momentum = bool(profile.get("option_momentum_confirmation_enabled"))
+        breakout = bool(profile.get("two_candle_or_confirmation_enabled"))
+        differences = []
+        if momentum:
+            differences.append('option momentum confirmation')
+        if breakout:
+            differences.append('opening-range candle confirmation')
+        description = 'Baseline direction strategy' + (' + ' + ' + '.join(differences) if differences else '; no extra confirmation filters')
+        profile_trades = [row for row in trades if row.get("profile_id") == profile_id
+                          and not row.get("is_test_position") and not row.get("test_type")
+                          and not str(row.get("option_symbol", "")).startswith("SPYTEST")
+                          and row.get("signal") not in ("TEST_PIPELINE", "TEST_RECORD")
+                          and row.get("entry_price_source") != "SYNTHETIC"]
+        completed = [row for row in profile_trades if row.get("status") == "CLOSED"]
+        metrics = reporting_trade_statistics([safe_float(row.get("pnl_dollars"), None) for row in completed])
+        metrics["Net P/L (Virtual)"] = metrics.pop("Total Realized P/L")
+        position = (states.get(profile_id) or {}).get("virtual_position") or {}
+        if not position:
+            position = next((row for row in profile_trades if row.get("status") == "OPEN"), {})
+        position_text = 'None'
+        if position and position.get("status", "OPEN") == "OPEN":
+            if position.get("is_test_position") or position.get("test_type") or str(position.get("option_symbol", "")).startswith("SPYTEST"):
+                position_text = 'Test position (excluded from performance)'
+            else:
+                position_text = f'{position.get("direction", "")} | {position.get("option_symbol", "N/A")} | Qty: {position.get("contracts", "N/A")} | Entry: {fmt_trade_price(position.get("entry_price"))}'
+        cards.append(f'''<article class="tournament-decision-card">
+<h3>{title}</h3><p><strong>{description}</strong></p>
+<p>Momentum: {"ON" if momentum else "OFF"} · Opening-range confirmation: {"ON" if breakout else "OFF"}<br>
+Enabled: {"YES" if profile.get("enabled", True) else "NO"}</p>
+{render_reporting_metrics(metrics)}
+<div class="final-decision-section"><strong>Current Open Position</strong><p>{escape_html(position_text)}</p></div>
+</article>''')
+    return '<div class="tournament-decision-grid">' + ''.join(cards) + '</div>'
+
+
+@app.route("/api/strategy-research-display")
+def api_strategy_research_display():
+    config = load_config()
+    settings = load_tournament_profile_settings(TOURNAMENT_PROFILES_FILE)
+    trades = [tournament_trade_to_dict(trade) for trade in list_tournament_trades(path=TOURNAMENT_TRADES_FILE)]
+    with BOT_LOCK:
+        states = dict(BOT_STATE.get("tournament_state_by_profile") or {})
+    return jsonify({
+        "comparison_html": render_human_bot_comparison(get_recent_trades(limit=None), config),
+        "research_html": render_strategy_research_cards(trades, settings, states),
+    })
+
+
 def escape_html(value):
     return html_lib.escape(str(value or ""))
 
@@ -6733,7 +6819,7 @@ def render_trade_list(summary, limit):
 
 
 def render_execution_performance(summary):
-    sections = []
+    sections = ['<p>All Broker Trades = actual broker results (sandbox paper results when using sandbox).<br>Clean Strategy Trades = strategy evaluation excluding execution anomalies and unknown execution quality. Account P/L is never removed.</p>']
     for key, title in (("all_broker_trades", "ALL BROKER TRADES"), ("clean_strategy_trades", "CLEAN STRATEGY TRADES")):
         values = summary.get(key)
         if values is None:
@@ -7614,6 +7700,17 @@ button {{
 
 <h1>Trading Bot Dashboard</h1>
 
+<section class="card">
+<h2>HUMAN VS BOT</h2>
+<p>Completed trades · Original BOT includes execution anomalies in actual results.</p>
+<div id="human-bot-comparison">{render_human_bot_comparison(get_recent_trades(limit=None), config)}</div>
+</section>
+<section class="card">
+<h2>STRATEGY RESEARCH</h2>
+<p>A/B/C/D are virtual experiments, not broker fills. Each uses the baseline direction strategy with the confirmation filters shown below. Saved profile settings are shown; thresholds and risk settings can differ. Test trades are excluded. Results cover all recorded completed trades, not just the latest 50.</p>
+<div id="strategy-research-cards">{render_strategy_research_cards([tournament_trade_to_dict(trade) for trade in list_tournament_trades(path=TOURNAMENT_TRADES_FILE)], tournament_settings, bot_snapshot.get("tournament_state_by_profile") or {})}</div>
+</section>
+
 <div class="card">
 <h2>Status</h2>
 Bot: <span class="{ "good" if bot_enabled else "bad" }">{ "ENABLED" if bot_enabled else "DISABLED" }</span><br>
@@ -7659,11 +7756,14 @@ Bot Reason Log:<br>
 </div>
 
 <div class="card">
+<details><summary><strong>Advanced Debug — Tournament Health</strong></summary>
 <h2>Tournament Health</h2>
 {render_tournament_health_panel(bot_snapshot.get("tournament_health"))}
+</details>
 </div>
 
 <div class="card">
+<details><summary><strong>Advanced Debug — Tournament Decisions &amp; Pipeline Counters</strong></summary>
 <h2>Tournament Decisions</h2>
 <div class="tournament-decision-grid" id="tournament-decision-cards">
 {render_tournament_decision_cards(bot_snapshot.get("tournament_decisions"))}
@@ -7729,13 +7829,16 @@ Bot Reason Log:<br>
 </table>
 </div>
 </details>
+</details>
 </div>
 
 <div class="card">
+<details><summary><strong>Advanced Debug — Momentum Candidate Transitions</strong></summary>
 <h2>Bot B / Bot D Momentum Candidate Transitions (Last 20)</h2>
 <div class="history-panel candidate-transition-list" id="tournament-candidate-transitions">
 {render_tournament_candidate_transition_cards(bot_snapshot.get("tournament_state_by_profile"))}
 </div>
+</details>
 </div>
 
 <div class="card">
@@ -8101,7 +8204,7 @@ Bot Reason Log:<br>
 
     html += f"""
 <div class="card">
-<h2>Bot vs Human Performance</h2>
+<h2>ORIGINAL BOT &amp; HUMAN — Account Details and Trade History</h2>
 <div class="performance-grid">
 {render_performance_panel("HUMAN", trade_performance["HUMAN"], bot_trades_limit)}
 {render_performance_panel("BOT", trade_performance["BOT"], bot_trades_limit)}
@@ -8934,6 +9037,11 @@ function renderTournamentHealth(health) {{
 async function updateTournamentTrades() {{
     const data = await getJson("/api/tournament/trades?limit=50");
     renderTournamentTrades(data.trades || []);
+    const reporting = await getJson("/api/strategy-research-display");
+    for (const [id, markup] of [["human-bot-comparison", reporting.comparison_html], ["strategy-research-cards", reporting.research_html]]) {{
+        const target = document.getElementById(id);
+        if (target && typeof markup === "string" && target.innerHTML !== markup) target.innerHTML = markup;
+    }}
 }}
 
 async function createTestTournamentTrade() {{
