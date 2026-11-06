@@ -78,13 +78,14 @@ class BrokerExecutionDiagnosticsTest(unittest.TestCase):
                 "transaction_date": "2026-09-24T14:40:00.000Z",
             }
         }
-        with patch.object(dashboard.requests, "get", return_value=response) as get_request, \
+        with patch.object(dashboard, "broker_request", return_value=response) as get_request, \
              patch.object(dashboard.requests, "post") as post_request:
             execution = dashboard.fetch_broker_order_execution("123", retries=1)
 
         self.assertEqual(execution["fill_price"], 0.86)
         get_request.assert_called_once()
-        self.assertIn("/orders/123", get_request.call_args.args[0])
+        self.assertEqual(get_request.call_args.args[0], "GET")
+        self.assertIn("/orders/123", get_request.call_args.args[1])
         post_request.assert_not_called()
 
     def test_trigger_quote_and_exit_fill_remain_separate(self):
@@ -136,7 +137,7 @@ class BrokerExecutionDiagnosticsTest(unittest.TestCase):
     def test_option_order_submission_remains_a_market_order(self):
         response = Mock(status_code=200, text='{"order":{"status":"ok","id":123}}')
         with patch.object(dashboard, "load_config", return_value={"symbol": "SPY"}), \
-             patch.object(dashboard.requests, "post", return_value=response) as post_request:
+             patch.object(dashboard, "broker_request", return_value=response) as post_request:
             dashboard.submit_option_order("SPY260924C00768000", 1, "buy_to_open")
 
         submitted = post_request.call_args.kwargs["data"]

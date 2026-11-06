@@ -92,15 +92,15 @@ class BrokerRealizedPnlTest(unittest.TestCase):
         now = datetime.now(dashboard.MARKET_TZ)
         quote = {"last": .51, "trade_date": (now - timedelta(seconds=902)).isoformat()}
         context = {"price": 768, "spy_quote_timestamp": (now - timedelta(seconds=977)).isoformat()}
-        with patch.object(dashboard, "BASE_URL", "https://sandbox.tradier.com/v1"):
+        with patch.object(dashboard, "resolve_connection", return_value=Mock(environment="sandbox")):
             self.assertEqual(dashboard.market_data_environment(), "SANDBOX_DELAYED")
             self.assertTrue(dashboard.entry_quote_freshness({}, quote, context)[0])
             config = {"require_realtime_entry_quotes": True, "max_entry_quote_age_seconds": 30}
             self.assertFalse(dashboard.entry_quote_freshness(config, quote, context)[0])
             config["allow_delayed_sandbox_entries"] = True
             self.assertTrue(dashboard.entry_quote_freshness(config, quote, context)[0])
-        with patch.object(dashboard, "BASE_URL", "https://api.tradier.com/v1"):
-            self.assertEqual(dashboard.market_data_environment(), "PRODUCTION_REALTIME")
+        with patch.object(dashboard, "resolve_connection", return_value=Mock(environment="live")):
+            self.assertEqual(dashboard.market_data_environment(), "PRODUCTION")
             self.assertFalse(dashboard.entry_quote_freshness(config, quote, context)[0])
 
     def test_enabled_guard_accepts_fresh_quotes_and_rejects_unknown_age(self):

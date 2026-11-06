@@ -12,6 +12,8 @@ import time
 import html as html_lib
 import traceback
 import atexit
+from functools import wraps
+from broker_connection import BrokerGateway, BrokerConnectionError, resolve_connection, legacy_environment, entry_funds_limit
 from dataclasses import asdict, replace
 from datetime import datetime, timedelta, time as datetime_time
 from zoneinfo import ZoneInfo
@@ -91,6 +93,8 @@ def parse_market_datetime(value):
 TOKEN = os.getenv("TRADIER_TOKEN", "")
 ACCOUNT = os.getenv("TRADIER_ACCOUNT", "")
 BASE_URL = os.getenv("TRADIER_BASE_URL", "https://sandbox.tradier.com/v1")
+BROKER = BrokerGateway()
+BROKER_OPERATION_LOCK = threading.RLock()
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_HISTORY_LIMIT = 20
 BOT_AUDIT_FILE = os.path.join(APP_DIR, "bot_audit_log.csv")
@@ -367,6 +371,11 @@ def load_config():
     })
 
     config.setdefault("bot_enabled", False)
+    # New automatic entries are a separate, opt-in switch. bot_enabled must stay on for
+    # exit management of open positions; this flag only controls opening new ones.
+    config.setdefault("auto_entries_enabled", False)
+    config.setdefault("broker_environment", legacy_environment())
+    config["mode"] = config["broker_environment"]
     config.setdefault("require_realtime_entry_quotes", False)
     config.setdefault("allow_delayed_sandbox_entries", False)
     config.setdefault("max_entry_quote_age_seconds", 30)
@@ -1270,11 +1279,120 @@ def submit_and_parse_option_order(option_symbol, qty, action, label):
     return ok, order_status, status, text
 
 
+def broker_session(function):
+    @wraps(function)
+    def guarded(*args, **kwargs):
+        with BROKER_OPERATION_LOCK:
+            return function(*args, **kwargs)
+    return guarded
+
+
+def broker_request(method, path, **kwargs):
+    with BROKER_OPERATION_LOCK:
+        connection = resolve_connection(load_config())
+        if method == "POST" and kwargs.get("data", {}).get("side") in ("buy", "buy_to_open") and not BROKER.account(connection)["validated"]:
+            raise BrokerConnectionError("Broker account is not validated; order not submitted")
+        try:
+            response = BROKER.request(connection, method, path, **kwargs)
+        except BrokerConnectionError:
+            if path == "/markets/quotes":
+                BROKER.quote_failed(connection, "Quote request failed")
+            raise
+        if path == "/markets/quotes":
+            try:
+                quote = response.json()["quotes"]["quote"]
+                quote = quote[0] if isinstance(quote, list) else quote
+                if response.status_code != 200 or not isinstance(quote, dict):
+                    raise ValueError()
+                BROKER.observe_quote(connection, quote)
+            except Exception:
+                BROKER.quote_failed(connection, "Quote unavailable or invalid")
+        return response
+
+
 def headers():
     return {
-        "Authorization": f"Bearer {TOKEN}",
         "Accept": "application/json"
     }
+
+
+def connected_account_snapshot():
+    config = load_config()
+    try:
+        connection = resolve_connection(config)
+        status = BROKER.account(connection)
+        with BROKER.lock:
+            cached_quote = dict(BROKER.quotes.get(connection.key, {}))
+        quote = cached_quote.get("quote", {})
+        observation = quote_execution_snapshot(quote)
+        age = observation.get("quote_age_seconds")
+        fetched = cached_quote.get("success")
+        fresh = isinstance(age, (int, float)) and 0 <= age <= 30 and fetched is not None and time.time() - fetched <= 60
+        status["market_data"] = {
+            "environment": "SANDBOX — DELAYED (~15 minutes)" if connection.environment == "sandbox" else "PRODUCTION (freshness verified separately)",
+            "symbol": quote.get("symbol"), "timestamp": observation.get("quote_timestamp"),
+            "bid_timestamp": broker_timestamp(quote.get("bid_date")),
+            "ask_timestamp": broker_timestamp(quote.get("ask_date")),
+            "trade_timestamp": broker_timestamp(quote.get("trade_date")),
+            "age_seconds": age, "price_source": observation.get("price_source"),
+            "status": "CONNECTION ERROR" if cached_quote.get("error") else ("FRESH" if fresh else "STALE / UNVERIFIED"),
+            "last_success": datetime.fromtimestamp(fetched, MARKET_TZ).isoformat() if fetched else None,
+            "error": cached_quote.get("error"),
+        }
+    except BrokerConnectionError as error:
+        status = {"environment_label": "UNKNOWN / CONNECTION ERROR", "masked_account": "N/A",
+                  "validated": False, "stale": True, "balances": {}, "error": str(error),
+                  "market_data": {}, "connection_status": "UNVERIFIED / ERROR"}
+    status["bot_budget"] = config.get("bot_budget")
+    status["bot_enabled"] = bool(config.get("bot_enabled"))
+    status["auto_entries_enabled"] = bool(config.get("auto_entries_enabled"))
+    with BOT_LOCK:
+        spent_today = BOT_STATE.get("spent_today", 0)
+    status["bot_spent_today"] = spent_today
+    limit, binding = entry_funds_limit(config.get("bot_budget"), spent_today,
+                                       status.get("balances", {}).get("entry_buying_power") if status.get("validated") else None)
+    status["max_new_entry_cost"], status["max_new_entry_limited_by"] = limit, binding
+    return status
+
+
+def render_connected_account(status):
+    fields = {
+        "Total Account Value": "total_account_value", "Cash": "cash", "Settled Cash": "settled_cash",
+        "Available Options Buying Power": "options_buying_power", "Cash Available (broker field)": "cash_available",
+        "Positions Value": "positions_value", "Unrealized P/L": "unrealized_pnl",
+    }
+    balances = status.get("balances", {})
+    metrics = {label: fmt_trade_price(balances.get(key)) for label, key in fields.items()}
+    metrics.update({"Account Connection": status.get("connection_status", "N/A"),
+                    "Balance Status": "STALE / UNVERIFIED" if status.get("stale") else "CURRENT",
+                    "Last Successful Balance Update": status.get("last_success") or "N/A",
+                    "Balance Age (seconds)": status.get("age_seconds") if status.get("age_seconds") is not None else "N/A",
+                    "Configured Bot Budget (not account funds)": fmt_trade_price(status.get("bot_budget")),
+                    "Bot Spent Today": fmt_trade_price(status.get("bot_spent_today")),
+                    "Broker Buying Power Used For Entries": fmt_trade_price(balances.get("entry_buying_power")),
+                    "Max New Bot Entry Cost": fmt_trade_price(status.get("max_new_entry_cost")),
+                    "Entry Limit Set By": status.get("max_new_entry_limited_by") or "N/A"})
+    market = status.get("market_data", {})
+    quote_metrics = {"Market Data Environment": market.get("environment") or "UNKNOWN",
+                     "Quote Status": market.get("status") or "UNVERIFIED", "Quote Symbol": market.get("symbol") or "N/A",
+                     "Broker Quote Timestamp": market.get("timestamp") or "N/A",
+                     "Quote Price Source": market.get("price_source") or "N/A",
+                     "Quote Age (seconds)": market.get("age_seconds") if market.get("age_seconds") not in (None, "") else "N/A",
+                     "Broker Bid Timestamp": market.get("bid_timestamp") or "N/A",
+                     "Broker Ask Timestamp": market.get("ask_timestamp") or "N/A",
+                     "Broker Last Trade Timestamp": market.get("trade_timestamp") or "N/A",
+                     "Last Successful Quote Update": market.get("last_success") or "N/A"}
+    return (f'<h3>{escape_html(status["environment_label"])}</h3>Account: {escape_html(status["masked_account"])}'
+            + render_reporting_metrics(metrics) + '<h3>Market Data (separate from account funds)</h3>'
+            + render_reporting_metrics(quote_metrics)
+            + f'<p>{escape_html(status.get("error") or "")}</p><p>{escape_html(market.get("error") or "")}</p>'
+            + '<p>Balances cached for 60 seconds, including outside market hours. Unreported fields are N/A; cash available is not assumed to mean settled cash or options buying power.</p>')
+
+
+@app.route("/api/account")
+def api_connected_account():
+    status = connected_account_snapshot()
+    return jsonify({"account": status, "html": render_connected_account(status)})
 
 
 def fmt_money(value):
@@ -1432,8 +1550,8 @@ def resolve_actual_entry_price(option_symbol, expected_qty, estimated_entry_pric
 def get_market_quote(symbol):
     started_at = time.perf_counter()
     try:
-        r = requests.get(
-            f"{BASE_URL}/markets/quotes",
+        r = broker_request("GET",
+            "/markets/quotes",
             params={"symbols": symbol},
             headers=headers()
         )
@@ -1461,11 +1579,12 @@ def get_market_quote(symbol):
         return None
 
 
+@broker_session
 def get_position():
     started_at = time.perf_counter()
     try:
-        r = requests.get(
-            f"{BASE_URL}/accounts/{ACCOUNT}/positions",
+        r = broker_request("GET",
+            "/accounts/{account}/positions",
             headers=headers()
         )
         if r.status_code != 200:
@@ -1481,7 +1600,9 @@ def get_position():
 
         pos = data["positions"]["position"]
         record_api_diagnostic("position", started_at, "OK_POSITION")
-        return pos if isinstance(pos, list) else [pos]
+        positions = pos if isinstance(pos, list) else [pos]
+        version = load_config().get("broker_selection_version", 0)
+        return [dict(position, _broker_selection_version=version) for position in positions]
     except Exception as exc:
         record_api_diagnostic("position", started_at, f"ERROR {exc}")
         return None
@@ -1491,8 +1612,8 @@ def get_expirations(symbol):
     if not scanner_market_is_open():
         return []
     try:
-        r = requests.get(
-            f"{BASE_URL}/markets/options/expirations",
+        r = broker_request("GET",
+            "/markets/options/expirations",
             params={"symbol": symbol, "includeAllRoots": "true"},
             headers=headers()
         )
@@ -1509,8 +1630,8 @@ def get_option_chain(symbol, expiration):
     if not scanner_market_is_open():
         return []
     try:
-        r = requests.get(
-            f"{BASE_URL}/markets/options/chains",
+        r = broker_request("GET",
+            "/markets/options/chains",
             params={"symbol": symbol, "expiration": expiration},
             headers=headers()
         )
@@ -1611,8 +1732,8 @@ def submit_option_order(option_symbol, qty, action="buy_to_open"):
     }
 
     started_at = time.perf_counter()
-    r = requests.post(
-        f"{BASE_URL}/accounts/{ACCOUNT}/orders",
+    r = broker_request("POST",
+        "/accounts/{account}/orders",
         headers=headers(),
         data=data
     )
@@ -1778,8 +1899,8 @@ def fetch_broker_order_execution(order_id, initial_response="", retries=4, delay
 
     for attempt in range(max(1, retries)):
         try:
-            response = requests.get(
-                f"{BASE_URL}/accounts/{ACCOUNT}/orders/{order_id}",
+            response = broker_request("GET",
+                "/accounts/{account}/orders/" + str(order_id),
                 headers=headers(),
                 timeout=3,
             )
@@ -1836,9 +1957,11 @@ def entry_execution_diagnostics(market_context, contract, order_execution=None):
 
 
 def market_data_environment():
-    from urllib.parse import urlparse
-    host = urlparse(BASE_URL).hostname
-    return {"sandbox.tradier.com": "SANDBOX_DELAYED", "api.tradier.com": "PRODUCTION_REALTIME"}.get(host, "UNKNOWN")
+    try:
+        environment = resolve_connection(load_config()).environment
+        return "SANDBOX_DELAYED" if environment == "sandbox" else "PRODUCTION"
+    except BrokerConnectionError:
+        return "UNKNOWN"
 
 
 def entry_quote_freshness(config, contract, context):
@@ -2414,8 +2537,8 @@ def get_historical_levels(symbol):
     try:
         end = market_now().date()
         start = end - timedelta(days=14)
-        r = requests.get(
-            f"{BASE_URL}/markets/history",
+        r = broker_request("GET",
+            "/markets/history",
             params={
                 "symbol": symbol,
                 "interval": "daily",
@@ -2476,8 +2599,8 @@ def get_intraday_bars(symbol):
     today = market_now().date()
 
     try:
-        r = requests.get(
-            f"{BASE_URL}/markets/timesales",
+        r = broker_request("GET",
+            "/markets/timesales",
             params={
                 "symbol": symbol,
                 "interval": "1min",
@@ -4180,7 +4303,48 @@ def log_accepted_trade(action, symbol, qty, price, pnl=""):
     add_bot_reason(f"{action} logged {symbol} qty {qty} price {price}")
 
 
+def entry_funds_check(config, contract, contracts, reference_price):
+    """Final gate before a bot buy: estimated cost must fit both the remaining
+    bot budget and the broker-reported buying power (fetched fresh)."""
+    prices = [p for p in (valid_price(reference_price), valid_price(contract.get("ask"))) if p is not None]
+    if not prices:
+        return False, "funds check: no option price"
+    cost = max(prices) * 100 * int(contracts)
+    _, spent_today = sync_trade_limits_from_file(config)
+    try:
+        account = BROKER.account(resolve_connection(config), force=True)
+    except BrokerConnectionError:
+        return False, "funds check: broker connection unavailable"
+    if not account.get("validated"):
+        return False, "funds check: broker balances not verified"
+    limit, binding = entry_funds_limit(config.get("bot_budget", 100), spent_today,
+                                      account.get("balances", {}).get("entry_buying_power"))
+    if limit is None:
+        return False, f"funds check: {binding}"
+    if cost > limit:
+        return False, f"funds check: cost {cost:.2f} > {limit:.2f} allowed by {binding}"
+    return True, ""
+
+
+@broker_session
 def execute_entry_buy(config, decision, side, contract, contracts, reference_price, market_context, label="ENTRY"):
+    current_config = load_config()
+    if (not current_config.get("bot_enabled") or
+            config.get("broker_selection_version", 0) != current_config.get("broker_selection_version", 0)):
+        add_bot_reason("ENTRY skipped: bot disabled or account selection changed")
+        return False
+    if not current_config.get("auto_entries_enabled"):
+        add_bot_reason(f"{label} skipped: new automatic entries are disabled")
+        log_bot_audit("SKIP", decision, config.get("symbol", ""), market_context, config,
+                      option_symbol=contract.get("symbol", ""), skip_reason="automatic entries disabled")
+        return False
+    try:
+        if not BROKER.account(resolve_connection(current_config))["validated"]:
+            add_bot_reason("ENTRY skipped: selected broker account not validated")
+            return False
+    except BrokerConnectionError:
+        add_bot_reason("ENTRY skipped: broker connection unavailable")
+        return False
     if not option_market_is_open():
         add_bot_reason(f"{label} skipped: options market is closed")
         log_bot_audit(
@@ -4219,6 +4383,12 @@ def execute_entry_buy(config, decision, side, contract, contracts, reference_pri
         add_bot_reason(freshness_reason)
         log_bot_audit("SKIP", decision, config.get("symbol", ""), market_context, config,
                       option_symbol=contract.get("symbol", ""), skip_reason=freshness_reason)
+        return False
+    funds_ok, funds_reason = entry_funds_check(current_config, contract, contracts, reference_price)
+    if not funds_ok:
+        add_bot_reason(f"{label} skipped: {funds_reason}")
+        log_bot_audit("SKIP", decision, config.get("symbol", ""), market_context, config,
+                      option_symbol=contract.get("symbol", ""), skip_reason=funds_reason)
         return False
     ok, order_status, status, text = submit_and_parse_option_order(
         contract["symbol"],
@@ -4292,6 +4462,10 @@ def execute_entry_buy(config, decision, side, contract, contracts, reference_pri
 
 
 def try_surfer_entry(config, positions, market_context, call, put):
+    if not config.get("auto_entries_enabled"):
+        add_bot_reason("SIGNAL no entry: new automatic entries are disabled")
+        log_bot_audit("SKIP", market_context.get("decision", "DO NOTHING"), config.get("symbol", ""), market_context, config, skip_reason="automatic entries disabled")
+        return
     if positions:
         add_bot_reason("SIGNAL no entry: already holding one position")
         log_bot_audit("SKIP", market_context.get("decision", "DO NOTHING"), config.get("symbol", ""), market_context, config, skip_reason="already holding one position")
@@ -4416,6 +4590,7 @@ def try_surfer_entry(config, positions, market_context, call, put):
     execute_entry_buy(config, decision, side, contract, contracts, ask, market_context, label="ENTRY")
 
 
+@broker_session
 def process_pending_entry(config):
     pending = get_pending_entry()
     if not pending.get("active"):
@@ -4436,18 +4611,19 @@ def process_pending_entry(config):
     momentum_enabled = bool(config.get("option_momentum_confirmation_enabled", True))
     breakout_enabled = bool(config.get("two_candle_or_confirmation_enabled", True))
 
-    if not config.get("bot_enabled"):
+    if not config.get("bot_enabled") or not config.get("auto_entries_enabled"):
+        why = "bot disabled" if not config.get("bot_enabled") else "automatic entries disabled"
         pending["active"] = False
         pending["status"] = "CANCELLED"
-        pending["reason"] = "bot disabled"
-        pending["final_cancellation_trigger"] = "bot disabled"
+        pending["reason"] = why
+        pending["final_cancellation_trigger"] = why
         pending["momentum_status"] = "FAIL"
         refresh_pending_time_remaining(pending)
         set_pending_entry(pending)
         record_shadow_gate_state_from_pending(config, pending)
         upsert_pending_history(pending, final_status="CANCELLED", cancellation_reason=pending["reason"])
-        add_bot_reason("PENDING BUY cancelled: bot disabled")
-        log_bot_audit("SKIP", decision, config.get("symbol", ""), market_context, config, option_symbol=option_symbol, skip_reason="pending entry cancelled: bot disabled")
+        add_bot_reason(f"PENDING BUY cancelled: {why}")
+        log_bot_audit("SKIP", decision, config.get("symbol", ""), market_context, config, option_symbol=option_symbol, skip_reason=f"pending entry cancelled: {why}")
         return True
 
     if not option_market_is_open():
@@ -4626,7 +4802,10 @@ def process_pending_entry(config):
     return True
 
 
+@broker_session
 def try_surfer_exit(config, positions, market_context):
+    if any(position.get("_broker_selection_version", 0) != load_config().get("broker_selection_version", 0) for position in (positions or [])):
+        return False
     if not positions:
         log_bot_audit("DO NOTHING", market_context.get("decision", "DO NOTHING"), config.get("symbol", ""), market_context, config, skip_reason="no open position")
         return False
@@ -4787,7 +4966,10 @@ def fast_exit_audit_fields(
     }
 
 
+@broker_session
 def fast_exit_poll(config, positions):
+    if any(position.get("_broker_selection_version", 0) != load_config().get("broker_selection_version", 0) for position in (positions or [])):
+        return False
     tick_started_at = time.perf_counter()
     set_last_error(None)
     if not positions:
@@ -5109,6 +5291,7 @@ def fast_exit_poll(config, positions):
     return True
 
 
+@broker_session
 def surfer_bot_tick(allow_entry=True):
     tick_started_at = time.perf_counter()
     set_last_error(None)
@@ -5293,6 +5476,7 @@ def surfer_bot_loop():
             time.sleep(10)
 
 
+@broker_session
 def sell_all_positions():
     positions = get_position()
     if not positions:
@@ -5349,8 +5533,8 @@ def sell_all_positions():
                 "tag": f"MANUAL_SELL_{symbol}"
             }
 
-            r = requests.post(
-                f"{BASE_URL}/accounts/{ACCOUNT}/orders",
+            r = broker_request("POST",
+                "/accounts/{account}/orders",
                 headers=headers(),
                 data=data
             )
@@ -5375,8 +5559,8 @@ def api_expirations():
 
 @app.route("/api/orders")
 def api_orders():
-    r = requests.get(
-        f"{BASE_URL}/accounts/{ACCOUNT}/orders",
+    r = broker_request("GET",
+        "/accounts/{account}/orders",
         headers=headers()
     )
     return r.text
@@ -5592,6 +5776,7 @@ def api_chain():
 
 
 @app.route("/manual-buy-selected", methods=["POST"])
+@broker_session
 def manual_buy_selected():
     option_symbol = request.form.get("option_symbol")
     qty = int(request.form.get("manual_qty", 1))
@@ -5624,6 +5809,7 @@ def manual_buy_selected():
 
 
 @app.route("/manual-buy-call", methods=["POST"])
+@broker_session
 def manual_buy_call():
     config = load_config()
     contract = select_atm_contract(config["symbol"], "CALL")
@@ -5653,6 +5839,7 @@ def manual_buy_call():
 
 
 @app.route("/manual-buy-put", methods=["POST"])
+@broker_session
 def manual_buy_put():
     config = load_config()
     contract = select_atm_contract(config["symbol"], "PUT")
@@ -5996,8 +6183,20 @@ def api_tournament_position_test_price():
 
 
 @app.route("/save-settings", methods=["POST"])
+@broker_session
 def save_settings():
     config = load_config()
+    previous_environment = config.get("broker_environment", legacy_environment())
+    selected_environment = request.form.get("mode", previous_environment)
+    if selected_environment not in ("sandbox", "live"):
+        return "Select sandbox or live", 400
+    switching = selected_environment != previous_environment
+    if switching:
+        try:
+            BROKER.assert_switch_safe(resolve_connection(config))
+            resolve_connection(dict(config, broker_environment=selected_environment))
+        except BrokerConnectionError as error:
+            return str(error), 400
     anomaly_threshold = safe_float(request.form.get("execution_anomaly_threshold_percent", config.get("execution_anomaly_threshold_percent", 15.0)), None)
     if anomaly_threshold is None or not math.isfinite(anomaly_threshold) or anomaly_threshold < 0:
         return "Execution anomaly threshold must be a finite non-negative percentage", 400
@@ -6013,10 +6212,12 @@ def save_settings():
     custom_symbol = request.form.get("custom_symbol", "").strip().upper()
 
     config["symbol"] = custom_symbol if custom_symbol else symbol_choice
-    config["mode"] = request.form.get("mode", "sandbox")
+    config["mode"] = selected_environment
+    config["broker_environment"] = selected_environment
     config["asset_type"] = request.form.get("asset_type", "option")
     config["contracts"] = int(request.form.get("contracts", 1))
     config["bot_enabled"] = request.form.get("bot_enabled") == "on"
+    config["auto_entries_enabled"] = request.form.get("auto_entries_enabled") == "on"
     config["strategy_mode"] = request.form.get("strategy_mode", "SURFER")
     config["decision_time"] = request.form.get("decision_time", "09:35")
     config["bot_budget"] = float(request.form.get("bot_budget", 100))
@@ -6075,6 +6276,24 @@ def save_settings():
 
     config["scanner"]["interval_seconds"] = int(request.form.get("interval_seconds", 60))
 
+    if switching:
+        config["bot_enabled"] = False
+        config["auto_entries_enabled"] = False
+        config["broker_selection_version"] = config.get("broker_selection_version", 0) + 1
+        clear_pending_entry("CANCELLED", "broker environment changed")
+        with BOT_LOCK:
+            BOT_STATE["samples"] = []
+            BOT_STATE["market_context"] = {}
+            BOT_STATE["historical_levels"] = {}
+            BOT_STATE["historical_levels_day"] = None
+            BOT_STATE["historical_levels_symbol"] = None
+            BOT_STATE["current_signal"] = "NONE"
+    elif config.get("bot_enabled"):
+        try:
+            if not BROKER.account(resolve_connection(config))["validated"]:
+                return "Validate the selected account before enabling the bot", 400
+        except BrokerConnectionError:
+            return "Matching account credentials are required before enabling the bot", 400
     save_config(config)
     return redirect("/")
 
@@ -7699,6 +7918,8 @@ button {{
 <body>
 
 <h1>Trading Bot Dashboard</h1>
+<section class="card"><h2>Connected Broker Account</h2>
+<div id="connected-account">Loading verified broker balances…</div></section>
 
 <section class="card">
 <h2>HUMAN VS BOT</h2>
@@ -7706,7 +7927,7 @@ button {{
 <div id="human-bot-comparison">{render_human_bot_comparison(get_recent_trades(limit=None), config)}</div>
 </section>
 <section class="card">
-<h2>STRATEGY RESEARCH</h2>
+<h2>STRATEGY RESEARCH — SIMULATED</h2>
 <p>A/B/C/D are virtual experiments, not broker fills. Each uses the baseline direction strategy with the confirmation filters shown below. Saved profile settings are shown; thresholds and risk settings can differ. Test trades are excluded. Results cover all recorded completed trades, not just the latest 50.</p>
 <div id="strategy-research-cards">{render_strategy_research_cards([tournament_trade_to_dict(trade) for trade in list_tournament_trades(path=TOURNAMENT_TRADES_FILE)], tournament_settings, bot_snapshot.get("tournament_state_by_profile") or {})}</div>
 </section>
@@ -7714,7 +7935,8 @@ button {{
 <div class="card">
 <h2>Status</h2>
 Bot: <span class="{ "good" if bot_enabled else "bad" }">{ "ENABLED" if bot_enabled else "DISABLED" }</span><br>
-Mode: {mode}<br>
+Broker Environment: <span id="broker-environment-label">UNKNOWN / awaiting account validation</span><br>
+New Automatic Entries: <span class="{ "good" if config.get("auto_entries_enabled") else "bad" }">{ "ENABLED" if config.get("auto_entries_enabled") else "DISABLED" }</span><br>
 Strategy Mode: {strategy_mode}<br>
 Ticker: {symbol}
 </div>
@@ -7842,7 +8064,7 @@ Bot Reason Log:<br>
 </div>
 
 <div class="card">
-<h2>TOURNAMENT TRADES</h2>
+<h2>TOURNAMENT TRADES — SIMULATED (not broker orders)</h2>
 <details class="item">
 <summary><strong>DEVELOPER TEST TOOLS</strong></summary>
 <br>
@@ -8277,8 +8499,11 @@ Maximum Entry Quote Age (seconds):
 Allow delayed sandbox entries for research (explicit override):
 <input type="checkbox" name="allow_delayed_sandbox_entries" {checked(config.get("allow_delayed_sandbox_entries", False))}><br>
 
-Bot Enabled:
+Bot Enabled (runs exit management for open positions):
 <input type="checkbox" name="bot_enabled" {checked(bot_enabled)}><br>
+
+Allow New Automatic Entries (opens new positions with real money in LIVE):
+<input type="checkbox" name="auto_entries_enabled" {checked(config.get("auto_entries_enabled", False))}><br>
 
 Decision Time:
 <input name="decision_time" value="{config.get("decision_time", "09:35")}"><br>
@@ -8313,11 +8538,12 @@ Minimum Confidence:
 Minimum Dominance %:
 <input type="number" name="minimum_dominance_percent" min="50" max="100" value="{config.get("minimum_dominance_percent", 60)}"><br>
 
-Mode:
+Broker Environment (matching credentials required):
 <select name="mode">
 <option value="sandbox" {selected("sandbox", mode)}>Sandbox</option>
 <option value="live" {selected("live", mode)}>Live</option>
 </select><br>
+<small>Switching disables auto-entry. After account validation, explicitly enable the bot and save again. Switching requires no open broker positions or pending orders. Tournament balances remain SIMULATED.</small><br>
 
 Ticker:
 <select name="symbol_choice">
@@ -9239,6 +9465,22 @@ async function refreshLiveDashboard() {{
 
 setInterval(refreshLiveDashboard, 1000);
 setInterval(updateTournamentTrades, 5000);
+let accountRefreshBusy = false;
+async function updateConnectedAccount() {{
+    if (accountRefreshBusy) return;
+    accountRefreshBusy = true;
+    try {{
+        const data = await getJson("/api/account");
+        const panel = document.getElementById("connected-account");
+        if (panel && panel.innerHTML !== data.html) panel.innerHTML = data.html;
+        document.getElementById("broker-environment-label").textContent = data.account.environment_label;
+    }} catch (error) {{
+        document.getElementById("broker-environment-label").textContent = "UNKNOWN / CONNECTION ERROR";
+        document.getElementById("connected-account").textContent = "Account refresh failed — values unavailable. Retrying.";
+    }} finally {{ accountRefreshBusy = false; }}
+}}
+updateConnectedAccount();
+setInterval(updateConnectedAccount, 10000);
 
 async function loadExpirations() {{
     const res = await fetch(`/api/expirations?symbol=${{CURRENT_SYMBOL}}`);

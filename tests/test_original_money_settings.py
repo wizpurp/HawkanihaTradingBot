@@ -15,6 +15,7 @@ def original_config(contracts=1, maximum_position_cost_dollars=150.0, locked_pro
         "asset_type": "option",
         "contracts": contracts,
         "bot_enabled": True,
+        "auto_entries_enabled": True,
         "strategy_mode": "SURFER",
         "decision_time": "09:35",
         "bot_budget": 1000.0,
