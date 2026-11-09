@@ -47,3 +47,5 @@ data/tournament_profiles.backup.json
 data/shadow_candidates.csv
 data/shadow_candidate_quotes.csv
 config.backup.json
+data/option_exit_state.json*
+data/option_exit_recovery.json*

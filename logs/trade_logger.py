@@ -49,7 +49,8 @@ TRADE_COLUMNS = [
     "PnLSource", "QuotePnL", "TriggerPnL", "TriggerPnLPercent",
     "BrokerRealizedPnL", "BrokerRealizedPnLPercent",
     "EntryFillVsAskPercent", "EntryFillVsMidPercent", "ExecutionAnomalyThresholdPercent",
-    "ExecutionQuality", "StrategyPerformanceEligible", "ExecutionExclusionReason"
+    "ExecutionQuality", "StrategyPerformanceEligible", "ExecutionExclusionReason",
+    "ExitFillKey"
 ]
 
 ENTRY_EXECUTION_COLUMNS = [column for column in TRADE_COLUMNS if column.startswith("Entry") and column not in {
@@ -155,6 +156,17 @@ def write_trade_header(path):
     with open(path, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(TRADE_COLUMNS)
+
+
+def exit_fill_already_logged(fill_key):
+    """Has this exit intent's fill already been written? The trade log is the source of truth."""
+    if not fill_key:
+        return False
+    try:
+        with open(TRADES_FILE, "r", newline="") as f:
+            return any(row.get("ExitFillKey") == fill_key for row in csv.DictReader(f))
+    except FileNotFoundError:
+        return False
 
 
 def find_last_buy(symbol, source=None):

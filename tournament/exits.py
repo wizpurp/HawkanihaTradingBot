@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import replace
 
 from .models import BotProfile, BotRuntimeState, TournamentTrade, VirtualTournamentPosition
@@ -15,9 +16,12 @@ EXIT_INVALID_POSITION = "INVALID_POSITION"
 EXIT_MANUAL_TEST_CLOSE = "MANUAL_TEST_CLOSE"
 
 
+PRICE_TOLERANCE = 1e-9
+
+
 def valid_bid(bid_price) -> bool:
     try:
-        return bid_price is not None and float(bid_price) > 0
+        return bid_price is not None and math.isfinite(float(bid_price)) and float(bid_price) > 0
     except (TypeError, ValueError):
         return False
 
@@ -112,13 +116,13 @@ def evaluate_virtual_exit(
     floor = profit_floor_price(updated)
     floor_active = profit_floor_activated(updated)
 
-    if bid_price <= hard_stop:
+    if bid_price <= hard_stop + PRICE_TOLERANCE:
         return EXIT_HARD_STOP
 
-    if floor_active and floor is not None and bid_price <= max(trailing_stop, floor):
+    if floor_active and floor is not None and bid_price <= max(trailing_stop, floor) + PRICE_TOLERANCE:
         return EXIT_PROFIT_FLOOR_STOP
 
-    if updated.peak_price > updated.entry_price and bid_price <= trailing_stop:
+    if updated.peak_price > updated.entry_price and bid_price <= trailing_stop + PRICE_TOLERANCE:
         return EXIT_TRAILING_STOP
 
     return None

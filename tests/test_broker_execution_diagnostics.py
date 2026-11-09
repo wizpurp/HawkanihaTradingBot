@@ -104,10 +104,11 @@ class BrokerExecutionDiagnosticsTest(unittest.TestCase):
             {"order_status": "filled", "fill_price": 0.855, "fill_timestamp": "2026-09-24T14:40:00Z"},
         )
 
-        self.assertEqual(diagnostics["ExitTriggerPrice"], 0.82)
+        self.assertEqual(diagnostics["ExitTriggerPrice"], 0.81)
+        self.assertEqual(diagnostics["ExitStopPriceSource"], "BID")
         self.assertEqual(diagnostics["ExitOptionLast"], 0.86)
         self.assertEqual(diagnostics["ExitBrokerFillPrice"], 0.855)
-        self.assertAlmostEqual(diagnostics["ExitSlippageFromTrigger"], 0.035)
+        self.assertAlmostEqual(diagnostics["ExitSlippageFromTrigger"], 0.045)
         self.assertAlmostEqual(diagnostics["SpyChangeDollars"], -0.5)
 
     def test_hard_stop_decision_preserves_the_exact_trigger_quote(self):
@@ -125,14 +126,16 @@ class BrokerExecutionDiagnosticsTest(unittest.TestCase):
             "stop_armed": False,
             "stop_control_rule": "HARD STOP",
         }
-        with patch.object(dashboard, "get_market_quote", return_value={"bid": 0.81, "ask": 0.83, "last": 0.82}), \
+        quote = {"bid": 0.81, "ask": 0.83, "last": 0.82,
+                 "bid_date": datetime.now(dashboard.MARKET_TZ).isoformat()}
+        with patch.object(dashboard, "get_market_quote", return_value=quote), \
              patch.object(dashboard, "calculate_stop_state", return_value=stop_state):
             decision, reasons = dashboard.decide_surfer_action(config, [position], context)
 
         self.assertEqual(decision, "SELL")
-        self.assertIn("P/L -39.71%", reasons)
-        self.assertEqual(context["exit_trigger_diagnostics"]["ExitTriggerPrice"], 0.82)
-        self.assertEqual(context["exit_trigger_diagnostics"]["ExitStopPriceSource"], "LAST")
+        self.assertIn("P/L -40.44%", reasons)
+        self.assertEqual(context["exit_trigger_diagnostics"]["ExitTriggerPrice"], 0.81)
+        self.assertEqual(context["exit_trigger_diagnostics"]["ExitStopPriceSource"], "BID")
 
     def test_option_order_submission_remains_a_market_order(self):
         response = Mock(status_code=200, text='{"order":{"status":"ok","id":123}}')

@@ -1,6 +1,8 @@
 import re
 import math
 import copy
+import hashlib
+import uuid
 from flask import Flask, request, redirect, jsonify
 import requests
 import json
@@ -98,6 +100,33 @@ BROKER_OPERATION_LOCK = threading.RLock()
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_HISTORY_LIMIT = 20
 BOT_AUDIT_FILE = os.path.join(APP_DIR, "bot_audit_log.csv")
+EXIT_STATE_FILE = os.path.join(APP_DIR, "data", "option_exit_state.json")
+EXIT_RECOVERY_FILE = os.path.join(APP_DIR, "data", "option_exit_recovery.json")
+EXIT_STATE_VERSION = 3
+EXIT_UNVERIFIED_SCOPE = "UNVERIFIED"
+EXIT_CLOSED_FLAT_CONFIRMATIONS = 2
+EXIT_PRICE_BASIS = "BID"
+LEGACY_PEAK_BASIS = "LEGACY_UNVERIFIED"
+EXIT_PRICE_TOLERANCE = 1e-9
+DEFAULT_MAX_EXIT_QUOTE_AGE_SECONDS = 30
+# Sandbox market data is delayed about 15 minutes by design.
+DEFAULT_SANDBOX_MAX_EXIT_QUOTE_AGE_SECONDS = 1200
+MAX_EXIT_QUOTE_FUTURE_SKEW_SECONDS = 5
+DEFAULT_EXIT_ORDER_RETRY_SECONDS = 5
+EXIT_FILL_PRICE_WAIT_SECONDS = 30
+EXIT_INTENT_TAG_PREFIX = "hkexit-"
+EXIT_UNSCOPED = "UNSCOPED"
+EXIT_ORDER_LOOKUP_LIMIT = 1000
+EXIT_ORDER_LOOKUP_MAX_PAGES = 5
+EXIT_RECONCILE_INTERVAL_SECONDS = 5
+EXIT_ORDER_CLOCK_SKEW_SECONDS = 120
+# "No such order" needs several complete broker lists after the order had time to appear.
+EXIT_ABSENCE_SETTLE_SECONDS = 30
+EXIT_ABSENCE_CONFIRMATIONS = 3
+EXIT_STATE_SAVE_LOCK = threading.RLock()
+EXIT_STATE_ABSENT_CONFIRMATIONS = 3
+EXIT_ENTRY_MATCH_TOLERANCE = 0.005
+EXIT_ORDER_FAILED_STATUSES = {"rejected", "canceled", "cancelled", "expired", "error"}
 BOT_AUDIT_VISIBLE_FILE = os.path.join(APP_DIR, "dashboard_bot_audit_visible.csv")
 BOT_AUDIT_BACKUP_FILE = os.path.join(APP_DIR, "dashboard_bot_audit_last_cleared.csv")
 PENDING_ENTRY_HISTORY_FILE = os.path.join(APP_DIR, "pending_entry_history.json")
@@ -160,6 +189,18 @@ BOT_STATE = {
     "position_effective_stops": {},
     "position_max_profit": {},
     "position_max_drawdown": {},
+    "position_peak_basis": {},
+    "position_exit_entry_prices": {},
+    "pending_exit_orders": {},
+    "exit_confirmed_remaining": {},
+    "exit_intent_clear_result": "",
+    "exit_closed_awaiting": {},
+    "unscoped_exit_positions": {},
+    "exit_recovery": None,
+    "exit_quote_errors": {},
+    "exit_retry_after": {},
+    "exit_state_absent_counts": {},
+    "exit_state_error": "",
     "last_trade_review": {},
     "last_quote_time": "",
     "last_quote_epoch": None,
@@ -701,11 +742,17 @@ def position_hold_time(symbol):
 
 
 def stop_debug_values(symbol, entry_price, current_price, config=None):
+    # Display/logging callers pass whatever price they have; this must stay read-only.
     config = config or load_config()
-    return calculate_stop_state(symbol, entry_price, current_price, config)
+    return calculate_stop_state(symbol, entry_price, current_price, config, update_state=False)
 
 
-def calculate_stop_state(symbol, entry_price, current_price, config=None, update_state=True):
+def calculate_stop_state(symbol, entry_price, current_price, config=None, update_state=False, price_basis=None):
+    """Compute stop levels. Shared peak/stop state changes only for a validated bid.
+
+    Writing requires update_state=True AND price_basis=EXIT_PRICE_BASIS, so a caller
+    holding a last, ask or fallback price cannot contaminate the stored values.
+    """
     config = config or load_config()
     strategy = config.get("strategy", {})
     hard_stop_percent = float(strategy.get("hard_stop_percent", 20))
@@ -715,10 +762,22 @@ def calculate_stop_state(symbol, entry_price, current_price, config=None, update
     locked_profit_dollars = max(0.0, safe_float(strategy.get("locked_profit_dollars", 0.0), 0.0))
     required_premium_movement = locked_profit_premium_increment(locked_profit_dollars, contracts)
 
+    if update_state and (price_basis != EXIT_PRICE_BASIS or current_price is None or exit_broker_scope(config) is None):
+        print("STOP STATE WRITE REFUSED:", symbol, "price_basis:", price_basis, "price:", current_price)
+        update_state = False
+    state_key = exit_state_key(symbol, config)
+
     with BOT_LOCK:
-        peak_price = BOT_STATE["position_peaks"].get(symbol, entry_price)
-        existing_profit_floor_active = bool(BOT_STATE["position_profit_floor_active"].get(symbol, False))
-        existing_effective_stop = BOT_STATE["position_effective_stops"].get(symbol)
+        had_stored_peak = state_key in BOT_STATE["position_peaks"]
+        peak_price = BOT_STATE["position_peaks"].get(state_key, entry_price)
+        stored_peak = peak_price
+        existing_profit_floor_active = bool(BOT_STATE["position_profit_floor_active"].get(state_key, False))
+        existing_effective_stop = BOT_STATE["position_effective_stops"].get(state_key)
+        peak_basis = BOT_STATE["position_peak_basis"].get(state_key)
+        stored_entry = BOT_STATE["position_exit_entry_prices"].get(state_key)
+
+    if had_stored_peak and not peak_basis:
+        peak_basis = LEGACY_PEAK_BASIS
 
     if current_price is not None:
         peak_price = max(peak_price or entry_price, current_price)
@@ -753,17 +812,33 @@ def calculate_stop_state(symbol, entry_price, current_price, config=None, update
     stop_armed = trailing_stop_price >= entry_price if trailing_stop_price is not None and entry_price is not None else False
     drawdown_from_peak_percent = ((peak_price - current_price) / peak_price) * 100 if peak_price and current_price is not None else 0
 
+    if not had_stored_peak or (current_price is not None and current_price > (stored_peak or 0)):
+        peak_basis = EXIT_PRICE_BASIS if update_state else peak_basis
+
     if update_state:
         with BOT_LOCK:
-            BOT_STATE["position_peaks"][symbol] = peak_price
-            BOT_STATE["position_profit_floor_active"][symbol] = profit_floor_activated
+            changed = (
+                not had_stored_peak
+                or peak_price != stored_peak
+                or profit_floor_activated != existing_profit_floor_active
+                or peak_basis != BOT_STATE["position_peak_basis"].get(state_key)
+                or stored_entry != entry_price
+                or (profit_floor_activated and trailing_stop_price != existing_effective_stop)
+            )
+            BOT_STATE["position_peaks"][state_key] = peak_price
+            BOT_STATE["position_peak_basis"][state_key] = peak_basis
+            BOT_STATE["position_exit_entry_prices"][state_key] = entry_price
+            BOT_STATE["position_profit_floor_active"][state_key] = profit_floor_activated
             if profit_floor_activated and trailing_stop_price is not None:
-                BOT_STATE["position_effective_stops"][symbol] = trailing_stop_price
+                BOT_STATE["position_effective_stops"][state_key] = trailing_stop_price
+        if changed:
+            persist_exit_state()
 
     return {
         "hard_stop_percent": hard_stop_percent,
         "hard_stop_price": hard_stop_price,
         "peak_price": peak_price,
+        "peak_basis": peak_basis or "",
         "trailing_stop_percent": trailing_stop_percent,
         "trailing_stop_price": trailing_stop_price,
         "percentage_trailing_stop": percentage_trailing_stop,
@@ -781,7 +856,10 @@ def calculate_stop_state(symbol, entry_price, current_price, config=None, update
     }
 
 
-def current_exit_display(symbol, stop_values):
+def current_exit_display(symbol, stop_values, quote_data_error=""):
+    if quote_data_error:
+        return "QUOTE DATA ERROR", f"{quote_data_error}\nStops are NOT being evaluated until a valid, fresh bid returns."
+
     context = current_market_context_snapshot()
     decision = context.get("decision") or "HOLD"
     reasons = context.get("decision_reasons") or []
@@ -1261,7 +1339,13 @@ def recover_shadow_research_on_startup():
     return changed
 
 
-def submit_and_parse_option_order(option_symbol, qty, action, label):
+def submit_and_parse_option_order(option_symbol, qty, action, label, tag=None):
+    recovery_block = exit_recovery_block_reason()
+    if recovery_block:
+        print(f"{label} ORDER BLOCKED:", recovery_block)
+        add_bot_reason(f"{label} ORDER BLOCKED: {recovery_block}")
+        return False, "RECOVERY_REQUIRED", 0, recovery_block
+
     if action == "buy_to_open":
         allowed, reason, current_total, max_open_contracts = validate_buy_position_cap(qty)
         if not allowed:
@@ -1272,7 +1356,7 @@ def submit_and_parse_option_order(option_symbol, qty, action, label):
             add_bot_reason(f"{label} BUY skipped: {reason}; Current: {current_total}; Maximum: {max_open_contracts}")
             return False, reason, 0, text
 
-    status, text = submit_option_order(option_symbol, qty, action)
+    status, text = submit_option_order(option_symbol, qty, action, tag=tag) if tag else submit_option_order(option_symbol, qty, action)
     print(f"{label} ORDER STATUS:", status)
     print(f"{label} ORDER RESPONSE:", text)
     ok, order_status = parse_order_response(status, text, label)
@@ -1289,7 +1373,12 @@ def broker_session(function):
 
 def broker_request(method, path, **kwargs):
     with BROKER_OPERATION_LOCK:
-        connection = resolve_connection(load_config())
+        request_config = load_config()
+        connection = resolve_connection(request_config)
+        if method == "POST" and path == "/accounts/{account}/orders":
+            recovery_block = exit_recovery_block_reason(request_config)
+            if recovery_block:
+                raise BrokerConnectionError(recovery_block)
         if method == "POST" and kwargs.get("data", {}).get("side") in ("buy", "buy_to_open") and not BROKER.account(connection)["validated"]:
             raise BrokerConnectionError("Broker account is not validated; order not submitted")
         try:
@@ -1717,7 +1806,7 @@ def select_entry_contract(config, decision, strict_call, strict_put):
     return select_closest_contract_within_budget(config.get("symbol", "SPY"), side, maximum_position_cost_dollars, contracts)
 
 
-def submit_option_order(option_symbol, qty, action="buy_to_open"):
+def submit_option_order(option_symbol, qty, action="buy_to_open", tag=None):
     config = load_config()
     underlying = config["symbol"]
 
@@ -1730,6 +1819,8 @@ def submit_option_order(option_symbol, qty, action="buy_to_open"):
         "type": "market",
         "duration": "day"
     }
+    if tag:
+        data["tag"] = tag
 
     started_at = time.perf_counter()
     r = broker_request("POST",
@@ -1868,6 +1959,11 @@ def quote_execution_snapshot(quote):
     }
 
 
+def broker_order_quantity(value):
+    price, status = strict_quote_price(value)
+    return price if status == "OK" else 0.0 if status == "ZERO" else None
+
+
 def parse_broker_order_execution(payload):
     if isinstance(payload, str):
         try:
@@ -1877,18 +1973,29 @@ def parse_broker_order_execution(payload):
     payload = payload if isinstance(payload, dict) else {}
     order = payload.get("order", payload)
     order = order if isinstance(order, dict) else {}
+    status = order.get("status")
+    filled_quantity = broker_order_quantity(order.get("exec_quantity"))
     fill_price = valid_price(order.get("avg_fill_price"))
     if fill_price is not None and not math.isfinite(fill_price):
         fill_price = None
-    if order.get("status") not in ["filled", "partially_filled"]:
+    # A canceled/expired order can still carry a real partial fill.
+    has_terminal_partial = status in EXIT_ORDER_FAILED_STATUSES and bool(filled_quantity)
+    if status not in ["filled", "partially_filled"] and not has_terminal_partial:
         fill_price = None
-    fill_timestamp = order.get("transaction_date") if fill_price is not None and order.get("status") == "filled" else ""
+    timestamp_allowed = status == "filled" or has_terminal_partial
+    fill_timestamp = order.get("transaction_date") if fill_price is not None and timestamp_allowed else ""
     return {
-        "order_status": order.get("status") or "",
+        "order_status": status or "",
         "fill_price": fill_price,
         "fill_timestamp": fill_timestamp or "",
         "order_type": order.get("type") or "",
         "requested_price": order.get("price") if order.get("price") not in (None, 0, "0") else "",
+        "order_id": str(order.get("id") or ""),
+        "option_symbol": order.get("option_symbol") or "",
+        "side": order.get("side") or "",
+        "tag": order.get("tag") or "",
+        "filled_quantity": filled_quantity,
+        "remaining_quantity": broker_order_quantity(order.get("remaining_quantity")),
     }
 
 
@@ -1984,19 +2091,22 @@ def entry_quote_freshness(config, contract, context):
 
 
 def exit_trigger_diagnostics(quote, spy_price, hard_stop_price, trailing_stop_price, effective_stop_price):
+    """Record the quote that triggered an option exit. The trigger basis is always the bid."""
     option = quote_execution_snapshot(quote)
+    bid_timestamp = broker_timestamp((quote or {}).get("bid_date")) if isinstance(quote, dict) else None
+    bid_age = (market_now() - bid_timestamp).total_seconds() if bid_timestamp else ""
     return {
         "ExitTriggerOptionBid": option["bid"] if option["bid"] is not None else "",
         "ExitTriggerOptionAsk": option["ask"] if option["ask"] is not None else "",
         "ExitTriggerOptionMidpoint": option["midpoint"] if option["midpoint"] is not None else "",
         "ExitTriggerOptionLast": option["last"] if option["last"] is not None else "",
-        "ExitTriggerQuoteTimestamp": option["quote_timestamp"],
-        "ExitTriggerQuoteAgeSeconds": option["quote_age_seconds"],
+        "ExitTriggerQuoteTimestamp": bid_timestamp.isoformat() if bid_timestamp else "",
+        "ExitTriggerQuoteAgeSeconds": bid_age,
         "ExitHardStopPrice": hard_stop_price if hard_stop_price is not None else "",
         "ExitTrailingStopPrice": trailing_stop_price if trailing_stop_price is not None else "",
         "ExitEffectiveStopPrice": effective_stop_price if effective_stop_price is not None else "",
-        "ExitStopPriceSource": option["price_source"],
-        "ExitTriggerPrice": option["selected_price"] if option["selected_price"] is not None else "",
+        "ExitStopPriceSource": EXIT_PRICE_BASIS if option["bid"] is not None else "NONE",
+        "ExitTriggerPrice": option["bid"] if option["bid"] is not None else "",
         "ExitTriggerSpyPrice": spy_price if spy_price is not None else "",
     }
 
@@ -2029,6 +2139,1400 @@ def exit_execution_diagnostics(trigger_diagnostics, pre_exit_quote, spy_exit_pri
         "SpyChangePercent": spy_change_percent if spy_change_percent is not None else "",
     })
     return diagnostics
+
+
+QUOTE_DATA_ERROR_DECISION = "QUOTE DATA ERROR"
+EXIT_CODE_HARD_STOP = "HARD_STOP"
+EXIT_CODE_TRAILING_STOP = "TRAILING_STOP"
+EXIT_CODE_PROFIT_FLOOR_STOP = "PROFIT_FLOOR_STOP"
+
+
+def strict_quote_price(value):
+    """Return (price, status). Status is OK, MISSING, INVALID, NON_FINITE, ZERO or NEGATIVE."""
+    if value is None or value == "":
+        return None, "MISSING"
+    if isinstance(value, bool):
+        return None, "INVALID"
+    try:
+        price = float(value)
+    except (TypeError, ValueError):
+        return None, "INVALID"
+    if not math.isfinite(price):
+        return None, "NON_FINITE"
+    if price == 0:
+        return None, "ZERO"
+    if price < 0:
+        return None, "NEGATIVE"
+    return price, "OK"
+
+
+def exit_quote_age_limit(config):
+    environment = market_data_environment()
+    if environment == "SANDBOX_DELAYED":
+        key, default = "max_sandbox_exit_quote_age_seconds", DEFAULT_SANDBOX_MAX_EXIT_QUOTE_AGE_SECONDS
+    else:
+        key, default = "max_exit_quote_age_seconds", DEFAULT_MAX_EXIT_QUOTE_AGE_SECONDS
+    limit = safe_float((config or {}).get(key), default)
+    if not isinstance(limit, (int, float)) or not math.isfinite(limit) or limit <= 0:
+        limit = default
+    return float(limit), environment
+
+
+def get_option_exit_price(quote, config=None):
+    """Validated exit price for closing a long option: the current bid, or an explicit error.
+
+    Never falls back to last, ask or entry. get_quote_price stays as it is for underlying
+    signals and entries; stop logic must use this helper instead.
+    """
+    config = config if config is not None else load_config()
+    limit, environment = exit_quote_age_limit(config)
+    result = {
+        "ok": False, "status": "", "message": "", "price": None, "price_source": "NONE",
+        "bid": None, "raw_bid": None, "ask": None, "last": None,
+        "quote_timestamp": "", "quote_age_seconds": None,
+        "max_age_seconds": limit, "market_data_environment": environment,
+    }
+
+    def failed(status, detail):
+        result.update(status=status, message=f"{status}: {detail}")
+        return result
+
+    if not isinstance(quote, dict) or not quote:
+        return failed("MISSING_QUOTE", "broker returned no option quote")
+
+    bid, bid_status = strict_quote_price(quote.get("bid"))
+    ask, _ = strict_quote_price(quote.get("ask"))
+    last, _ = strict_quote_price(quote.get("last"))
+    raw_timestamp = quote.get("bid_date")
+    timestamp = broker_timestamp(raw_timestamp)
+    age = (market_now() - timestamp).total_seconds() if timestamp else None
+    result.update(bid=bid, raw_bid=quote.get("bid"), ask=ask, last=last,
+                  quote_timestamp=timestamp.isoformat() if timestamp else "",
+                  quote_age_seconds=age)
+
+    if bid_status != "OK":
+        return failed(f"{bid_status}_BID", f"bid is unusable (raw value {quote.get('bid')!r})")
+    if ask is not None and bid > ask + EXIT_PRICE_TOLERANCE:
+        return failed("CROSSED_QUOTE", f"bid {bid} is above ask {ask}")
+    if timestamp is None:
+        status = "MISSING_BID_TIMESTAMP" if raw_timestamp in (None, "") else "INVALID_BID_TIMESTAMP"
+        return failed(status, f"bid age cannot be verified (raw bid_date {raw_timestamp!r})")
+    if age < -MAX_EXIT_QUOTE_FUTURE_SKEW_SECONDS:
+        return failed("FUTURE_BID_TIMESTAMP", f"bid timestamp is {-age:.1f}s in the future")
+    if age > limit:
+        return failed("STALE_BID", f"bid age {age:.1f}s exceeds {limit:g}s limit ({environment})")
+
+    result.update(ok=True, status="OK", price=bid, price_source=EXIT_PRICE_BASIS,
+                  quote_age_seconds=max(age, 0.0))
+    return result
+
+
+def exit_quote_number(value):
+    return f"{value:.4f}" if isinstance(value, (int, float)) else "N/A"
+
+
+def exit_quote_log_line(symbol, exit_quote, stop_price="", exit_reason=""):
+    age = exit_quote.get("quote_age_seconds")
+    return (
+        f"EXIT QUOTE {symbol}: status={exit_quote.get('status')} source={exit_quote.get('price_source')} "
+        f"timestamp={exit_quote.get('quote_timestamp') or 'N/A'} "
+        f"age={f'{age:.1f}s' if isinstance(age, (int, float)) else 'N/A'} "
+        f"bid={exit_quote_number(exit_quote.get('bid'))} ask={exit_quote_number(exit_quote.get('ask'))} "
+        f"last={exit_quote_number(exit_quote.get('last'))} stop={exit_quote_number(stop_price)} "
+        f"exit_reason={exit_reason or 'NONE'}"
+    )
+
+
+def exit_quote_status_text(exit_quote):
+    age = exit_quote.get("quote_age_seconds")
+    return f"BID {exit_quote_number(exit_quote.get('bid'))} ({f'{age:.1f}s' if isinstance(age, (int, float)) else 'age N/A'} old)"
+
+
+def evaluate_option_exit(symbol, entry_price, quote, config):
+    """The single stop decision used by every automated exit path."""
+    reconcile_exit_state_entry(symbol, entry_price, config)
+    exit_quote = get_option_exit_price(quote, config)
+    bid = exit_quote["price"]
+    hard_stop_percent = float(config["strategy"].get("hard_stop_percent", 20))
+    hard_stop_price = entry_price * (1 - hard_stop_percent / 100) if entry_price else None
+    stop_values = calculate_stop_state(
+        symbol, entry_price, bid, config,
+        update_state=exit_quote["ok"],
+        price_basis=EXIT_PRICE_BASIS if exit_quote["ok"] else None,
+    )
+    effective_stop = stop_values.get("effective_trailing_stop")
+    stop_armed = bool(stop_values.get("stop_armed"))
+    decision = "HOLD"
+    exit_code = ""
+    stop_price = effective_stop if stop_armed and effective_stop is not None else hard_stop_price
+
+    if not exit_quote["ok"]:
+        decision = "DATA_ERROR"
+    else:
+        clear_exit_quote_error(symbol)
+        if hard_stop_price is not None and bid <= hard_stop_price + EXIT_PRICE_TOLERANCE:
+            decision, exit_code, stop_price = "SELL", EXIT_CODE_HARD_STOP, hard_stop_price
+        elif stop_armed and effective_stop is not None and bid <= effective_stop + EXIT_PRICE_TOLERANCE:
+            floor_rules = stop_values.get("stop_control_rule") == "PROFIT FLOOR"
+            decision, exit_code, stop_price = "SELL", EXIT_CODE_PROFIT_FLOOR_STOP if floor_rules else EXIT_CODE_TRAILING_STOP, effective_stop
+
+    return {
+        "ok": exit_quote["ok"], "decision": decision, "exit_code": exit_code, "bid": bid,
+        "exit_quote": exit_quote, "stop_values": stop_values, "hard_stop_price": hard_stop_price,
+        "effective_stop": effective_stop, "stop_price": stop_price, "stop_armed": stop_armed,
+    }
+
+
+def clear_exit_quote_error(symbol):
+    key = exit_state_key(symbol)
+    with BOT_LOCK:
+        previous = BOT_STATE["exit_quote_errors"].pop(key, None)
+    if previous:
+        add_bot_reason(f"EXIT QUOTE RECOVERED {symbol}: valid bid returned after {previous['count']} failed poll(s)")
+
+
+def record_exit_quote_error(symbol, qty, entry_price, evaluation, label):
+    """Surface a quote problem. Places, cancels and changes no orders; the next poll is the retry."""
+    exit_quote = evaluation["exit_quote"]
+    stop_values = evaluation["stop_values"]
+    now_epoch = time.time()
+    key = exit_state_key(symbol)
+    with BOT_LOCK:
+        entry = BOT_STATE["exit_quote_errors"].setdefault(key, {"count": 0, "first_seen": now_epoch})
+        entry["count"] += 1
+        entry["status"] = exit_quote["status"]
+        count, first_seen = entry["count"], entry["first_seen"]
+    message = f"{label} QUOTE DATA ERROR {symbol}: {exit_quote['message']}"
+    exposure = (
+        f"UNRESOLVED EXPOSURE: {qty:g} contract(s) of {symbol} remain open and stops are NOT being evaluated "
+        f"({count} failed poll(s) over {now_epoch - first_seen:.0f}s). Entry {exit_quote_number(entry_price)}, "
+        f"peak {exit_quote_number(stop_values.get('peak_price'))}, hard stop {exit_quote_number(evaluation['hard_stop_price'])}, "
+        f"effective stop {exit_quote_number(evaluation['effective_stop'])}. No order sent or changed; retrying next poll. "
+        f"Broker-side orders, if any, are untouched."
+    )
+    print(exit_quote_log_line(symbol, exit_quote, evaluation["stop_price"], "NONE"))
+    print(exposure)
+    add_bot_reason(f"{message} | {exposure}")
+    set_last_error(f"{message} | {exposure}")
+    return message, exposure
+
+
+def json_safe(value):
+    try:
+        return json.loads(json.dumps(value, default=str))
+    except (TypeError, ValueError):
+        return {}
+
+
+def exit_state_key(symbol, config=None):
+    """Account/environment/contract key for stop state. Unverifiable accounts never share a key."""
+    return exit_order_key(exit_broker_scope(config) or EXIT_UNVERIFIED_SCOPE, symbol)
+
+
+def write_exit_recovery_marker():
+    with BOT_LOCK:
+        payload = json_safe(BOT_STATE.get("exit_recovery") or {})
+    temporary = f"{EXIT_RECOVERY_FILE}.tmp"
+    try:
+        os.makedirs(os.path.dirname(EXIT_RECOVERY_FILE), exist_ok=True)
+        with open(temporary, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, EXIT_RECOVERY_FILE)
+        return True
+    except (OSError, TypeError, ValueError) as exc:
+        print("EXIT RECOVERY MARKER SAVE FAILED:", exc)
+        return False
+
+
+def require_exit_recovery(reason):
+    """Record that saved exit state was lost. Lives in its own file so state saves cannot clear it."""
+    message = (f"EXIT RECOVERY REQUIRED: {reason}; armed stops and exit intents NOT restored. "
+               f"All new orders are blocked until broker orders and positions are reconciled.")
+    with BOT_LOCK:
+        BOT_STATE["exit_recovery"] = {
+            "required": True, "reason": reason, "detected_epoch": time.time(),
+            "detected_at": market_now().isoformat(), "reconciled_scopes": [], "checks": {}, "status": message,
+        }
+        BOT_STATE["exit_state_error"] = message
+    saved = write_exit_recovery_marker()
+    print(message)
+    add_bot_reason(message)
+    set_last_error(message)
+    return saved
+
+
+def load_exit_recovery_marker():
+    if not os.path.exists(EXIT_RECOVERY_FILE):
+        return
+    try:
+        with open(EXIT_RECOVERY_FILE, encoding="utf-8") as handle:
+            marker = json.load(handle)
+        if not isinstance(marker, dict) or not isinstance(marker.get("reconciled_scopes"), list):
+            raise ValueError("invalid marker")
+    except (OSError, ValueError) as exc:
+        require_exit_recovery(f"recovery marker unreadable ({exc})")
+        return
+    with BOT_LOCK:
+        BOT_STATE["exit_recovery"] = marker
+    add_bot_reason(f"EXIT RECOVERY marker restored: {marker.get('reason', 'unknown reason')}")
+
+
+def exit_recovery_block_reason(config=None):
+    """Why new orders are blocked on the selected account; empty when they are allowed."""
+    with BOT_LOCK:
+        recovery = BOT_STATE.get("exit_recovery")
+        recovery = dict(recovery) if recovery else None
+    if not recovery:
+        return ""
+    if exit_broker_scope(config) in (recovery.get("reconciled_scopes") or []):
+        return ""
+    return recovery.get("status") or "EXIT RECOVERY REQUIRED: new orders are blocked"
+
+
+def update_exit_recovery(scope, count, last_epoch, status):
+    with BOT_LOCK:
+        recovery = BOT_STATE.get("exit_recovery")
+        if not recovery:
+            return
+        recovery.setdefault("checks", {})[scope] = {"count": count, "last_epoch": last_epoch}
+        changed = recovery.get("status") != status
+        recovery["status"] = status
+    write_exit_recovery_marker()
+    if changed:
+        print(status)
+        add_bot_reason(status)
+    set_last_error(status)
+
+
+@broker_session
+def process_exit_recovery(positions):
+    """Read-only reconciliation for lost exit state. Returns NONE, BLOCKED or RECONCILED."""
+    config = load_config()
+    with BOT_LOCK:
+        recovery = BOT_STATE.get("exit_recovery")
+        recovery = copy.deepcopy(recovery) if recovery else None
+    if not recovery:
+        return "NONE"
+    scope = exit_broker_scope(config)
+    if scope is None:
+        set_last_error("EXIT RECOVERY REQUIRED: broker account could not be verified; new orders remain blocked")
+        return "BLOCKED"
+    if scope in recovery.get("reconciled_scopes", []):
+        return "NONE"
+    check = (recovery.get("checks") or {}).get(scope) or {"count": 0, "last_epoch": 0}
+    now_epoch = time.time()
+    if now_epoch - check["last_epoch"] < EXIT_RECONCILE_INTERVAL_SECONDS:
+        return "BLOCKED"
+
+    def blocked(detail, count=0):
+        update_exit_recovery(scope, count, now_epoch, (
+            f"EXIT RECOVERY REQUIRED ({recovery.get('reason')}): {detail} New orders remain blocked; monitoring and "
+            f"reconciliation continue. ACTION: review open orders and positions for this account in Tradier."
+        ))
+        return "BLOCKED"
+
+    with BOT_LOCK:
+        position_status = str(BOT_STATE.get("last_position_status", ""))
+    if not position_status.startswith("OK"):
+        return blocked("Broker positions could not be confirmed.")
+    orders, error = fetch_broker_orders_for_reconciliation()
+    if error:
+        return blocked(f"Broker order lookup failed ({error}).")
+    working = [order for order in orders
+               if order.get("side") in (None, "", "sell_to_close", "buy_to_open") and not order_is_finished(order.get("status"))]
+    if working:
+        ids = ", ".join(str(order.get("id") or "no id") for order in working[:5])
+        return blocked(f"{len(working)} working option order(s) at the broker (ids: {ids}).")
+    if now_epoch - recovery.get("detected_epoch", 0) < EXIT_ABSENCE_SETTLE_SECONDS:
+        return blocked("Waiting for any recent order to become visible at the broker.")
+    count = check["count"] + 1
+    if count < EXIT_ABSENCE_CONFIRMATIONS:
+        return blocked(f"{count} of {EXIT_ABSENCE_CONFIRMATIONS} required clean broker checks completed.", count)
+
+    notes = rebuild_closed_exits_from_orders(orders, positions, scope)
+    status = f"EXIT RECOVERY complete for this account: no working orders in {count} broker checks. Stops restart from entry unless restored."
+    if notes:
+        status += f" Filled exit order(s) missing from the trade log: {', '.join(notes)}; record them from Tradier."
+    with BOT_LOCK:
+        current = BOT_STATE.get("exit_recovery")
+        if current:
+            current.setdefault("reconciled_scopes", []).append(scope)
+            current["status"] = status
+    if not write_exit_recovery_marker():
+        with BOT_LOCK:
+            BOT_STATE["exit_recovery"]["reconciled_scopes"].remove(scope)
+        return blocked("The reconciliation result could not be saved.")
+    print(status)
+    add_bot_reason(status)
+    return "RECONCILED"
+
+
+def rebuild_closed_exits_from_orders(orders, positions, scope):
+    """Lost state may have held a closed record; tagged fills restore that protection."""
+    unlogged = []
+    held = {position.get("symbol") for position in positions or []}
+    changed = False
+    for order in orders:
+        tag = str(order.get("tag") or "")
+        if not tag.startswith(EXIT_INTENT_TAG_PREFIX) or str(order.get("status") or "").lower() != "filled":
+            continue
+        try:
+            if not exit_fill_already_logged(tag[len(EXIT_INTENT_TAG_PREFIX):]):
+                unlogged.append(str(order.get("id") or tag))
+        except OSError:
+            unlogged.append(str(order.get("id") or tag))
+        symbol = order.get("option_symbol")
+        if symbol in held:
+            stamp = broker_timestamp(order.get("transaction_date") or order.get("create_date"))
+            key = exit_order_key(scope, symbol)
+            with BOT_LOCK:
+                BOT_STATE["exit_closed_awaiting"].setdefault(key, {
+                    "key": key, "scope": scope, "symbol": symbol, "intent_id": tag[len(EXIT_INTENT_TAG_PREFIX):],
+                    "order_id": str(order.get("id") or ""), "sold_qty": broker_order_quantity(order.get("exec_quantity")) or 0,
+                    "closed_epoch": stamp.timestamp() if stamp else time.time(), "position_before": {},
+                    "entry_price": None, "flat_checks": 0, "status_message": "Rebuilt during recovery; awaiting position confirmation",
+                })
+            changed = True
+    if changed:
+        persist_exit_state()
+    return unlogged
+
+
+def persist_exit_state():
+    """Atomically and durably save exit state. Returns True only if it reached disk."""
+    with EXIT_STATE_SAVE_LOCK:
+        with BOT_LOCK:
+            recovery = BOT_STATE.get("exit_recovery")
+        if recovery and not os.path.exists(EXIT_RECOVERY_FILE) and not write_exit_recovery_marker():
+            # The unreadable state file is the only remaining evidence; do not overwrite it.
+            print("EXIT STATE NOT SAVED: recovery marker could not be written")
+            return False
+        with BOT_LOCK:
+            payload = {
+                "version": EXIT_STATE_VERSION,
+                "saved_at": market_now().isoformat(),
+                "positions": {
+                    key: {
+                        "peak_price": peak,
+                        "peak_basis": BOT_STATE["position_peak_basis"].get(key) or LEGACY_PEAK_BASIS,
+                        "entry_price": BOT_STATE["position_exit_entry_prices"].get(key),
+                        "profit_floor_active": bool(BOT_STATE["position_profit_floor_active"].get(key, False)),
+                        "effective_stop": BOT_STATE["position_effective_stops"].get(key),
+                    }
+                    for key, peak in BOT_STATE["position_peaks"].items()
+                },
+                "unscoped_positions": BOT_STATE["unscoped_exit_positions"],
+                "pending_exit_orders": BOT_STATE["pending_exit_orders"],
+                "exit_confirmed_remaining": BOT_STATE["exit_confirmed_remaining"],
+                "exit_closed_awaiting": BOT_STATE["exit_closed_awaiting"],
+            }
+            payload = json_safe(payload)
+        temporary = f"{EXIT_STATE_FILE}.tmp"
+        try:
+            os.makedirs(os.path.dirname(EXIT_STATE_FILE), exist_ok=True)
+            with open(temporary, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=2, sort_keys=True)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, EXIT_STATE_FILE)
+            with BOT_LOCK:
+                if not BOT_STATE.get("exit_recovery"):
+                    BOT_STATE["exit_state_error"] = ""
+            return True
+        except (OSError, TypeError, ValueError) as exc:
+            message = f"EXIT STATE SAVE FAILED: {exc}; armed stops and exit intents would not survive a restart"
+            print(message)
+            with BOT_LOCK:
+                BOT_STATE["exit_state_error"] = message
+            set_last_error(message)
+            return False
+
+
+def restore_position_record(key, record, issues):
+    if not isinstance(record, dict):
+        issues.append(f"position {key} is not a record")
+        return
+    peak, peak_status = strict_quote_price(record.get("peak_price"))
+    if peak_status != "OK":
+        issues.append(f"invalid saved peak for {key}: {record.get('peak_price')!r}")
+        return
+    basis = record.get("peak_basis") if record.get("peak_basis") == EXIT_PRICE_BASIS else LEGACY_PEAK_BASIS
+    entry, _ = strict_quote_price(record.get("entry_price"))
+    stop, _ = strict_quote_price(record.get("effective_stop"))
+    with BOT_LOCK:
+        BOT_STATE["position_peaks"][key] = peak
+        BOT_STATE["position_peak_basis"][key] = basis
+        BOT_STATE["position_profit_floor_active"][key] = bool(record.get("profit_floor_active"))
+        if entry is not None:
+            BOT_STATE["position_exit_entry_prices"][key] = entry
+        if stop is not None:
+            BOT_STATE["position_effective_stops"][key] = stop
+    add_bot_reason(f"EXIT STATE RESTORED {key}: peak {peak:.4f} basis {basis} effective stop {exit_quote_number(stop)}")
+
+
+def quarantine_unscoped_position(symbol, record, issues):
+    """Pre-scoping stop state belongs to an unknown account, so no account receives it automatically."""
+    peak, peak_status = strict_quote_price(record.get("peak_price") if isinstance(record, dict) else None)
+    if peak_status != "OK":
+        issues.append(f"invalid saved peak for {symbol}")
+        return
+    stored = dict(record, symbol=symbol, peak_price=peak, migration_id=record.get("migration_id") or uuid.uuid4().hex)
+    with BOT_LOCK:
+        BOT_STATE["unscoped_exit_positions"][symbol] = stored
+    add_bot_reason(f"EXIT STATE MIGRATION REQUIRED {symbol}: saved peak {peak:.4f} has no account; choose an action in Unresolved Exit Orders")
+
+
+def valid_exit_quantity(value):
+    return strict_quote_price(value)[1] == "OK"
+
+
+def load_exit_state():
+    """Restore armed stops and exit intents. Unloadable or invalid state requires broker recovery."""
+    load_exit_recovery_marker()
+    if not os.path.exists(EXIT_STATE_FILE):
+        print("EXIT STATE: no saved state; any open position starts its peak from entry")
+        return False
+    try:
+        with open(EXIT_STATE_FILE, encoding="utf-8") as handle:
+            data = json.load(handle)
+        if not isinstance(data, dict):
+            raise ValueError("root is not an object")
+        if not isinstance(data.get("version", 1), int) or data.get("version", 1) > EXIT_STATE_VERSION:
+            raise ValueError(f"unsupported version {data.get('version')!r}")
+    except (OSError, ValueError) as exc:
+        # Marker first: if it cannot be written the unreadable file must stay as the only evidence.
+        if require_exit_recovery(f"saved exit state unreadable ({exc})"):
+            try:
+                os.replace(EXIT_STATE_FILE, f"{EXIT_STATE_FILE}.corrupt-{int(time.time())}")
+            except OSError as move_error:
+                print("EXIT STATE: could not preserve unreadable file:", move_error)
+        return False
+
+    issues = []
+    for key, record in (data.get("positions") or {}).items():
+        if "|" in key:
+            restore_position_record(key, record, issues)
+        else:
+            quarantine_unscoped_position(key, record, issues)
+    for symbol, record in (data.get("unscoped_positions") or {}).items():
+        quarantine_unscoped_position(symbol, record, issues)
+
+    for saved_key, record in (data.get("pending_exit_orders") or {}).items():
+        if not isinstance(record, dict) or not valid_exit_quantity(record.get("qty")) or not isinstance(record.get("submitted_epoch"), (int, float)):
+            issues.append(f"invalid exit intent {saved_key}")
+            continue
+        record.setdefault("symbol", saved_key)
+        if not record.get("scope") or not record.get("intent_id"):
+            # Saved by the pre-intent format: its account is unknown, so it stays blocked for review.
+            record.update(scope=EXIT_UNSCOPED, tag=record.get("tag", ""), intent_id=record.get("intent_id") or uuid.uuid4().hex)
+        record["key"] = exit_order_key(record["scope"], record["symbol"])
+        with BOT_LOCK:
+            BOT_STATE["pending_exit_orders"][record["key"]] = record
+        add_bot_reason(f"EXIT STATE RESTORED intent {record['symbol']}: order {record.get('order_id') or 'UNKNOWN'} tag {record.get('tag') or 'NONE'}; reconciling before any new exit")
+
+    for key, value in (data.get("exit_confirmed_remaining") or {}).items():
+        if valid_exit_quantity(value):
+            with BOT_LOCK:
+                BOT_STATE["exit_confirmed_remaining"][key] = value
+        else:
+            issues.append(f"invalid confirmed remaining quantity for {key}")
+
+    for key, record in (data.get("exit_closed_awaiting") or {}).items():
+        if not isinstance(record, dict) or not record.get("symbol") or not isinstance(record.get("closed_epoch"), (int, float)):
+            issues.append(f"invalid closed exit record {key}")
+            continue
+        with BOT_LOCK:
+            BOT_STATE["exit_closed_awaiting"][key] = record
+        add_bot_reason(f"EXIT STATE RESTORED closed exit {record['symbol']}: awaiting broker position confirmation")
+
+    if issues:
+        summary = "; ".join(issues[:5])
+        print("EXIT STATE VALIDATION FAILED:", summary)
+        add_bot_reason(f"EXIT STATE VALIDATION FAILED: {summary}")
+        try:
+            shutil.copy2(EXIT_STATE_FILE, f"{EXIT_STATE_FILE}.corrupt-{int(time.time())}")
+        except OSError as copy_error:
+            print("EXIT STATE: could not preserve invalid file:", copy_error)
+        require_exit_recovery(f"saved exit state failed validation ({summary})")
+    return True
+
+
+def clear_position_exit_state(symbol, reason):
+    key = exit_state_key(symbol)
+    with BOT_LOCK:
+        had_state = key in BOT_STATE["position_peaks"] or key in BOT_STATE["exit_confirmed_remaining"]
+        BOT_STATE["exit_confirmed_remaining"].pop(key, None)
+        for name in ("position_peaks", "position_peak_basis", "position_exit_entry_prices",
+                     "position_profit_floor_active", "position_effective_stops", "position_max_profit",
+                     "position_max_drawdown", "exit_quote_errors", "exit_retry_after", "exit_state_absent_counts"):
+            BOT_STATE[name].pop(key, None)
+    if had_state:
+        print("EXIT STATE CLEARED:", key, reason)
+        persist_exit_state()
+
+
+def reconcile_exit_state_entry(symbol, entry_price, config=None):
+    """A changed cost basis means different fills, so the saved peak describes another position."""
+    key = exit_state_key(symbol, config)
+    with BOT_LOCK:
+        stored = BOT_STATE["position_exit_entry_prices"].get(key)
+        peak = BOT_STATE["position_peaks"].get(key)
+    if stored is None or abs(stored - entry_price) <= EXIT_ENTRY_MATCH_TOLERANCE:
+        return
+    message = (f"EXIT STATE RESET {symbol}: broker entry {entry_price:.4f} differs from tracked entry "
+               f"{stored:.4f}; discarded peak {exit_quote_number(peak)} from the previous position")
+    print(message)
+    add_bot_reason(message)
+    clear_position_exit_state(symbol, "entry price changed")
+
+
+def reconcile_exit_state_with_broker(positions):
+    """Drop state for positions the broker repeatedly confirms are gone from this account."""
+    scope = exit_broker_scope()
+    if scope is None:
+        return
+    prefix = exit_order_key(scope, "")
+    with BOT_LOCK:
+        confirmed = str(BOT_STATE.get("last_position_status", "")).startswith("OK")
+        tracked = [key for key in BOT_STATE["position_peaks"] if key.startswith(prefix)]
+        pending = {record.get("symbol") for record in BOT_STATE["pending_exit_orders"].values() if record.get("scope") == scope}
+    if not confirmed:
+        return
+    held = {position.get("symbol") for position in positions or []}
+    to_clear = []
+    with BOT_LOCK:
+        counts = BOT_STATE["exit_state_absent_counts"]
+        for key in tracked:
+            symbol = key[len(prefix):]
+            if symbol in held or symbol in pending:
+                counts.pop(key, None)
+                continue
+            counts[key] = counts.get(key, 0) + 1
+            if counts[key] >= EXIT_STATE_ABSENT_CONFIRMATIONS:
+                to_clear.append(symbol)
+    for symbol in to_clear:
+        clear_position_exit_state(symbol, "broker confirms position closed")
+
+
+def closed_exit_records():
+    scope = exit_broker_scope()
+    with BOT_LOCK:
+        records = [dict(record) for record in BOT_STATE["exit_closed_awaiting"].values()]
+    return [record for record in records if scope is None or record.get("scope") == scope]
+
+
+def get_closed_exit(symbol):
+    return next((record for record in closed_exit_records() if record.get("symbol") == symbol), None)
+
+
+def update_closed_exit(record, persist=True, **changes):
+    with BOT_LOCK:
+        stored = BOT_STATE["exit_closed_awaiting"].get(record["key"])
+        if not stored or all(stored.get(key) == value for key, value in changes.items()):
+            return
+        stored.update(changes)
+    if persist:
+        persist_exit_state()
+
+
+def release_closed_exit(symbol, reason):
+    record = get_closed_exit(symbol)
+    if not record:
+        return
+    with BOT_LOCK:
+        BOT_STATE["exit_closed_awaiting"].pop(record["key"], None)
+    persist_exit_state()
+    add_bot_reason(f"CLOSED EXIT RELEASED {symbol}: {reason}")
+
+
+def position_is_new_after_close(record, position):
+    """Evidence that this position opened after the confirmed exit; empty if it may be stale data."""
+    acquired = broker_timestamp(position.get("date_acquired"))
+    if acquired and acquired.timestamp() > record["closed_epoch"]:
+        return f"position acquired {acquired.isoformat()}, after the exit fill"
+    before = record.get("position_before") or {}
+    quantity = float(position.get("quantity", 0) or 0)
+    if before.get("cost_per_contract") is not None and quantity:
+        cost = option_entry_price(float(position.get("cost_basis", 0) or 0), quantity)
+        if abs(cost - before["cost_per_contract"]) > EXIT_ENTRY_MATCH_TOLERANCE:
+            return f"cost per contract changed from {before['cost_per_contract']:.4f} to {cost:.4f}"
+
+    now_epoch = time.time()
+    if now_epoch - record.get("last_order_check_epoch", 0) < EXIT_RECONCILE_INTERVAL_SECONDS:
+        return ""
+    update_closed_exit(record, persist=False, last_order_check_epoch=now_epoch)
+    orders, error = fetch_broker_orders_for_reconciliation()
+    if error:
+        return ""
+    for order in orders:
+        created = broker_timestamp(order.get("create_date"))
+        executed = str(order.get("status") or "").lower() == "filled" or bool(broker_order_quantity(order.get("exec_quantity")))
+        if (order.get("option_symbol") == record["symbol"] and order.get("side") == "buy_to_open" and executed
+                and created and created.timestamp() > record["closed_epoch"]):
+            return f"broker shows buy order {order.get('id')} after the exit fill"
+    return ""
+
+
+def advance_closed_exit(record, positions):
+    """Hold a fully sold contract until broker positions catch up. Returns NONE when released."""
+    symbol = record["symbol"]
+    with BOT_LOCK:
+        status = str(BOT_STATE.get("last_position_status", ""))
+    held = [position for position in positions or []
+            if position.get("symbol") == symbol and float(position.get("quantity", 0) or 0) > 0]
+    awaiting = (f"EXIT CLOSED {symbol}: order {record.get('order_id') or 'UNKNOWN'} confirmed filled; "
+                f"no further sell until broker positions confirm it.")
+    if not held:
+        if status.startswith("OK_NO") or (positions is not None and status.startswith("OK")):
+            checks = record.get("flat_checks", 0) + 1
+            if checks >= EXIT_CLOSED_FLAT_CONFIRMATIONS:
+                release_closed_exit(symbol, "broker confirms the position is flat")
+                return "NONE"
+            update_closed_exit(record, flat_checks=checks, status_message=f"{awaiting} Flat check {checks} of {EXIT_CLOSED_FLAT_CONFIRMATIONS}.")
+        else:
+            update_closed_exit(record, flat_checks=0, status_message=f"{awaiting} Broker positions could not be confirmed.")
+        return "CLOSED_AWAITING"
+
+    update_closed_exit(record, flat_checks=0, status_message=f"{awaiting} Broker still reports the old position.")
+    new_position = position_is_new_after_close(record, held[0])
+    if new_position:
+        release_closed_exit(symbol, f"genuinely new position: {new_position}")
+        return "NONE"
+    return "CLOSED_AWAITING"
+
+
+def resolve_unscoped_exit_state(migration_id, action, confirmation):
+    """Explicit operator choice for stop state saved before account scoping."""
+    def finish(ok, message):
+        add_bot_reason(f"EXIT STATE MIGRATION: {message}")
+        with BOT_LOCK:
+            BOT_STATE["exit_intent_clear_result"] = message
+        return ok, message
+
+    config = load_config()
+    scope = exit_broker_scope(config)
+    if scope is None:
+        return finish(False, "NOT MIGRATED: the selected broker account could not be verified.")
+    with BOT_LOCK:
+        record = next((dict(item) for item in BOT_STATE["unscoped_exit_positions"].values() if migration_id and item.get("migration_id") == migration_id), None)
+    if record is None:
+        return finish(False, "NOT MIGRATED: that saved stop state no longer exists.")
+    symbol = record["symbol"]
+    if str(confirmation or "").strip() != symbol:
+        return finish(False, f"NOT MIGRATED: type the exact contract symbol {symbol} to confirm.")
+    if action not in ("apply", "discard"):
+        return finish(False, "NOT MIGRATED: choose apply or discard.")
+    key = exit_order_key(scope, symbol)
+    with BOT_LOCK:
+        if action == "apply" and key in BOT_STATE["position_peaks"]:
+            exists = True
+        else:
+            exists = False
+            BOT_STATE["unscoped_exit_positions"].pop(symbol, None)
+    if exists:
+        return finish(False, f"NOT MIGRATED {symbol}: this account already has its own stop state.")
+    if action == "apply":
+        restore_position_record(key, dict(record, peak_basis=LEGACY_PEAK_BASIS), [])
+    if not persist_exit_state():
+        with BOT_LOCK:
+            BOT_STATE["unscoped_exit_positions"][symbol] = record
+        return finish(False, f"NOT MIGRATED {symbol}: the change could not be saved.")
+    return finish(True, f"{symbol}: saved stop state {'applied to the selected account' if action == 'apply' else 'discarded'}.")
+
+
+def exit_broker_scope(config=None):
+    """Identify the actual broker environment and account, without storing the account number."""
+    try:
+        connection = resolve_connection(config if config is not None else load_config())
+    except BrokerConnectionError:
+        return None
+    return f"{connection.environment}:{hashlib.sha256(connection.account.encode()).hexdigest()[:16]}"
+
+
+def exit_order_key(scope, symbol):
+    return f"{scope}|{symbol}"
+
+
+def pending_exit_records():
+    """Intents for the selected account. If the account cannot be verified, all of them count."""
+    scope = exit_broker_scope()
+    with BOT_LOCK:
+        records = [dict(record) for record in BOT_STATE["pending_exit_orders"].values()]
+    return [record for record in records if scope is None or record.get("scope") in (scope, EXIT_UNSCOPED)]
+
+
+def has_pending_exit_orders():
+    return bool(pending_exit_records())
+
+
+def has_unsettled_exits():
+    return bool(pending_exit_records() or closed_exit_records())
+
+
+@broker_session
+def process_all_pending_exits(positions):
+    for record in pending_exit_records() + closed_exit_records():
+        process_pending_exit(record["symbol"], positions)
+
+
+def get_pending_exit(symbol):
+    """The unresolved exit intent for this symbol on the selected broker account, if any."""
+    return next((record for record in pending_exit_records() if record.get("symbol") == symbol), None)
+
+
+def remove_pending_exit(record):
+    with BOT_LOCK:
+        BOT_STATE["pending_exit_orders"].pop(record["key"], None)
+    return persist_exit_state()
+
+
+def update_pending_exit(record, **changes):
+    with BOT_LOCK:
+        stored = BOT_STATE["pending_exit_orders"].get(record["key"])
+        if not stored or all(stored.get(key) == value for key, value in changes.items()):
+            return
+        stored.update(changes)
+    persist_exit_state()
+
+
+def exit_retry_wait_seconds(symbol):
+    key = exit_state_key(symbol)
+    with BOT_LOCK:
+        retry_after = BOT_STATE["exit_retry_after"].get(key, 0)
+    return max(0.0, retry_after - time.time())
+
+
+def block_exit_retry(symbol, config):
+    delay = safe_float((config or {}).get("exit_order_retry_seconds"), DEFAULT_EXIT_ORDER_RETRY_SECONDS)
+    if not isinstance(delay, (int, float)) or not math.isfinite(delay) or delay <= 0:
+        delay = DEFAULT_EXIT_ORDER_RETRY_SECONDS
+    key = exit_state_key(symbol, config)
+    with BOT_LOCK:
+        BOT_STATE["exit_retry_after"][key] = time.time() + delay
+
+
+def audit_exit_event(action, record, config, **extra):
+    """Bot audit row for an exit event; manual sells keep their existing no-audit behavior."""
+    if record.get("source") != "BOT":
+        return
+    fields = dict(record.get("audit_fields") or {})
+    fields.update(extra)
+    fields["option_symbol"] = record["symbol"]
+    fields.setdefault("reason_log", record.get("reasons") or [])
+    fields.setdefault("exit_reason", record.get("reason", ""))
+    fields.setdefault("order_id", record.get("order_id", ""))
+    log_bot_audit(action, "SELL", config.get("symbol", ""), record.get("market_context") or {}, config, **fields)
+
+
+def mark_exit_unresolved(record, code, detail, absent_checks=0):
+    """Broker evidence is missing or ambiguous: keep protection and tell the operator what to check."""
+    paused = "AUTOMATED RESUBMISSION PAUSED after operator confirmation. " if record.get("operator_hold") else ""
+    message = (
+        f"{paused}EXIT UNRESOLVED [{code}] {record['symbol']} qty {record['qty']:g}, tag {record.get('tag') or 'NONE'}: {detail} "
+        f"Duplicate exits stay blocked and reconciliation continues. ACTION: in Tradier, check this account's "
+        f"orders for a sell_to_close on {record['symbol']} and confirm whether it is working, filled or canceled."
+    )
+    if record.get("unresolved_code") != code:
+        print(message)
+        add_bot_reason(message)
+    update_pending_exit(record, unresolved_code=code, status_message=message, absent_checks=absent_checks)
+    set_last_error(message)
+    return "PENDING"
+
+
+@broker_session
+def submit_tracked_exit(symbol, qty, cost_basis, entry_price, label, source, quote, trigger_diagnostics,
+                        market_context, reason, reasons, config, audit_fields=None, reference_price=None, position_snapshot=None):
+    """Save an exit intent, then send one tagged sell_to_close. Acceptance is not an exit."""
+    scope = exit_broker_scope(config)
+    if scope is None:
+        message = f"{label} NOT SENT {symbol}: broker account/environment could not be verified; position remains open"
+        print(message)
+        add_bot_reason(message)
+        set_last_error(message)
+        return "SCOPE_UNAVAILABLE"
+    recovery_block = exit_recovery_block_reason(config)
+    if recovery_block:
+        print(f"{label} NOT SENT {symbol}: {recovery_block}")
+        set_last_error(recovery_block)
+        return "RECOVERY_REQUIRED"
+    if get_pending_exit(symbol):
+        print(f"{label} NOT SENT: exit intent already unresolved for", symbol)
+        return "PENDING"
+    closed = get_closed_exit(symbol)
+    if closed and advance_closed_exit(closed, [position_snapshot] if position_snapshot else None) != "NONE":
+        print(f"{label} NOT SENT {symbol}: full exit already confirmed; awaiting position confirmation")
+        return "AWAITING_POSITION_CONFIRMATION"
+
+    key = exit_order_key(scope, symbol)
+    with BOT_LOCK:
+        confirmed_remaining = BOT_STATE["exit_confirmed_remaining"].get(key)
+    send_qty = min(qty, confirmed_remaining) if confirmed_remaining else qty
+    send_qty = int(send_qty) if float(send_qty).is_integer() else send_qty
+    intent_id = uuid.uuid4().hex
+    now_epoch = time.time()
+    record = {
+        "key": key,
+        "scope": scope,
+        "intent_id": intent_id,
+        # Tradier documents tag as free text; letters, digits and hyphens are the safe subset.
+        "tag": f"{EXIT_INTENT_TAG_PREFIX}{intent_id}",
+        "phase": "INTENT_SAVED",
+        "order_id": "",
+        "order_status": "",
+        "symbol": symbol,
+        "qty": send_qty,
+        "position_qty_at_intent": qty,
+        "position_before": {
+            "quantity": (position_snapshot or {}).get("quantity"),
+            "cost_per_contract": cost_basis / (qty * 100) if qty else None,
+            "date_acquired": (position_snapshot or {}).get("date_acquired"),
+        },
+        "filled_qty": 0,
+        "remaining_qty": send_qty,
+        "fill_logged": False,
+        "absent_checks": 0,
+        "last_reconcile_epoch": 0,
+        "unresolved_code": "",
+        "entry_price": entry_price,
+        "cost_basis_per_contract": cost_basis / qty if qty else 0,
+        "label": label,
+        "source": source,
+        "reason": reason,
+        "reasons": list(reasons or []),
+        "reference_price": reference_price,
+        "trigger_diagnostics": json_safe(trigger_diagnostics or {}),
+        "pre_exit_quote": json_safe(quote or {}),
+        "pre_exit_quote_age_seconds": quote_execution_snapshot(quote)["quote_age_seconds"],
+        "market_context": json_safe(market_context or {}),
+        "audit_fields": json_safe(audit_fields or {}),
+        "submitted_epoch": now_epoch,
+        "submitted_at": market_now().isoformat(),
+        "intent_market_date": market_now().date().isoformat(),
+        "status_message": "EXIT INTENT saved; sending order",
+    }
+
+    with BOT_LOCK:
+        BOT_STATE["pending_exit_orders"][key] = record
+    if not persist_exit_state():
+        with BOT_LOCK:
+            BOT_STATE["pending_exit_orders"].pop(key, None)
+        block_exit_retry(symbol, config)
+        message = f"{label} NOT SENT {symbol}: exit intent could not be saved durably; ZERO orders sent; position remains open and stops stay armed"
+        print(message)
+        add_bot_reason(message)
+        set_last_error(message)
+        audit_exit_event("SKIP", record, config, skip_reason="exit intent could not be saved; order not sent", order_status="NOT_SENT")
+        return "PERSIST_FAILED"
+
+    try:
+        ok, order_status, status, text = submit_and_parse_option_order(symbol, send_qty, "sell_to_close", label, tag=record["tag"])
+        order_id = extract_order_id(text)
+    except Exception as exc:
+        ok, order_status, status, text, order_id = None, "SUBMIT_UNKNOWN", None, str(exc), ""
+
+    # A timeout, 5xx or unreadable 200 may still have reached the broker, so only reconciliation can settle it.
+    ambiguous = ok is None or (not ok and (status is None or status >= 500 or (status == 200 and order_status != "rejected")))
+    if not ok and not ambiguous:
+        remove_pending_exit(record)
+        block_exit_retry(symbol, config)
+        add_bot_reason(f"{label} REJECTED {symbol} ({order_status}): position remains open; stops stay armed; retry after backoff")
+        audit_exit_event("SKIP", record, config, skip_reason=f"{label.lower()} rejected or not accepted", order_status=order_status, order_id=order_id)
+        return "REJECTED"
+
+    changes = {"order_id": str(order_id or ""), "order_status": order_status or "SUBMIT_UNKNOWN"}
+    if order_id:
+        changes.update(phase="ACCEPTED", status_message=f"EXIT ORDER {order_id} {order_status}: awaiting confirmed fill")
+    else:
+        changes.update(phase="SEND_UNCONFIRMED",
+                       status_message=f"EXIT SEND UNCONFIRMED ({order_status or status}): duplicate exits blocked; reconciling tag {record['tag']} with broker orders")
+    update_pending_exit(record, **changes)
+    record.update(changes)
+    add_bot_reason(f"{label} {record['status_message']} ({symbol}): {reason}")
+    audit_exit_event("EXIT_PENDING", record, config, skip_reason="exit order submitted; not a completed exit", order_status=record["order_status"])
+    if not order_id:
+        return "PENDING"
+    return process_pending_exit(symbol, initial_response=text, retries=4)
+
+
+@broker_session
+def process_pending_exit(symbol, positions=None, initial_response="", retries=1):
+    """Advance an intent from broker evidence only. Returns NONE, PENDING, FILLED or FAILED."""
+    record = get_pending_exit(symbol)
+    if record is None:
+        closed = get_closed_exit(symbol)
+        return "NONE" if closed is None else advance_closed_exit(closed, positions)
+    config = load_config()
+    if exit_broker_scope(config) is None:
+        return mark_exit_unresolved(record, "ACCOUNT_UNVERIFIED", "The account this exit belongs to cannot be verified.")
+    if record.get("scope") == EXIT_UNSCOPED:
+        if record.get("operator_hold"):
+            return advance_operator_hold(record, config)
+        return mark_exit_unresolved(record, "ACCOUNT_UNVERIFIED", "The account this exit belongs to cannot be verified.")
+    if not record.get("order_id"):
+        return reconcile_unidentified_exit(record, positions, config)
+    execution = fetch_broker_order_execution(record["order_id"], initial_response, retries=retries)
+    if record.get("operator_hold") and not execution.get("order_status"):
+        return advance_operator_hold(record, config)
+    return advance_identified_exit(record, execution, config)
+
+
+def advance_identified_exit(record, execution, config):
+    symbol = record["symbol"]
+    requested = record["qty"]
+    status = str(execution.get("order_status") or "").lower()
+    filled = execution.get("filled_quantity")
+
+    if execution.get("option_symbol") not in (None, "", symbol) or execution.get("side") not in (None, "", "sell_to_close"):
+        return mark_exit_unresolved(record, "ORDER_MISMATCH", f"Order {record['order_id']} is not a sell_to_close for this contract.")
+
+    if status == "filled":
+        if execution.get("fill_price") is None and time.time() - record["submitted_epoch"] < EXIT_FILL_PRICE_WAIT_SECONDS:
+            update_pending_exit(record, order_status=status, status_message=f"EXIT ORDER {record['order_id']} filled; waiting for fill price from broker")
+            return "PENDING"
+        return complete_exit_order(record, execution, filled if filled and filled > 0 else requested, config)
+
+    if status in EXIT_ORDER_FAILED_STATUSES:
+        if filled is None and status != "rejected":
+            return mark_exit_unresolved(record, "FILL_QUANTITY_MISSING", f"Order {record['order_id']} is {status} but the broker gave no executed quantity.")
+        return complete_exit_order(record, execution, filled or 0, config)
+
+    # Working, partially filled, unknown status or failed lookup: nothing here proves the order is finished.
+    filled_so_far = filled if filled is not None else record.get("filled_qty", 0)
+    remaining = execution.get("remaining_quantity")
+    remaining = remaining if remaining is not None else requested - filled_so_far
+    state = status or "status unavailable from broker"
+    update_pending_exit(
+        record,
+        order_status=status or record.get("order_status"),
+        filled_qty=filled_so_far,
+        remaining_qty=remaining,
+        unresolved_code="",
+        status_message=f"EXIT ORDER {record['order_id']} {state}: filled {filled_so_far:g}/{requested:g}, {remaining:g} still open; awaiting confirmed fill",
+    )
+    print(f"{record['label']} PENDING {symbol}: order {record['order_id']} {state}; filled {filled_so_far:g}/{requested:g}; no duplicate sent")
+    return "PENDING"
+
+
+def complete_exit_order(record, execution, filled, config):
+    """The order is confirmed terminal. Log its fill exactly once, then release protection."""
+    symbol = record["symbol"]
+    requested = record["qty"]
+    status = str(execution.get("order_status") or "").lower()
+    if filled > 0 and not record.get("fill_logged"):
+        try:
+            already_logged = exit_fill_already_logged(record["intent_id"])
+        except OSError as exc:
+            return mark_exit_unresolved(record, "TRADE_LOG_UNREADABLE", f"Could not check for an existing fill record ({exc}).")
+        if not already_logged:
+            finalize_exit_fill(record, execution, filled, config)
+        update_pending_exit(record, fill_logged=True)
+
+    remaining = max(0, requested - filled)
+    fill_stamp = broker_timestamp(execution.get("fill_timestamp"))
+    now_epoch = time.time()
+    with BOT_LOCK:
+        if filled > 0 and remaining > 0:
+            BOT_STATE["exit_confirmed_remaining"][record["key"]] = remaining
+        elif remaining <= 0:
+            BOT_STATE["exit_confirmed_remaining"].pop(record["key"], None)
+            BOT_STATE["exit_closed_awaiting"][record["key"]] = {
+                "key": record["key"], "scope": record["scope"], "symbol": symbol,
+                "intent_id": record.get("intent_id", ""), "order_id": record.get("order_id", ""),
+                "sold_qty": filled, "closed_epoch": min(fill_stamp.timestamp(), now_epoch) if fill_stamp else now_epoch,
+                "position_before": record.get("position_before") or {}, "flat_checks": 0,
+                "status_message": f"EXIT CLOSED {symbol}: confirmed filled; no further sell until broker positions confirm it.",
+            }
+        BOT_STATE["pending_exit_orders"].pop(record["key"], None)
+    persist_exit_state()
+
+    if remaining <= 0:
+        clear_position_exit_state(symbol, "exit fill confirmed")
+        return "FILLED"
+    block_exit_retry(symbol, config)
+    add_bot_reason(f"{record['label']} ORDER {record['order_id']} {status} for {symbol}: filled {filled:g}/{requested:g}; "
+                   f"{remaining:g} contract(s) confirmed remaining; stops stay armed")
+    audit_exit_event("SKIP", record, config, skip_reason=f"exit order {status}; {remaining:g} contract(s) remain open", order_status=status)
+    return "FAILED"
+
+
+def fetch_broker_orders_for_reconciliation():
+    """Every order Tradier reports for today's session. Returns (orders, error)."""
+    orders = []
+    for page in range(1, EXIT_ORDER_LOOKUP_MAX_PAGES + 1):
+        try:
+            response = broker_request(
+                "GET", "/accounts/{account}/orders", headers=headers(), timeout=5,
+                params={"includeTags": "true", "limit": EXIT_ORDER_LOOKUP_LIMIT, "page": page},
+            )
+            if response.status_code != 200:
+                return None, f"HTTP {response.status_code}"
+            container = response.json()["orders"]
+        except Exception as exc:
+            return None, type(exc).__name__
+        if container in (None, "", "null"):
+            return orders, None
+        if not isinstance(container, dict) or "order" not in container:
+            return None, "unexpected response shape"
+        batch = container["order"]
+        batch = batch if isinstance(batch, list) else [batch]  # one order arrives as a bare object
+        if not all(isinstance(order, dict) for order in batch):
+            return None, "unexpected response shape"
+        orders.extend(batch)
+        if len(batch) < EXIT_ORDER_LOOKUP_LIMIT:
+            return orders, None
+    return None, "order list too long to read completely"
+
+
+def order_could_be_this_exit(order, record):
+    """Could an order not carrying this intent's tag still be the sell we sent?"""
+    symbol = record["symbol"]
+    option_symbol = order.get("option_symbol")
+    underlying = str(order.get("symbol") or "")
+    if option_symbol:
+        same_contract = option_symbol == symbol
+    else:
+        same_contract = underlying == symbol or (bool(underlying) and symbol.startswith(underlying))
+    if not same_contract or order.get("side") not in (None, "", "sell_to_close"):
+        return False
+    status = str(order.get("status") or "").lower()
+    executed = broker_order_quantity(order.get("exec_quantity"))
+    if status in EXIT_ORDER_FAILED_STATUSES and executed == 0:
+        return False  # never executed and can no longer execute
+    tag = str(order.get("tag") or "")
+    if tag.startswith(EXIT_INTENT_TAG_PREFIX) and (status == "filled" or status in EXIT_ORDER_FAILED_STATUSES):
+        return False  # one of our earlier intents, finished and already accounted for
+    created = broker_timestamp(order.get("create_date"))
+    return created is None or created.timestamp() >= record["submitted_epoch"] - EXIT_ORDER_CLOCK_SKEW_SECONDS
+
+
+def broker_position_quantity(symbol, positions):
+    with BOT_LOCK:
+        confirmed = str(BOT_STATE.get("last_position_status", "")).startswith("OK")
+    if not confirmed:
+        return None
+    return sum(float(position.get("quantity", 0) or 0) for position in positions or [] if position.get("symbol") == symbol)
+
+
+def reconcile_unidentified_exit(record, positions, config):
+    """No order id is known. Time and position changes never settle this; broker orders do."""
+    symbol = record["symbol"]
+    now_epoch = time.time()
+    if now_epoch - record.get("last_reconcile_epoch", 0) < EXIT_RECONCILE_INTERVAL_SECONDS:
+        return "PENDING"
+    update_pending_exit(record, last_reconcile_epoch=now_epoch)
+
+    orders, error = fetch_broker_orders_for_reconciliation()
+    if error:
+        return mark_exit_unresolved(record, "ORDER_LOOKUP_FAILED", f"Tradier order lookup failed ({error}).")
+
+    tagged = [order for order in orders if str(order.get("tag") or "") == record["tag"]]
+    if len(tagged) > 1:
+        return mark_exit_unresolved(record, "MULTIPLE_TAGGED_ORDERS", f"{len(tagged)} orders carry this tag; tags are not unique at the broker.")
+    if tagged:
+        order = tagged[0]
+        if not order.get("id"):
+            return mark_exit_unresolved(record, "TAGGED_ORDER_WITHOUT_ID", "A tagged order was found but it has no order id.")
+        order_id = str(order["id"])
+        update_pending_exit(record, order_id=order_id, phase="ACCEPTED", unresolved_code="", absent_checks=0)
+        record = dict(record, order_id=order_id, phase="ACCEPTED")
+        add_bot_reason(f"{record['label']} reconciled {symbol}: tag {record['tag']} is broker order {order_id}")
+        return advance_identified_exit(record, parse_broker_order_execution({"order": order}), config)
+
+    if record.get("operator_hold"):
+        return evaluate_operator_hold(record, orders, config)
+
+    possible = [order for order in orders if order_could_be_this_exit(order, record)]
+    if possible:
+        ids = ", ".join(str(order.get("id") or "no id") for order in possible[:5])
+        return mark_exit_unresolved(record, "POSSIBLE_MATCHING_ORDERS", f"{len(possible)} order(s) on this contract lack this intent's tag (ids: {ids}).")
+
+    if market_now().date().isoformat() != record.get("intent_market_date"):
+        return mark_exit_unresolved(record, "OUTSIDE_ORDER_LIST_WINDOW", "Tradier's order list covers only today's session, so it cannot show this earlier intent.")
+
+    held = broker_position_quantity(symbol, positions)
+    if held is None:
+        return mark_exit_unresolved(record, "POSITION_UNKNOWN", "The broker position could not be confirmed.")
+    if held < record["position_qty_at_intent"]:
+        return mark_exit_unresolved(record, "POSITION_CHANGED_NO_ORDER", f"Position fell from {record['position_qty_at_intent']:g} to {held:g} but no matching order was found.")
+
+    age = now_epoch - record["submitted_epoch"]
+    checks = record.get("absent_checks", 0) + 1 if age >= EXIT_ABSENCE_SETTLE_SECONDS else 0
+    if checks < EXIT_ABSENCE_CONFIRMATIONS:
+        return mark_exit_unresolved(record, "NO_ORDER_FOUND_YET", f"No matching order in {checks} of {EXIT_ABSENCE_CONFIRMATIONS} required complete broker lookups.", absent_checks=checks)
+
+    add_bot_reason(f"{record['label']} intent {record['tag']} for {symbol}: {checks} complete broker order lists show no such order and the position is unchanged; treated as never received")
+    audit_exit_event("SKIP", record, config, skip_reason="exit intent confirmed absent from broker orders", order_status="NOT_FOUND")
+    remove_pending_exit(record)
+    block_exit_retry(symbol, config)
+    return "FAILED"
+
+
+def order_is_finished(status):
+    status = str(status or "").lower()
+    return status == "filled" or status in EXIT_ORDER_FAILED_STATUSES
+
+
+def live_related_orders(orders, record):
+    """Orders that may still be working for this intent, or could be mistaken for it."""
+    tag = record.get("tag")
+    order_id = str(record.get("order_id") or "")
+    related = [order for order in orders
+               if (tag and str(order.get("tag") or "") == tag)
+               or (order_id and str(order.get("id") or "") == order_id)
+               or order_could_be_this_exit(order, record)]
+    return [order for order in related if not order_is_finished(order.get("status"))]
+
+
+def manual_clear_evidence(record):
+    """Returns (VERIFIED|UNVERIFIED|BLOCKED, detail) from current broker data."""
+    code = record.get("unresolved_code")
+    self_resolving = "The broker shows this order finished; the bot will complete it automatically on the next poll."
+    order_id = record.get("order_id")
+    if order_id and record.get("scope") != EXIT_UNSCOPED:
+        status = str(fetch_broker_order_execution(order_id, retries=1).get("order_status") or "").lower()
+        if status and code == "ORDER_MISMATCH":
+            return "VERIFIED", "broker order does not match this exit"
+        if status and order_is_finished(status):
+            return ("VERIFIED", f"broker order is {status}") if code else ("BLOCKED", self_resolving)
+        if status:
+            return "BLOCKED", f"Broker reports order {order_id} is {status}. Cancel it in Tradier first; the bot will then finish this automatically."
+
+    orders, error = fetch_broker_orders_for_reconciliation()
+    if error:
+        return "UNVERIFIED", f"order lookup failed ({error})"
+    live = live_related_orders(orders, record)
+    if live:
+        ids = ", ".join(str(order.get("id") or "no id") for order in live[:5])
+        return "BLOCKED", f"Broker shows a working sell on this contract (order {ids}). Cancel it in Tradier first or wait for it to finish."
+    tagged = [order for order in orders if record.get("tag") and str(order.get("tag") or "") == record.get("tag")]
+    if not order_id and len(tagged) == 1 and code != "ORDER_MISMATCH":
+        return "BLOCKED", self_resolving
+    return "VERIFIED", "complete broker order list shows no working order"
+
+
+def release_exit_hold(record, config, detail):
+    message = f"{record['label']} operator hold released for {record['symbol']}: {detail}. Automated exits may resume after the retry delay."
+    print(message)
+    add_bot_reason(message)
+    audit_exit_event("SKIP", record, config, skip_reason="operator hold released by broker evidence", order_status="NOT_WORKING")
+    remove_pending_exit(record)
+    block_exit_retry(record["symbol"], config)
+    return "FAILED"
+
+
+def evaluate_operator_hold(record, orders, config):
+    """Only complete broker data showing nothing working may end an operator hold."""
+    live = live_related_orders(orders, record)
+    if live:
+        ids = ", ".join(str(order.get("id") or "no id") for order in live[:5])
+        return mark_exit_unresolved(record, "HOLD_WORKING_ORDER", f"Broker shows working order(s): {ids}.")
+    checks = record.get("absent_checks", 0) + 1
+    if checks < EXIT_ABSENCE_CONFIRMATIONS:
+        return mark_exit_unresolved(record, "HOLD_AWAITING_EVIDENCE", f"{checks} of {EXIT_ABSENCE_CONFIRMATIONS} required complete broker checks show no working order.", absent_checks=checks)
+    return release_exit_hold(record, config, f"{checks} complete broker order lists show no working order")
+
+
+def advance_operator_hold(record, config):
+    now_epoch = time.time()
+    if now_epoch - record.get("last_reconcile_epoch", 0) < EXIT_RECONCILE_INTERVAL_SECONDS:
+        return "PENDING"
+    update_pending_exit(record, last_reconcile_epoch=now_epoch)
+    orders, error = fetch_broker_orders_for_reconciliation()
+    if error:
+        return mark_exit_unresolved(record, "ORDER_LOOKUP_FAILED", f"Tradier order lookup failed ({error}).")
+    return evaluate_operator_hold(record, orders, config)
+
+
+@broker_session
+def clear_stuck_exit_intent(intent_id, confirmation):
+    """Operator attestation about a stuck intent. Sends and cancels nothing.
+
+    Protection is removed only if the broker can show nothing is working; otherwise the
+    attestation is recorded and automated resubmission stays paused.
+    """
+    def finish(ok, message):
+        print("EXIT INTENT MANUAL CLEAR:", message)
+        add_bot_reason(f"EXIT INTENT MANUAL CLEAR: {message}")
+        with BOT_LOCK:
+            BOT_STATE["exit_intent_clear_result"] = message
+        return ok, message
+
+    config = load_config()
+    if exit_broker_scope(config) is None:
+        return finish(False, "NOT CLEARED: the selected broker account could not be verified.")
+    record = next((item for item in pending_exit_records() if intent_id and item.get("intent_id") == intent_id), None)
+    if record is None:
+        return finish(False, "NOT CLEARED: that exit intent is no longer open on the selected account.")
+    symbol = record["symbol"]
+    if str(confirmation or "").strip() != symbol:
+        return finish(False, f"NOT CLEARED: type the exact contract symbol {symbol} to confirm.")
+    if time.time() - record.get("submitted_epoch", 0) < EXIT_ABSENCE_SETTLE_SECONDS:
+        return finish(False, f"NOT CLEARED {symbol}: this intent is under {EXIT_ABSENCE_SETTLE_SECONDS}s old and its order may not be visible at the broker yet.")
+    verdict, detail = manual_clear_evidence(record)
+    if verdict == "BLOCKED":
+        return finish(False, f"NOT CLEARED {symbol}: {detail}")
+
+    if verdict == "UNVERIFIED":
+        changes = {"operator_hold": True, "operator_hold_at": market_now().isoformat(), "absent_checks": 0}
+        update_pending_exit(record, **changes)
+        mark_exit_unresolved(dict(record, **changes), "OPERATOR_HOLD", f"Your confirmation is recorded, but the broker could not verify this order ({detail}).")
+        audit_exit_event("SKIP", record, config, skip_reason="operator confirmed exit intent; broker unverifiable, automated resubmission paused", order_status=record.get("order_status", ""))
+        return finish(False, f"HOLD {symbol}: your confirmation is recorded, but the broker cannot verify the order ({detail}). AUTOMATED RESUBMISSION REMAINS PAUSED until reconciliation confirms nothing is working.")
+
+    with BOT_LOCK:
+        BOT_STATE["pending_exit_orders"].pop(record["key"], None)
+    if not persist_exit_state():
+        with BOT_LOCK:
+            BOT_STATE["pending_exit_orders"][record["key"]] = record
+        return finish(False, f"NOT CLEARED {symbol}: the change could not be saved, so the intent would return after a restart.")
+
+    block_exit_retry(symbol, config)
+    try:
+        log_bot_audit(
+            "MANUAL_EXIT_CLEAR", "SELL", config.get("symbol", ""), record.get("market_context") or {}, config,
+            option_symbol=symbol, order_id=record.get("order_id", ""), order_status=record.get("order_status", ""),
+            skip_reason=f"operator cleared unresolved exit intent {record.get('tag') or 'NONE'} ({record.get('unresolved_code') or 'no code'}); broker: {detail}",
+            exit_reason=record.get("reason", ""),
+        )
+    except OSError as exc:
+        print("EXIT INTENT MANUAL CLEAR: audit row not written:", exc)
+    return finish(True, (
+        f"CLEARED {symbol} (tag {record.get('tag') or 'NONE'}): duplicate protection removed on your confirmation and broker evidence ({detail}). "
+        f"No order was sent or canceled. The bot may exit any remaining position after the retry delay if a stop is hit. "
+        f"Any fills from this intent are NOT in the bot's trade log; record them from Tradier."
+    ))
+
+
+def render_pending_exit_panel():
+    records = pending_exit_records()
+    closed = closed_exit_records()
+    with BOT_LOCK:
+        result = BOT_STATE.get("exit_intent_clear_result") or ""
+        unscoped = [dict(item) for item in BOT_STATE["unscoped_exit_positions"].values()]
+    recovery = exit_recovery_block_reason()
+    if not records and not result and not closed and not unscoped and not recovery:
+        return ""
+    rows = ""
+    for record in records:
+        symbol = escape_html(record.get("symbol", ""))
+        if record.get("operator_hold"):
+            action = "<div><strong>AUTOMATED RESUBMISSION PAUSED</strong>: your confirmation is recorded; waiting for broker verification.</div>"
+        else:
+            action = f"""<form method="post" action="/resolve-exit-intent">
+<input type="hidden" name="intent_id" value="{escape_html(record.get("intent_id", ""))}">
+<label>I checked Tradier and no order for this exit is working. Type {symbol} to clear:
+<input type="text" name="confirm_symbol" required autocomplete="off"></label>
+<button type="submit">Clear exit intent</button>
+</form>"""
+        rows += f"""
+<div class="item">
+<div class="label">{symbol} qty {escape_html(record.get("qty", ""))}</div>
+<div>{escape_html(record.get("status_message") or "Pending")}</div>
+<div>Order ID: {escape_html(record.get("order_id") or "UNKNOWN")} · Tag: {escape_html(record.get("tag") or "NONE")}</div>
+{action}
+</div>"""
+    for record in closed:
+        rows += f"""
+<div class="item">
+<div class="label">{escape_html(record.get("symbol", ""))}: closed, awaiting position confirmation</div>
+<div>{escape_html(record.get("status_message") or "Awaiting broker position data")}</div>
+</div>"""
+    for record in unscoped:
+        symbol = escape_html(record.get("symbol", ""))
+        rows += f"""
+<div class="item">
+<div class="label">{symbol}: saved stop state has no account</div>
+<div>Peak {fmt_money(record.get("peak_price"))}. It was saved before stops were tracked per account and is not being used.</div>
+<form method="post" action="/resolve-unscoped-exit-state">
+<input type="hidden" name="migration_id" value="{escape_html(record.get("migration_id", ""))}">
+<label>Type {symbol} to confirm: <input type="text" name="confirm_symbol" required autocomplete="off"></label>
+<button type="submit" name="action" value="apply">Apply to selected account</button>
+<button type="submit" name="action" value="discard">Discard</button>
+</form>
+</div>"""
+    recovery_notice = f"<p><strong>{escape_html(recovery)}</strong></p>" if recovery else ""
+    notice = f"<p>{escape_html(result)}</p>" if result else ""
+    return f"""<div class="card">
+<h2>Unresolved Exit Orders</h2>
+<p>Exits for these contracts are blocked to prevent a duplicate sell. Reload this page for the latest status.</p>
+{recovery_notice}{notice}{rows}
+</div>
+
+"""
+
+
+def finalize_exit_fill(record, execution, filled_qty, config):
+    """Log a completed (or partially completed) exit once. Trigger and fill stay separate."""
+    symbol = record["symbol"]
+    label = record["label"]
+    filled_qty = int(filled_qty) if float(filled_qty).is_integer() else filled_qty
+    fill_price = execution.get("fill_price")
+    trigger_diagnostics = record.get("trigger_diagnostics") or {}
+    trigger_price = valid_price(trigger_diagnostics.get("ExitTriggerPrice"))
+    reference = next((price for price in (fill_price, trigger_price, record.get("reference_price")) if price is not None), None)
+    if reference is None:
+        message = (f"{label} COMPLETED AT BROKER {symbol} qty {filled_qty:g} but no fill or quote price is available; "
+                   f"trade row NOT written. Reconcile order {record.get('order_id') or 'UNKNOWN'} manually.")
+        print(message)
+        add_bot_reason(message)
+        set_last_error(message)
+        return
+
+    entry_price = record["entry_price"]
+    filled_cost = record["cost_basis_per_contract"] * filled_qty
+    pnl = option_pnl(reference, filled_cost, filled_qty)
+    pnl_percent = ((reference - entry_price) / entry_price) * 100 if entry_price else 0
+    market_context = dict(record.get("market_context") or {})
+    entry_row = find_last_buy(symbol)
+    complete = filled_qty >= record["qty"]
+    # This row covers only the contracts that filled, so its fill is fully realized.
+    row_execution = dict(execution, order_status="filled") if fill_price is not None else execution
+    if not complete:
+        market_context["decision_reasons"] = list(market_context.get("decision_reasons") or []) + [
+            f"Partial exit: {filled_qty:g} of {record['qty']:g} filled; order ended {execution.get('order_status')}"
+        ]
+    execution_diagnostics = exit_execution_diagnostics(
+        trigger_diagnostics, record.get("pre_exit_quote") or {}, market_context.get("price"), entry_row, row_execution
+    )
+    # The snapshot recomputes age at fill time; report the age when the order was sent.
+    execution_diagnostics["ExitOptionQuoteAgeSeconds"] = record.get("pre_exit_quote_age_seconds", "")
+    execution_diagnostics["ExitFillKey"] = record.get("intent_id", "")
+    log_price = reference if record.get("source") != "BOT" else (trigger_price if trigger_price is not None else reference)
+    trade_row = log_trade(
+        "SELL", symbol, filled_qty, log_price, pnl, source=record.get("source", "HUMAN"),
+        market_context=market_context, execution_diagnostics=execution_diagnostics,
+    )
+    if trade_row.get("PnLSource") == "BROKER_FILLS":
+        pnl = trade_row["PnL"]
+        pnl_percent = trade_row["PnLPercent"]
+    with BOT_LOCK:
+        max_profit = BOT_STATE["position_max_profit"].get(record["key"], pnl)
+        max_drawdown = BOT_STATE["position_max_drawdown"].get(record["key"], pnl)
+    audit_exit_event(
+        "SELL", dict(record, market_context=market_context), config,
+        exit_grade=trade_row.get("ExitGrade", ""), pnl=pnl, pnl_percent=pnl_percent,
+        order_status=execution.get("order_status", ""), max_unrealized_profit=max_profit,
+        max_drawdown=max_drawdown, hold_time=trade_row.get("HoldTime", ""),
+        spy_price_at_exit=market_context.get("price", ""), market_state_at_exit=market_context.get("market_state", ""),
+    )
+    if record.get("source") == "BOT":
+        update_last_trade_review({
+            "entry_reason": entry_row.get("GradeReason", "") if entry_row else "",
+            "exit_reason": record.get("reason", ""),
+            "entry_grade": entry_row.get("EntryGrade", "") if entry_row else "",
+            "exit_grade": trade_row.get("ExitGrade", ""),
+            "final_pl": pnl,
+            "max_profit": max_profit,
+            "max_drawdown": max_drawdown,
+            "hold_time": trade_row.get("HoldTime", ""),
+            "human_or_bot": "BOT"
+        })
+    fill_text = f"broker fill {fill_price:.4f}" if fill_price is not None else "broker fill price UNAVAILABLE"
+    trigger_text = f"bid trigger {trigger_price:.4f}" if trigger_price is not None else "no bid trigger"
+    add_bot_reason(f"{label} {'FILLED' if complete else 'PARTIAL FILL'} {symbol} qty {filled_qty:g}/{record['qty']:g}: {fill_text}; {trigger_text}; {record.get('reason', '')}")
 
 
 def default_pending_entry():
@@ -2473,7 +3977,8 @@ def sync_trade_limits_from_file(config):
     with BOT_LOCK:
         if BOT_STATE["day"] != today:
             BOT_STATE["samples"] = []
-            BOT_STATE["position_peaks"] = {}
+            # Peaks are deliberately kept: wiping them here would silently loosen the
+            # armed stop of a position held overnight. They clear on confirmed exit.
             BOT_STATE["day"] = today
         BOT_STATE["trades_today"] = trades_today
         BOT_STATE["spent_today"] = spent_today
@@ -3215,18 +4720,26 @@ def build_market_context(config, positions=None):
         qty = float(pos.get("quantity", 0) or 0)
         cost_basis = float(pos.get("cost_basis", 0) or 0)
         position_quote = get_market_quote(position_symbol)
-        position_price = get_quote_price(position_quote)
+        position_is_option = len(position_symbol) > 6
+        if position_is_option:
+            position_exit_quote = get_option_exit_price(position_quote, config)
+            position_price = position_exit_quote["price"]
+            if position_price is None:
+                current_pl = None
+                reasons.append(position_exit_quote["message"])
+        else:
+            position_price = get_quote_price(position_quote)
         if position_price is not None and qty:
-            entry_price = option_entry_price(cost_basis, qty) if len(position_symbol) > 6 else cost_basis / qty
-            multiplier = 100 if len(position_symbol) > 6 else 1
+            entry_price = option_entry_price(cost_basis, qty) if position_is_option else cost_basis / qty
+            multiplier = 100 if position_is_option else 1
             current_pl = (position_price - entry_price) * qty * multiplier
+            position_key = exit_state_key(position_symbol, config)
             with BOT_LOCK:
-                peak = max(BOT_STATE["position_peaks"].get(position_symbol, entry_price), position_price)
-                BOT_STATE["position_peaks"][position_symbol] = peak
-                max_profit = max(BOT_STATE["position_max_profit"].get(position_symbol, current_pl), current_pl)
-                max_drawdown = min(BOT_STATE["position_max_drawdown"].get(position_symbol, current_pl), current_pl)
-                BOT_STATE["position_max_profit"][position_symbol] = max_profit
-                BOT_STATE["position_max_drawdown"][position_symbol] = max_drawdown
+                max_profit = max(BOT_STATE["position_max_profit"].get(position_key, current_pl), current_pl)
+                max_drawdown = min(BOT_STATE["position_max_drawdown"].get(position_key, current_pl), current_pl)
+                BOT_STATE["position_max_profit"][position_key] = max_profit
+                BOT_STATE["position_max_drawdown"][position_key] = max_drawdown
+            # Read-only: decide_surfer_action/fast_exit_poll own the peak updates.
             stop_values = calculate_stop_state(position_symbol, entry_price, position_price, config)
             trailing_stop_price = stop_values.get("effective_trailing_stop")
             distance_to_trailing_stop = position_price - trailing_stop_price if trailing_stop_price is not None else None
@@ -3333,23 +4846,28 @@ def decide_surfer_action(config, positions, market_context):
         symbol = pos.get("symbol", "")
         qty = float(pos.get("quantity", 0) or 0)
         cost_basis = float(pos.get("cost_basis", 0) or 0)
+        if len(symbol) <= 6:
+            # try_surfer_exit only ever closes option contracts.
+            return "HOLD", ["Non-option position: stop evaluation not applicable"] + market_context.get("reasons", [])
+
         quote = get_market_quote(symbol)
-        current_price = get_quote_price(quote)
-        entry_price = option_entry_price(cost_basis, qty) if len(symbol) > 6 and qty else cost_basis / qty if qty else 0
+        entry_price = option_entry_price(cost_basis, qty) if qty else 0
+        evaluation = evaluate_option_exit(symbol, entry_price, quote, config)
 
-        with BOT_LOCK:
-            peak = max(BOT_STATE["position_peaks"].get(symbol, entry_price), current_price or entry_price)
-            BOT_STATE["position_peaks"][symbol] = peak
+        if not evaluation["ok"]:
+            message, exposure = record_exit_quote_error(symbol, qty, entry_price, evaluation, "SURFER EXIT")
+            return QUOTE_DATA_ERROR_DECISION, [message, exposure]
 
-        pnl_percent = ((current_price - entry_price) / entry_price) * 100 if current_price and entry_price else 0
-        stop_values = calculate_stop_state(symbol, entry_price, current_price, config)
-        hard_stop_price = entry_price * (1 - hard_stop_percent / 100) if entry_price else None
-        trailing_stop_price = stop_values.get("effective_trailing_stop") or 0
-        trailing_drawdown = ((peak - current_price) / peak) * 100 if current_price and peak else 0
-        trailing_stop_active = bool(stop_values.get("stop_armed"))
+        current_price = evaluation["bid"]
+        stop_values = evaluation["stop_values"]
+        hard_stop_price = evaluation["hard_stop_price"]
+        trailing_stop_price = evaluation["effective_stop"]
         stop_control_rule = stop_values.get("stop_control_rule", "HARD STOP")
+        pnl_percent = ((current_price - entry_price) / entry_price) * 100 if entry_price else 0
+        quote_line = exit_quote_log_line(symbol, evaluation["exit_quote"], evaluation["stop_price"], evaluation["exit_code"])
+        print(quote_line)
 
-        if pnl_percent <= -hard_stop_percent:
+        if evaluation["decision"] == "SELL":
             trigger_snapshot = exit_trigger_diagnostics(
                 quote,
                 market_context.get("price"),
@@ -3360,21 +4878,11 @@ def decide_surfer_action(config, positions, market_context):
             market_context["exit_trigger_diagnostics"] = trigger_snapshot
             if original_market_context is not None:
                 original_market_context["exit_trigger_diagnostics"] = trigger_snapshot
-            return "SELL", ["Hard stop hit", f"P/L {pnl_percent:.2f}%"]
-        if trailing_stop_active and current_price is not None and current_price <= trailing_stop_price:
-            trigger_snapshot = exit_trigger_diagnostics(
-                quote,
-                market_context.get("price"),
-                hard_stop_price,
-                stop_values.get("percentage_trailing_stop"),
-                trailing_stop_price,
-            )
-            market_context["exit_trigger_diagnostics"] = trigger_snapshot
-            if original_market_context is not None:
-                original_market_context["exit_trigger_diagnostics"] = trigger_snapshot
-            return "SELL", ["Trailing stop hit", f"Current {current_price:.2f} <= effective stop {trailing_stop_price:.2f}", f"Rule: {stop_control_rule}"]
+            if evaluation["exit_code"] == EXIT_CODE_HARD_STOP:
+                return "SELL", ["Hard stop hit", f"P/L {pnl_percent:.2f}%", quote_line]
+            return "SELL", ["Trailing stop hit", f"Bid {current_price:.2f} <= effective stop {trailing_stop_price:.2f}", f"Rule: {stop_control_rule}", quote_line]
 
-        trailing_reason = "Trailing stop not hit" if trailing_stop_active else "Trailing stop inactive"
+        trailing_reason = "Trailing stop not hit" if stop_values.get("stop_armed") else "Trailing stop inactive"
         return "HOLD", ["Hard stop not hit", trailing_reason] + market_context.get("reasons", [])
 
     if (
@@ -4441,6 +5949,8 @@ def execute_entry_buy(config, decision, side, contract, contracts, reference_pri
             market_state_at_entry=market_context.get("market_state", ""),
             reason_log=market_context.get("decision_reasons", [])
         )
+        clear_position_exit_state(contract["symbol"], "new bot entry")
+        release_closed_exit(contract["symbol"], "new bot entry")
         add_bot_reason(f"BUY logged {contract['symbol']} qty {contracts} price {entry_price} source {entry_price_source}")
         add_bot_reason(f"SIGNAL entered {side}: {'; '.join(market_context.get('decision_reasons', []))}")
         return True
@@ -4812,6 +6322,10 @@ def try_surfer_exit(config, positions, market_context):
     if not scanner_market_is_open():
         return False
 
+    for pos in positions:
+        if process_pending_exit(pos.get("symbol", ""), positions) != "NONE":
+            return True
+
     decision = market_context.get("decision", "DO NOTHING")
     if decision != "SELL":
         add_bot_reason(f"EXIT hold: {'; '.join(market_context.get('decision_reasons', []))}")
@@ -4827,7 +6341,6 @@ def try_surfer_exit(config, positions, market_context):
         cost_basis = float(pos.get("cost_basis", 0) or 0)
         entry_price = option_entry_price(cost_basis, qty)
         quote = get_market_quote(symbol)
-        current_price = get_quote_price(quote) or entry_price
         trigger_diagnostics = dict(market_context.get("exit_trigger_diagnostics") or {})
 
         exit_reasons = market_context.get("decision_reasons", [])
@@ -4839,88 +6352,21 @@ def try_surfer_exit(config, positions, market_context):
             log_bot_audit("SKIP", decision, config.get("symbol", ""), market_context, config, option_symbol=symbol, skip_reason="options market closed", exit_reason=reason)
             return True
 
-        ok, order_status, status, text = submit_and_parse_option_order(
-            symbol,
-            qty,
-            "sell_to_close",
-            "EXIT"
-        )
-        order_id = extract_order_id(text)
+        if exit_retry_wait_seconds(symbol) > 0:
+            add_bot_reason(f"EXIT waiting before retry after rejected order: {symbol}")
+            return True
 
-        if ok:
-            entry_row = find_last_buy(symbol)
-            order_execution = fetch_broker_order_execution(order_id, text)
-            execution_diagnostics = exit_execution_diagnostics(
-                trigger_diagnostics,
-                quote,
-                market_context.get("price"),
-                entry_row,
-                order_execution,
-            )
-            pnl = option_pnl(current_price, cost_basis, qty)
-            trade_row = log_trade(
-                "SELL",
-                symbol,
-                qty,
-                current_price,
-                pnl,
-                source="BOT",
-                market_context=market_context,
-                execution_diagnostics=execution_diagnostics,
-            )
-            pnl_percent = ((current_price - entry_price) / entry_price) * 100 if entry_price else 0
-            if trade_row.get("PnLSource") == "BROKER_FILLS":
-                pnl = trade_row["PnL"]
-                pnl_percent = trade_row["PnLPercent"]
-            with BOT_LOCK:
-                max_profit = BOT_STATE["position_max_profit"].get(symbol, pnl)
-                max_drawdown = BOT_STATE["position_max_drawdown"].get(symbol, pnl)
-            log_bot_audit(
-                "SELL",
-                decision,
-                config.get("symbol", ""),
-                market_context,
-                config,
-                option_symbol=symbol,
-                exit_grade=trade_row.get("ExitGrade", ""),
-                pnl=pnl,
-                pnl_percent=pnl_percent,
-                current_price=current_price,
-                entry_price=entry_price,
-                current_value=option_current_value(current_price, qty),
-                cost_basis=cost_basis,
-                exit_reason=reason,
-                order_status=order_status,
-                order_id=order_id,
-                max_unrealized_profit=max_profit,
-                max_drawdown=max_drawdown,
-                hold_time=trade_row.get("HoldTime", ""),
-                spy_price_at_exit=market_context.get("price", ""),
-                market_state_at_exit=market_context.get("market_state", "")
-            )
-            update_last_trade_review({
-                "entry_reason": entry_row.get("GradeReason", "") if entry_row else "",
-                "exit_reason": reason,
-                "entry_grade": entry_row.get("EntryGrade", "") if entry_row else "",
-                "exit_grade": trade_row.get("ExitGrade", ""),
-                "final_pl": pnl,
-                "max_profit": max_profit,
-                "max_drawdown": max_drawdown,
-                "hold_time": trade_row.get("HoldTime", ""),
-                "human_or_bot": "BOT"
-            })
-            add_bot_reason(f"EXIT sold {symbol}: {reason}")
-            with BOT_LOCK:
-                BOT_STATE["position_peaks"].pop(symbol, None)
-                BOT_STATE["position_profit_floor_active"].pop(symbol, None)
-                BOT_STATE["position_effective_stops"].pop(symbol, None)
-                BOT_STATE["position_max_profit"].pop(symbol, None)
-                BOT_STATE["position_max_drawdown"].pop(symbol, None)
-            return True
-        else:
-            add_bot_reason(f"EXIT rejected or not accepted: {order_status}")
-            log_bot_audit("SKIP", decision, config.get("symbol", ""), market_context, config, option_symbol=symbol, skip_reason="exit rejected or not accepted", exit_reason=reason, order_status=order_status, order_id=order_id)
-            return True
+        submit_tracked_exit(
+            symbol, qty, cost_basis, entry_price, "EXIT", "BOT", quote, trigger_diagnostics,
+            market_context, reason, exit_reasons, config,
+            audit_fields={
+                "entry_price": entry_price,
+                "cost_basis": cost_basis,
+                "current_price": trigger_diagnostics.get("ExitTriggerPrice", ""),
+            },
+            position_snapshot=pos,
+        )
+        return True
 
     return False
 
@@ -5004,26 +6450,62 @@ def fast_exit_poll(config, positions):
         record_tick_finished(tick_started_at)
         return False
 
+    if process_pending_exit(symbol, positions) != "NONE":
+        record_tick_finished(tick_started_at)
+        return True
+
     qty = int(float(pos.get("quantity", 1)))
     cost_basis = float(pos.get("cost_basis", 0) or 0)
     entry_price = option_entry_price(cost_basis, qty)
     quote = get_market_quote(symbol)
-    current_price = get_quote_price(quote) or entry_price
     hard_stop_percent = float(config["strategy"].get("hard_stop_percent", 20))
     trailing_stop_percent = float(config["strategy"].get("trailing_stop_percent", 15))
+    evaluation = evaluate_option_exit(symbol, entry_price, quote, config)
+
+    if not evaluation["ok"]:
+        message, exposure = record_exit_quote_error(symbol, qty, entry_price, evaluation, "FAST EXIT")
+        reasons = [message, exposure, exit_quote_log_line(symbol, evaluation["exit_quote"], evaluation["stop_price"], "NONE")]
+        market_context = current_market_context_snapshot()
+        market_context.update({
+            "decision": QUOTE_DATA_ERROR_DECISION,
+            "decision_reasons": reasons,
+            "current_pl": None,
+            "distance_to_trailing_stop": None,
+            "exit_trigger_diagnostics": {},
+        })
+        with BOT_LOCK:
+            BOT_STATE["market_context"] = dict(market_context)
+            BOT_STATE["last_action"] = f"FAST EXIT {QUOTE_DATA_ERROR_DECISION}: {message}"
+            BOT_STATE["thread_alive"] = True
+        log_bot_audit(
+            "SKIP",
+            QUOTE_DATA_ERROR_DECISION,
+            config.get("symbol", ""),
+            market_context,
+            config,
+            option_symbol=symbol,
+            entry_price=entry_price,
+            cost_basis=cost_basis,
+            reason_log=reasons,
+            skip_reason="option quote data error",
+            no_sell_reason=f"{message} {exposure}",
+        )
+        record_tick_finished(tick_started_at)
+        return False
+
+    current_price = evaluation["bid"]
     pnl = option_pnl(current_price, cost_basis, qty)
     pnl_percent = ((current_price - entry_price) / entry_price) * 100 if entry_price else 0
 
+    position_key = exit_state_key(symbol, config)
     with BOT_LOCK:
-        peak = max(BOT_STATE["position_peaks"].get(symbol, entry_price), current_price)
-        BOT_STATE["position_peaks"][symbol] = peak
-        BOT_STATE["position_max_profit"][symbol] = max(BOT_STATE["position_max_profit"].get(symbol, pnl), pnl)
-        BOT_STATE["position_max_drawdown"][symbol] = min(BOT_STATE["position_max_drawdown"].get(symbol, pnl), pnl)
+        BOT_STATE["position_max_profit"][position_key] = max(BOT_STATE["position_max_profit"].get(position_key, pnl), pnl)
+        BOT_STATE["position_max_drawdown"][position_key] = min(BOT_STATE["position_max_drawdown"].get(position_key, pnl), pnl)
         BOT_STATE["thread_alive"] = True
 
-    hard_stop_price = entry_price * (1 - hard_stop_percent / 100)
-    stop_values = calculate_stop_state(symbol, entry_price, current_price, config)
-    peak = stop_values.get("peak_price", peak)
+    hard_stop_price = evaluation["hard_stop_price"]
+    stop_values = evaluation["stop_values"]
+    peak = stop_values.get("peak_price", entry_price)
     percentage_trailing_stop = stop_values.get("percentage_trailing_stop")
     trailing_stop_price = stop_values.get("effective_trailing_stop")
     trailing_drawdown = ((peak - current_price) / peak) * 100 if peak else 0
@@ -5045,14 +6527,15 @@ def fast_exit_poll(config, positions):
         f"Drawdown {trailing_drawdown:.2f}%"
     ]
 
-    if pnl_percent <= -hard_stop_percent:
+    quote_line = exit_quote_log_line(symbol, evaluation["exit_quote"], evaluation["stop_price"], evaluation["exit_code"])
+    if evaluation["exit_code"] == EXIT_CODE_HARD_STOP:
         decision = "SELL"
-        sell_trigger_reason = f"Hard stop hit: P/L {pnl_percent:.2f}% <= -{hard_stop_percent:.2f}%"
-        reasons = ["Hard stop hit", f"P/L {pnl_percent:.2f}% <= -{hard_stop_percent:.2f}%"] + reasons
-    elif stop_armed and current_price <= trailing_stop_price:
+        sell_trigger_reason = f"Hard stop hit: bid {current_price:.2f} <= hard stop {hard_stop_price:.2f}; P/L at bid {pnl_percent:.2f}%"
+        reasons = ["Hard stop hit", f"Bid {current_price:.2f} <= hard stop {hard_stop_price:.2f}", quote_line] + reasons
+    elif evaluation["decision"] == "SELL":
         decision = "SELL"
-        sell_trigger_reason = f"Trailing stop hit: current {current_price:.2f} <= effective stop {trailing_stop_price:.2f} ({stop_control_rule})"
-        reasons = ["Trailing stop hit", f"Current {current_price:.2f} <= effective stop {trailing_stop_price:.2f}", f"Rule: {stop_control_rule}"] + reasons
+        sell_trigger_reason = f"{evaluation['exit_code']}: bid {current_price:.2f} <= effective stop {trailing_stop_price:.2f} ({stop_control_rule})"
+        reasons = ["Trailing stop hit", f"Bid {current_price:.2f} <= effective stop {trailing_stop_price:.2f}", f"Rule: {stop_control_rule}", quote_line] + reasons
     else:
         if stop_armed:
             no_sell_reason = f"Hard stop not hit; trailing stop not hit; stop_armed={stop_armed}; current {current_price:.2f} > effective stop {trailing_stop_price:.2f}; rule={stop_control_rule}"
@@ -5093,6 +6576,7 @@ def fast_exit_poll(config, positions):
 
     print("FAST EXIT POLL")
     print("symbol:", symbol)
+    print(quote_line)
     print("entry_price:", entry_price)
     print("current_option_price:", current_price)
     print("highest_option_price_since_entry:", peak)
@@ -5172,107 +6656,15 @@ def fast_exit_poll(config, positions):
         record_tick_finished(tick_started_at)
         return True
 
-    ok, order_status, status, text = submit_and_parse_option_order(
-        symbol,
-        qty,
-        "sell_to_close",
-        "FAST EXIT"
-    )
-    order_id = extract_order_id(text)
-
-    if ok:
-        entry_row = find_last_buy(symbol)
-        order_execution = fetch_broker_order_execution(order_id, text)
-        execution_diagnostics = exit_execution_diagnostics(
-            trigger_diagnostics,
-            quote,
-            market_context.get("price"),
-            entry_row,
-            order_execution,
-        )
-        trade_row = log_trade(
-            "SELL",
-            symbol,
-            qty,
-            current_price,
-            pnl,
-            source="BOT",
-            market_context=market_context,
-            execution_diagnostics=execution_diagnostics,
-        )
-        if trade_row.get("PnLSource") == "BROKER_FILLS":
-            pnl = trade_row["PnL"]
-            pnl_percent = trade_row["PnLPercent"]
-        with BOT_LOCK:
-            max_profit = BOT_STATE["position_max_profit"].get(symbol, pnl)
-            max_drawdown = BOT_STATE["position_max_drawdown"].get(symbol, pnl)
-        log_bot_audit(
-            "SELL",
-            decision,
-            config.get("symbol", ""),
-            market_context,
-            config,
-            exit_grade=trade_row.get("ExitGrade", ""),
-            pnl=pnl,
-            pnl_percent=pnl_percent,
-            exit_reason=reason,
-            order_status=order_status,
-            order_id=order_id,
-            max_unrealized_profit=max_profit,
-            max_drawdown=max_drawdown,
-            hold_time=trade_row.get("HoldTime", ""),
-            spy_price_at_exit=market_context.get("price", ""),
-            market_state_at_exit=market_context.get("market_state", ""),
-            reason_log=reasons,
-            **fast_exit_audit_fields(
-                symbol,
-                qty,
-                cost_basis,
-                entry_price,
-                current_price,
-                peak,
-                trailing_stop_percent,
-                trailing_stop_price,
-                trailing_drawdown,
-                stop_armed,
-                sell_trigger_reason=sell_trigger_reason,
-                stop_values=stop_values
-            )
-        )
-        update_last_trade_review({
-            "entry_reason": entry_row.get("GradeReason", "") if entry_row else "",
-            "exit_reason": reason,
-            "entry_grade": entry_row.get("EntryGrade", "") if entry_row else "",
-            "exit_grade": trade_row.get("ExitGrade", ""),
-            "final_pl": pnl,
-            "max_profit": max_profit,
-            "max_drawdown": max_drawdown,
-            "hold_time": trade_row.get("HoldTime", ""),
-            "human_or_bot": "BOT"
-        })
-        add_bot_reason(f"FAST EXIT sold {symbol}: {reason}")
-        with BOT_LOCK:
-            BOT_STATE["position_peaks"].pop(symbol, None)
-            BOT_STATE["position_profit_floor_active"].pop(symbol, None)
-            BOT_STATE["position_effective_stops"].pop(symbol, None)
-            BOT_STATE["position_max_profit"].pop(symbol, None)
-            BOT_STATE["position_max_drawdown"].pop(symbol, None)
+    if exit_retry_wait_seconds(symbol) > 0:
+        add_bot_reason(f"FAST EXIT waiting before retry after rejected order: {symbol}")
         record_tick_finished(tick_started_at)
         return True
 
-    add_bot_reason(f"FAST EXIT rejected or not accepted: {order_status}")
-    log_bot_audit(
-        "SKIP",
-        decision,
-        config.get("symbol", ""),
-        market_context,
-        config,
-        reason_log=reasons,
-        skip_reason="fast exit rejected or not accepted",
-        exit_reason=reason,
-        order_status=order_status,
-        order_id=order_id,
-        **fast_exit_audit_fields(
+    submit_tracked_exit(
+        symbol, qty, cost_basis, entry_price, "FAST EXIT", "BOT", quote, trigger_diagnostics,
+        market_context, reason, reasons, config,
+        audit_fields=fast_exit_audit_fields(
             symbol,
             qty,
             cost_basis,
@@ -5285,7 +6677,8 @@ def fast_exit_poll(config, positions):
             stop_armed,
             sell_trigger_reason=sell_trigger_reason,
             stop_values=stop_values
-        )
+        ),
+        position_snapshot=pos,
     )
     record_tick_finished(tick_started_at)
     return True
@@ -5430,6 +6823,12 @@ def surfer_bot_loop():
             config = load_config()
             interval = int(config.get("scanner", {}).get("interval_seconds", 60))
             exit_poll_interval_ms = clamp_int(config["strategy"].get("exit_poll_interval_ms", 1000), 100, 5000, 1000)
+            if has_unsettled_exits():
+                # Runs regardless of market hours or open positions so a fill is never lost.
+                process_all_pending_exits(get_position())
+            if exit_recovery_block_reason(config):
+                # Read-only: reconciles lost exit state; order submission stays blocked until it passes.
+                process_exit_recovery(get_position())
             if not scanner_market_is_open():
                 idle_started_at = time.perf_counter()
                 with BOT_LOCK:
@@ -5439,6 +6838,7 @@ def surfer_bot_loop():
                 time.sleep(MARKET_CLOSED_SLEEP_SECONDS)
                 continue
             positions = get_position()
+            reconcile_exit_state_with_broker(positions)
             if positions:
                 active_pending = get_pending_entry()
                 if active_pending.get("active"):
@@ -5464,7 +6864,10 @@ def surfer_bot_loop():
                 time.sleep(exit_poll_interval_ms / 1000)
             else:
                 last_full_position_scan = 0
-                if get_pending_entry().get("active"):
+                if has_unsettled_exits():
+                    # Exit not yet confirmed: never start a new entry on top of it.
+                    time.sleep(exit_poll_interval_ms / 1000)
+                elif get_pending_entry().get("active"):
                     process_pending_entry(config)
                     time.sleep(exit_poll_interval_ms / 1000)
                 else:
@@ -5478,6 +6881,10 @@ def surfer_bot_loop():
 
 @broker_session
 def sell_all_positions():
+    recovery_block = exit_recovery_block_reason()
+    if recovery_block:
+        add_bot_reason(f"SELL BLOCKED: {recovery_block}")
+        return False, recovery_block
     positions = get_position()
     if not positions:
         return False, "No open positions"
@@ -5513,15 +6920,18 @@ def sell_all_positions():
         print("pnl:", pnl)
 
         if is_option:
-            ok, order_status, status, text = submit_and_parse_option_order(
-                symbol,
-                qty,
-                "sell_to_close",
-                "SELL"
+            if get_pending_exit(symbol):
+                results.append(f"{symbol}: exit order already pending; no duplicate sent")
+                continue
+            exit_quote = get_option_exit_price(quote)
+            reference_price = exit_quote["price"] or strict_quote_price((quote or {}).get("last"))[0]
+            outcome = submit_tracked_exit(
+                symbol, qty, cost_basis, entry_price, "SELL", "HUMAN", quote, {},
+                current_market_context_snapshot(), "Manual sell", ["Manual sell"], load_config(),
+                reference_price=reference_price,
+                position_snapshot=pos,
             )
-            if ok:
-                log_trade("SELL", symbol, qty, sell_price, pnl)
-            results.append(text)
+            results.append(f"{symbol}: {outcome}")
         else:
             data = {
                 "class": "equity",
@@ -5865,6 +7275,19 @@ def manual_buy_put():
                 entry_price_source=entry_price_source,
                 estimated_entry_price=estimated_entry_price
             )
+    return redirect("/")
+
+
+@app.route("/resolve-unscoped-exit-state", methods=["POST"])
+@broker_session
+def resolve_unscoped_exit_state_route():
+    resolve_unscoped_exit_state(request.form.get("migration_id", ""), request.form.get("action", ""), request.form.get("confirm_symbol", ""))
+    return redirect("/")
+
+
+@app.route("/resolve-exit-intent", methods=["POST"])
+def resolve_exit_intent():
+    clear_stuck_exit_intent(request.form.get("intent_id", ""), request.form.get("confirm_symbol", ""))
     return redirect("/")
 
 
@@ -7112,9 +8535,16 @@ def get_position_pl_data(pos):
     cost_basis = float(pos.get("cost_basis", 0) or 0)
 
     quote = get_market_quote(symbol)
+    is_option = len(symbol) > 6
 
     current_price = None
-    if quote:
+    exit_quote = None
+    quote_data_error = ""
+    if is_option:
+        exit_quote = get_option_exit_price(quote)
+        current_price = exit_quote["price"]
+        quote_data_error = "" if exit_quote["ok"] else exit_quote["message"]
+    elif quote:
         for key in ["last", "bid", "ask"]:
             if quote.get(key) is not None:
                 try:
@@ -7123,8 +8553,6 @@ def get_position_pl_data(pos):
                 except:
                     pass
 
-    is_option = len(symbol) > 6
-
     if qty == 0:
         entry_price = 0
     elif is_option:
@@ -7132,24 +8560,37 @@ def get_position_pl_data(pos):
     else:
         entry_price = cost_basis / qty
 
-    if current_price is None:
+    if current_price is None and not is_option:
         current_price = entry_price
 
-    if is_option:
-        current_value = option_current_value(current_price, qty)
+    if current_price is None:
+        # Option with no usable bid: report no value rather than inventing one.
+        current_value = None
+        pnl = None
+        pnl_percent = None
     else:
-        current_value = current_price * qty
-
-    pnl = option_pnl(current_price, cost_basis, qty) if is_option else current_value - cost_basis
-
-    if cost_basis != 0:
-        pnl_percent = (pnl / cost_basis) * 100
-    else:
-        pnl_percent = 0
+        current_value = option_current_value(current_price, qty) if is_option else current_price * qty
+        pnl = option_pnl(current_price, cost_basis, qty) if is_option else current_value - cost_basis
+        pnl_percent = (pnl / cost_basis) * 100 if cost_basis != 0 else 0
 
     stop_values = stop_debug_values(symbol, entry_price, current_price)
     hold_time = position_hold_time(symbol)
-    current_exit_decision, current_exit_reason = current_exit_display(symbol, stop_values)
+    current_exit_decision, current_exit_reason = current_exit_display(symbol, stop_values, quote_data_error)
+    pending_exit = get_pending_exit(symbol)
+    closed_exit = get_closed_exit(symbol)
+    recovery_block = exit_recovery_block_reason()
+    if recovery_block:
+        quote_status = recovery_block
+    elif pending_exit:
+        quote_status = pending_exit.get("status_message", "EXIT ORDER PENDING")
+    elif closed_exit:
+        quote_status = closed_exit.get("status_message", "EXIT CLOSED: awaiting position confirmation")
+    elif quote_data_error:
+        quote_status = f"QUOTE DATA ERROR: {quote_data_error}"
+    elif exit_quote:
+        quote_status = exit_quote_status_text(exit_quote)
+    else:
+        quote_status = "N/A"
 
     position_data = {
         "symbol": symbol,
@@ -7178,6 +8619,9 @@ def get_position_pl_data(pos):
         "hold_time": hold_time,
         "current_exit_decision": current_exit_decision,
         "current_exit_reason": current_exit_reason,
+        "quote_data_error": quote_data_error,
+        "quote_status": quote_status,
+        "exit_order_pending": bool(pending_exit),
         "is_option": is_option
     }
 
@@ -7198,8 +8642,9 @@ def get_position_pl_data(pos):
 
 def get_bot_health_data(positions, bot_snapshot):
     broker_has_position = bool(positions)
+    scope_prefix = exit_order_key(exit_broker_scope(), "")
     with BOT_LOCK:
-        internal_symbols = list(BOT_STATE["position_peaks"].keys())
+        internal_symbols = [key for key in BOT_STATE["position_peaks"] if key.startswith(scope_prefix)]
     internal_has_position = bool(internal_symbols)
     position_sync = "OK" if internal_has_position == broker_has_position else "MISMATCH"
     last_quote_age_ms = age_ms(bot_snapshot.get("last_quote_epoch"))
@@ -7242,6 +8687,8 @@ def get_bot_health_data(positions, bot_snapshot):
         ) if broker_has_position else None,
         "trailing_stop_percent": None,
         "stop_armed": False,
+        "quote_data_error": "",
+        "quote_status": "N/A",
         "hold_time": "N/A"
     }
 
@@ -7268,6 +8715,8 @@ def get_bot_health_data(positions, bot_snapshot):
             ),
             "trailing_stop_percent": pl.get("trailing_stop_percent"),
             "stop_armed": bool(pl.get("effective_trailing_stop") and pl.get("entry_price") and pl.get("effective_trailing_stop") >= pl.get("entry_price")),
+            "quote_data_error": pl.get("quote_data_error", ""),
+            "quote_status": pl.get("quote_status", "N/A"),
             "hold_time": pl.get("hold_time", "N/A")
         })
 
@@ -8281,11 +9730,12 @@ Max Trades Per Day: {e.get("max_trades_per_day")}
 </div>
 </div>
 
-<div class="card">
+{render_pending_exit_panel()}<div class="card">
 <h2>Exit Monitor</h2>
 <div class="grid">
 <div class="item"><div class="label">Entry</div><div class="value" id="exit-entry">{fmt_money(bot_health["entry_price"])}</div></div>
-<div class="item"><div class="label">Current</div><div class="value" id="exit-current">{fmt_money(bot_health["current_price"])}</div></div>
+<div class="item"><div class="label">Current (Bid)</div><div class="value" id="exit-current">{fmt_money(bot_health["current_price"])}</div></div>
+<div class="item"><div class="label">Exit Quote</div><div class="value" id="exit-quote-status">{escape_html(bot_health["quote_status"])}</div></div>
 <div class="item"><div class="label">Peak</div><div class="value" id="exit-peak">{fmt_money(bot_health["peak_price"])}</div></div>
 <div class="item"><div class="label">Trailing Stop</div><div class="value" id="exit-trailing-stop">{fmt_money(bot_health["trailing_stop_price"])}</div></div>
 <div class="item"><div class="label">Profit Floor Enabled</div><div class="value" id="exit-profit-floor-enabled">{ "YES" if bot_health["profit_floor_enabled"] else "NO" }</div></div>
@@ -8334,14 +9784,15 @@ Max Trades Per Day: {e.get("max_trades_per_day")}
     if positions:
         for pos in positions:
             pl = get_position_pl_data(pos)
-            pnl_color = "#00ff88" if pl["pnl"] >= 0 else "#ff5555"
+            pnl_color = "#00ff88" if (pl["pnl"] or 0) >= 0 else "#ff5555"
             html += f"""
 <div class="item">
 <div class="label">Symbol</div>
 <div class="value">{pl["symbol"]}</div>
 Qty: {pl["qty"]}<br>
 Entry: {fmt_money(pl["entry_price"])}<br>
-Current: {fmt_money(pl["current_price"])}<br>
+Current (Bid): {fmt_money(pl["current_price"])}<br>
+Exit Quote: {escape_html(pl.get("quote_status") or "N/A")}<br>
 Hard Stop %: {pl["hard_stop_percent"]:.2f}%<br>
 Hard Stop Price: {fmt_money(pl["hard_stop_price"])}<br>
 Peak Price: {fmt_money(pl["peak_price"])}<br>
@@ -8358,7 +9809,7 @@ Trailing Stop Price: {fmt_money(pl["trailing_stop_price"])}<br>
 Drawdown From Peak %: {pl["drawdown_from_peak_percent"]:.2f}%<br>
 <span style="color:{pnl_color}; font-weight:bold;">
 P/L: {fmt_money(pl["pnl"])}<br>
-P/L %: {pl["pnl_percent"]:+.2f}%
+P/L %: {f"{pl['pnl_percent']:+.2f}%" if pl["pnl_percent"] is not None else "N/A"}
 </span><br>
 Hold Time: {pl.get("hold_time") or "N/A"}<br>
 Live Grade: {pl.get("live_grade") or "N/A"}<br>
@@ -8801,7 +10252,8 @@ function renderPositions(positions) {{
 <div class="value">${{pl.symbol}}</div>
 Qty: ${{pl.qty}}<br>
 Entry: ${{fmtMoney(pl.entry_price)}}<br>
-Current: ${{fmtMoney(pl.current_price)}}<br>
+Current (Bid): ${{fmtMoney(pl.current_price)}}<br>
+Exit Quote: ${{escapeHtml(pl.quote_status || "N/A")}}<br>
 Hard Stop %: ${{Number(pl.hard_stop_percent || 0).toFixed(2)}}%<br>
 Hard Stop Price: ${{fmtMoney(pl.hard_stop_price)}}<br>
 Peak Price: ${{fmtMoney(pl.peak_price)}}<br>
@@ -8818,7 +10270,7 @@ Trailing Stop Price: ${{fmtMoney(pl.trailing_stop_price)}}<br>
 Drawdown From Peak %: ${{Number(pl.drawdown_from_peak_percent || 0).toFixed(2)}}%<br>
 <span style="color:${{pnlColor}}; font-weight:bold;">
 P/L: ${{fmtMoney(pl.pnl)}}<br>
-P/L %: ${{Number(pl.pnl_percent || 0).toFixed(2)}}%
+P/L %: ${{pl.pnl_percent === null || pl.pnl_percent === undefined ? "N/A" : Number(pl.pnl_percent).toFixed(2) + "%"}}
 </span><br>
 Hold Time: ${{pl.hold_time || "N/A"}}<br>
 Live Grade: ${{pl.live_grade || "N/A"}}<br>
@@ -9420,6 +10872,7 @@ async function updateDeveloperDiagnostics() {{
 
     setText("exit-entry", fmtMoney(position.entry_price));
     setText("exit-current", fmtMoney(position.current_price));
+    setText("exit-quote-status", position.quote_status || "N/A");
     setText("exit-peak", fmtMoney(position.peak_price));
     setText("exit-trailing-stop", fmtMoney(position.trailing_stop_price));
     setText("exit-profit-floor-enabled", position.profit_floor_enabled ? "YES" : "NO");
@@ -9558,6 +11011,7 @@ if __name__ == "__main__":
     initialize_pending_entry_history()
     recover_shadow_research_on_startup()
     initialize_tournament_recovery()
+    load_exit_state()
     atexit.register(shutdown_tournament_monitors)
     threading.Thread(target=surfer_bot_loop, daemon=True).start()
     start_tournament_exit_monitor()

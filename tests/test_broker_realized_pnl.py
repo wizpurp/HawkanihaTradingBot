@@ -73,8 +73,9 @@ class BrokerRealizedPnlTest(unittest.TestCase):
         self.assertIn("Broker Realized P/L", dashboard.render_sell_trade_card(display))
         self.assertIn("Trigger P/L", dashboard.render_sell_trade_card(display))
 
-    def test_last_bid_discrepancy_current_behavior_is_preserved(self):
-        quote = {"bid": .51, "ask": .52, "last": .42}
+    def test_stale_last_below_stop_does_not_trigger_when_bid_is_valid(self):
+        quote = {"bid": .51, "ask": .52, "last": .42,
+                 "bid_date": datetime.now(dashboard.MARKET_TZ).isoformat()}
         self.assertEqual(dashboard.get_quote_price(quote), .42)
         self.assertAlmostEqual((dashboard.get_quote_price(quote) - .51) / .51 * 100, -17.6470588)
         self.assertEqual((quote["bid"] - .51) / .51 * 100, 0)
@@ -85,8 +86,8 @@ class BrokerRealizedPnlTest(unittest.TestCase):
              patch.object(dashboard, "calculate_stop_state", return_value={"stop_armed": False}), \
              patch.dict(dashboard.BOT_STATE, {"position_peaks": {}}, clear=False):
             decision, reasons = dashboard.decide_surfer_action(config, [position], context)
-        self.assertEqual(decision, "SELL")
-        self.assertIn("Hard stop hit", reasons)
+        self.assertEqual(decision, "HOLD")
+        self.assertIn("Hard stop not hit", reasons)
 
     def test_environment_and_opt_in_guard_with_override(self):
         now = datetime.now(dashboard.MARKET_TZ)
