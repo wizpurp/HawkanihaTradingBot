@@ -6872,7 +6872,11 @@ def surfer_bot_loop():
                     time.sleep(exit_poll_interval_ms / 1000)
                 else:
                     surfer_bot_tick()
-                    time.sleep(max(1, interval))
+                    if get_pending_entry().get("active"):
+                        # This scan created a candidate: begin monitoring on the short cadence.
+                        time.sleep(exit_poll_interval_ms / 1000)
+                    else:
+                        time.sleep(max(1, interval))
         except Exception as exc:
             set_last_error(exc)
             add_bot_reason(f"BOT ERROR {exc}")

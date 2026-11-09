@@ -150,7 +150,11 @@ class OriginalMoneySettingsTest(unittest.TestCase):
         self.assertEqual(dashboard.locked_profit_premium_increment(original["strategy"]["locked_profit_dollars"], original["contracts"]), 0.025)
 
     def test_original_money_input_labels_include_dollars(self):
-        html = dashboard.app.test_client().get("/").get_data(as_text=True)
+        # The page makes broker calls while the market is open; these labels don't need them.
+        with patch.object(dashboard, "scanner_market_is_open", return_value=False), \
+             patch.object(dashboard.BROKER, "request") as broker:
+            html = dashboard.app.test_client().get("/").get_data(as_text=True)
+        broker.assert_not_called()
         self.assertIn("Maximum Position Cost ($)", html)
         self.assertIn("Locked Profit ($)", html)
 

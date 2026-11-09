@@ -1910,6 +1910,137 @@ class BotLoopIntegrationTests(BidExitCase):
         entry.assert_not_called()
 
 
+class PendingEntryLoopCadenceTests(BidExitCase):
+    """Real surfer_bot_loop and pending-entry code on a fake clock; only the scan and buy are stubbed."""
+
+    CONTRACT = {"symbol": SYMBOL, "bid": 0.99, "ask": 1.01}
+
+    def setUp(self):
+        super().setUp()
+        directory = self.directory.name
+        patches = [
+            patch.object(dashboard, "PENDING_ENTRY_HISTORY_FILE", os.path.join(directory, "pending.json")),
+            patch.object(dashboard, "PENDING_ENTRY_HISTORY_VISIBLE_FILE", os.path.join(directory, "pending_visible.json")),
+            patch.object(dashboard, "PENDING_ENTRY_HISTORY_BACKUP_FILE", os.path.join(directory, "pending_backup.json")),
+            patch.object(dashboard, "record_shadow_gate_state_from_pending"),
+        ]
+        for item in patches:
+            item.start()
+            self.addCleanup(item.stop)
+        self.config.update(strategy_mode="SURFER", bot_enabled=True, auto_entries_enabled=True,
+                           scanner={"interval_seconds": 60}, option_momentum_percent=1.0,
+                           two_candle_or_confirmation_enabled=False, confirmation_timeout_seconds=60)
+        self.original_config = copy.deepcopy(self.config)
+        dashboard.clear_pending_entry()
+        self.clock = 1_800_000_000.0
+        self.sleeps = []
+        self.scans = []
+        self.checks = []
+        self.candidate_ids = set()
+
+    def scan_creates_candidate(self, allow_entry=True):
+        if not allow_entry:  # the position branch scans for exits only
+            return
+        self.scans.append(self.clock)
+        dashboard.create_pending_entry(self.config, "BUY CALL", "CALL", dict(self.CONTRACT), 1, 1.00, {}, "MIDPOINT")
+        self.candidate_ids.add(dashboard.get_pending_entry()["id"])
+
+    def scan_finds_nothing(self, allow_entry=True):
+        self.scans.append(self.clock)
+
+    def run_loop(self, scan, iterations, on_sleep=None):
+        real_process = dashboard.process_pending_entry
+
+        def fake_sleep(seconds):
+            self.sleeps.append(seconds)
+            self.clock += seconds
+            if len(self.sleeps) >= iterations:
+                raise StopLoop()
+            if on_sleep:
+                on_sleep(len(self.sleeps))
+
+        def checked(config):
+            self.checks.append(self.clock)
+            return real_process(config)
+
+        self.buy = Mock(return_value=True)
+        with patch.object(dashboard.time, "time", side_effect=lambda: self.clock), \
+             patch.object(dashboard.time, "sleep", side_effect=fake_sleep), \
+             patch.object(dashboard, "surfer_bot_tick", side_effect=scan), \
+             patch.object(dashboard, "process_pending_entry", side_effect=checked), \
+             patch.object(dashboard, "execute_entry_buy", self.buy), \
+             self.assertRaises(StopLoop):
+            dashboard.surfer_bot_loop()
+        self.assertNotIn(10, self.sleeps, f"bot loop raised: {dashboard.BOT_STATE['last_error']}")
+
+    def waiting_quote(self):
+        self.set_quote(bid=0.99, ask=1.01, last=1.00, age=0.0)
+
+    def confirming_quote(self):
+        self.set_quote(bid=1.02, ask=1.04, last=1.03, age=0.0)
+
+    def test_new_candidate_is_checked_on_short_cadence(self):
+        self.waiting_quote()
+        self.run_loop(self.scan_creates_candidate, 2)
+        self.assertEqual(self.sleeps[0], 1.0)
+        self.assertEqual(self.checks[0] - self.scans[0], 1.0, "first check one poll after the scan, not 60s")
+
+    def test_first_check_uses_the_configured_poll_interval(self):
+        self.config["strategy"]["exit_poll_interval_ms"] = 500
+        self.original_config = copy.deepcopy(self.config)
+        self.waiting_quote()
+        self.run_loop(self.scan_creates_candidate, 2)
+        self.assertEqual(self.checks[0] - self.scans[0], 0.5)
+
+    def test_scan_without_candidate_keeps_the_scanner_interval(self):
+        self.waiting_quote()
+        self.run_loop(self.scan_finds_nothing, 3)
+        self.assertEqual(self.sleeps, [60, 60, 60])
+        self.assertEqual([scan - self.scans[0] for scan in self.scans], [0.0, 60.0, 120.0])
+        self.assertEqual(self.checks, [])
+
+    def test_repeated_polling_creates_one_candidate_and_one_buy(self):
+        self.waiting_quote()
+
+        def after_sleep(count):
+            if count == 5:
+                self.confirming_quote()
+            if count == 6:
+                self.broker.positions = [{"symbol": SYMBOL, "quantity": 1, "cost_basis": 100.0, "date_acquired": self.now().isoformat()}]
+
+        self.run_loop(self.scan_creates_candidate, 9, after_sleep)
+        self.assertEqual(len(self.scans), 1, "no rescan while a candidate is active")
+        self.assertEqual(len(self.candidate_ids), 1)
+        self.assertEqual(len(self.checks), 5, "polled on every short iteration until confirmed")
+        self.assertEqual(self.buy.call_count, 1)
+        self.assertFalse(dashboard.get_pending_entry()["active"])
+
+    def test_position_appearing_after_scan_cancels_candidate_without_monitoring(self):
+        self.waiting_quote()
+
+        def after_sleep(count):
+            self.broker.positions = [{"symbol": SYMBOL, "quantity": 1, "cost_basis": 100.0, "date_acquired": self.now().isoformat()}]
+
+        with patch.object(dashboard, "fast_exit_poll"):
+            self.run_loop(self.scan_creates_candidate, 2, after_sleep)
+        self.assertEqual(self.checks, [])
+        self.assertEqual(dashboard.get_pending_entry()["status"], "CANCELLED")
+        self.buy.assert_not_called()
+
+    def test_unsettled_exit_still_blocks_candidate_monitoring(self):
+        self.waiting_quote()
+
+        def after_sleep(count):
+            dashboard.BOT_STATE["exit_closed_awaiting"][self.key()] = {
+                "key": self.key(), "scope": dashboard.exit_broker_scope(self.config), "symbol": SYMBOL,
+                "closed_epoch": self.clock, "position_before": {}, "flat_checks": 0,
+            }
+
+        self.run_loop(self.scan_creates_candidate, 3, after_sleep)
+        self.assertEqual(self.checks, [])
+        self.buy.assert_not_called()
+
+
 class SimulatedProcedureTest(BidExitCase):
     """The end-to-end sequence quoted in the hand-off notes; every number is asserted."""
 
