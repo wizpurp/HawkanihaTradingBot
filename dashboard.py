@@ -3758,6 +3758,13 @@ def create_pending_entry(config, decision, side, contract, contracts, start_pric
     timeout_seconds = int(config.get("confirmation_timeout_seconds", 60))
     max_drawdown_percent = max(0.0, min(50.0, safe_float(config.get("pre_confirmation_max_drawdown_percent", 5.0), 5.0)))
     started_epoch = time.time()
+    if breakout_enabled:
+        window_ok, window_message = breakout_confirmation_window(config, started_epoch)
+        if not window_ok:
+            add_bot_reason(window_message)
+            log_bot_audit("SKIP", decision, config.get("symbol", ""), market_context, config,
+                          option_symbol=contract.get("symbol", ""), skip_reason=window_message)
+            return False
     timestamp = market_now().strftime("%H:%M:%S")
     pending_id = f"{market_now().strftime('%Y%m%d%H%M%S%f')}-{contract.get('symbol', '')}"
     confirmation_price = start_price * (1 + momentum_percent / 100) if momentum_enabled else start_price
@@ -4160,6 +4167,28 @@ def completed_intraday_bars(symbol, now=None):
         bar for bar in get_intraday_bars(symbol)
         if bar.get("time") and bar["time"] + timedelta(minutes=1) <= now
     ]
+
+
+def breakout_confirmation_window(config, started_epoch):
+    """Can the required breakout candles close before this candidate's timeout?
+
+    Counting starts with the one-minute candle in progress at the signal, so the last
+    required candle closes at that candle's start + required minutes. The configured
+    timeout is never changed here; an impossible combination is reported instead.
+    """
+    required = clamp_int(config.get("required_breakout_candles", 2), 1, 10, 2)
+    timeout = int(config.get("confirmation_timeout_seconds", 60))
+    grace = clamp_int(config.get("breakout_candle_grace_seconds", 10), 0, 60, 10)
+    last_close = started_epoch - (started_epoch % 60) + required * 60
+    needed = last_close + grace - started_epoch
+    if timeout >= needed:
+        return True, ""
+    close_time = datetime.fromtimestamp(last_close, MARKET_TZ).strftime("%H:%M:%S")
+    return False, (
+        f"PENDING BUY not started: {required} breakout candles need {needed:.0f}s "
+        f"(last candle closes {close_time}, plus {grace}s for candle data) but confirmation_timeout_seconds is {timeout}. "
+        f"Set confirmation_timeout_seconds to at least {required * 60 + grace} so any signal time can confirm."
+    )
 
 
 def default_opening_range_confirmation_state():

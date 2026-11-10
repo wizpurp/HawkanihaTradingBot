@@ -162,7 +162,8 @@ class OriginalMoneySettingsTest(unittest.TestCase):
         config = original_config()
         config["option_momentum_confirmation_enabled"] = True
         config["option_momentum_percent"] = 1.0
-        config["confirmation_timeout_seconds"] = 60
+        # Two one-minute breakout candles cannot close inside 60s, so those tests use a window that can.
+        config["confirmation_timeout_seconds"] = 180 if breakout_enabled else 60
         config["pre_confirmation_max_drawdown_percent"] = 5.0
         config["two_candle_or_confirmation_enabled"] = breakout_enabled
         contract = {"symbol": f"SPYTEST{direction}", "ask": start_price}
